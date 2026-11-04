@@ -4,8 +4,9 @@ use std::time::Duration;
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
-/// Set while this device runs as a client (`connection`): its host answers
-/// Telegram, so no call leaves this device, whatever asks for it.
+/// Set while this device does not run the library's services
+/// (`device_role`): another computer answers Telegram, so no call leaves
+/// this device, whatever asks for it.
 static CLIENT_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Blocks (or allows again) every call to Telegram from this device.
@@ -13,10 +14,10 @@ pub(crate) fn set_client_device(client: bool) {
     CLIENT_DEVICE.store(client, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// The Telegram API, unless this device is a client.
+/// The Telegram API, unless another computer answers Telegram.
 fn api_base() -> Result<&'static str, String> {
     if CLIENT_DEVICE.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err("En modo cliente Telegram no se usa en este equipo: lo maneja el host.".to_string());
+        return Err("Este dispositivo no atiende Telegram: lo atiende la computadora de la biblioteca con más procesamiento.".to_string());
     }
     Ok(TELEGRAM_API_BASE)
 }
@@ -79,6 +80,13 @@ struct TelegramMessage {
     audio: Option<TelegramAudio>,
     /// Shared by the photos or files sent together as an album.
     media_group_id: Option<String>,
+    /// The message this one answers (Telegram's «Responder»).
+    reply_to_message: Option<TelegramReplyRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramReplyRef {
+    message_id: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -171,6 +179,8 @@ pub struct IncomingTelegramUpdate {
     pub document: Option<TelegramDocument>,
     /// Album the photo or file belongs to; its parts arrive as separate updates.
     pub media_group_id: Option<String>,
+    /// The bot message this one answers, when the person used «Responder».
+    pub reply_to_message_id: Option<i64>,
     pub callback_query_id: Option<String>,
     pub callback_data: Option<String>,
     pub chat_type: String,
@@ -255,6 +265,7 @@ pub async fn get_updates(token: &str, offset: i64) -> Result<Vec<IncomingTelegra
                     }),
                     document: message.document,
                     media_group_id: message.media_group_id,
+                    reply_to_message_id: message.reply_to_message.map(|reply| reply.message_id),
                     callback_query_id: None,
                     callback_data: None,
                     chat_type: message.chat.chat_type,
@@ -273,6 +284,7 @@ pub async fn get_updates(token: &str, offset: i64) -> Result<Vec<IncomingTelegra
                 photo: None,
                 document: None,
                 media_group_id: None,
+                reply_to_message_id: None,
                 callback_query_id: Some(callback.id),
                 callback_data: callback.data,
                 chat_type: callback_message.chat.chat_type,

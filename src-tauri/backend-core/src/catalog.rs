@@ -54,6 +54,12 @@ pub enum ToolPolicy {
     /// The web browser of the host PC (Playwright): the Owner's, where the
     /// terminal is.
     Browser,
+    /// The Owner's WhatsApp linked on the host PC: the Owner's, where the
+    /// terminal is, and only in the chats the Owner allowed.
+    WhatsApp,
+    /// The Python support scripts of `.agent/scripts`, run on the host PC:
+    /// the Owner's, where the terminal is.
+    Scripts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +276,8 @@ pub fn canonical_tool_catalog() -> Vec<ToolDefinition> {
     catalog.extend(image_tools());
     catalog.push(terminal_tool());
     catalog.extend(browser_tools());
+    catalog.extend(whatsapp_tools());
+    catalog.extend(script_tools());
     catalog.into_iter().map(with_canonical_schema).collect()
 }
 
@@ -342,6 +350,42 @@ fn browser_tools() -> Vec<ToolDefinition> {
             scopes: vec![BackendScope::Library, BackendScope::Document, BackendScope::TaskManager],
             read_only: false,
             requires_confirmation: super::browser::is_browser_interaction_tool(name),
+        })
+        .collect()
+}
+
+/// Reading WhatsApp changes nothing; a message or a file reaches other
+/// people, so sending asks for confirmation («Confirmar todos» lets the
+/// rest of the request run). Which chats each tool may use is the Owner's
+/// choice in Settings, checked when it runs.
+fn whatsapp_tools() -> Vec<ToolDefinition> {
+    super::whatsapp::WHATSAPP_TOOLS
+        .into_iter()
+        .map(|name| ToolDefinition {
+            name: name.to_string(),
+            description: "Usa el WhatsApp vinculado del Owner.".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            scopes: vec![BackendScope::Library, BackendScope::Document, BackendScope::TaskManager],
+            read_only: !super::whatsapp::is_whatsapp_send_tool(name),
+            requires_confirmation: super::whatsapp::is_whatsapp_send_tool(name),
+        })
+        .collect()
+}
+
+/// The support scripts run code on the host PC: saving one (new code)
+/// asks for confirmation with the whole file, and running a saved one does
+/// not, as with any tool. Listing them is the only read-only one, so the
+/// hourly review and other read-only runs never run a script.
+fn script_tools() -> Vec<ToolDefinition> {
+    super::agent_scripts::SCRIPT_TOOLS
+        .into_iter()
+        .map(|name| ToolDefinition {
+            name: name.to_string(),
+            description: "Usa los scripts Python de soporte del agente.".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            scopes: vec![BackendScope::Library, BackendScope::Document, BackendScope::TaskManager],
+            read_only: name == super::agent_scripts::LIST_TOOL,
+            requires_confirmation: name == super::agent_scripts::SAVE_TOOL,
         })
         .collect()
 }
@@ -669,6 +713,8 @@ pub fn tool_policy(tool_name: &str) -> ToolPolicy {
         name if super::image_generation::is_image_tool(name) => ToolPolicy::Images,
         name if super::terminal::is_terminal_tool(name) => ToolPolicy::Terminal,
         name if super::browser::is_browser_tool(name) => ToolPolicy::Browser,
+        name if super::whatsapp::is_whatsapp_tool(name) => ToolPolicy::WhatsApp,
+        name if super::agent_scripts::is_script_tool(name) => ToolPolicy::Scripts,
         "list_agenda" => ToolPolicy::AgendaRead,
         "create_agenda_event"
         | "delete_agenda_event"
@@ -839,11 +885,11 @@ pub fn authorize_tool_call(
             "Las imágenes las genera solo el Owner, en los chats de la app o en Telegram.",
             false,
         )),
-        // The terminal and the browser are the host PC's: only the Owner,
-        // from the app chats (an AI task runs as one) or their Telegram. A
-        // published board, Meeting and any other user never reach them,
-        // whoever logs in there.
-        ToolPolicy::Terminal | ToolPolicy::Browser
+        // The terminal, the browser and WhatsApp are the host PC's: only
+        // the Owner, from the app chats (an AI task runs as one) or their
+        // Telegram. A published board, Meeting and any other user never
+        // reach them, whoever logs in there.
+        ToolPolicy::Terminal | ToolPolicy::Browser | ToolPolicy::WhatsApp | ToolPolicy::Scripts
             if context.actor.is_library_owner()
                 && matches!(context.channel, BackendChannel::App | BackendChannel::Telegram)
                 && !matches!(projection, ToolCatalogProjection::PublishedTaskManager)
@@ -859,6 +905,16 @@ pub fn authorize_tool_call(
         ToolPolicy::Browser => Err(BackendError::new(
             BackendErrorCode::Forbidden,
             "El navegador de la PC host lo usa solo el Owner, desde los chats de la app o su Telegram.",
+            false,
+        )),
+        ToolPolicy::WhatsApp => Err(BackendError::new(
+            BackendErrorCode::Forbidden,
+            "El WhatsApp vinculado lo usa solo el Owner, desde los chats de la app o su Telegram.",
+            false,
+        )),
+        ToolPolicy::Scripts => Err(BackendError::new(
+            BackendErrorCode::Forbidden,
+            "Los scripts de soporte corren solo para el Owner, desde los chats de la app o su Telegram.",
             false,
         )),
         // The actions answer only the Owner, by Telegram.
@@ -1114,6 +1170,75 @@ mod tests {
         meeting.channel = BackendChannel::Meeting;
         assert!(browser_tools(&meeting, &principal(), ToolCatalogProjection::Full).is_empty());
         assert!(restrict_tool_access(owner, ToolAccess::ReadOnly, true).is_empty());
+    }
+
+    #[test]
+    fn whatsapp_is_the_owners_where_the_terminal_is_and_sending_asks_first() {
+        let whatsapp_tools = |context: &BackendRequestContext, principal: &AuthorizationPrincipal, projection| {
+            project_tool_catalog(context, principal, &canonical_tool_catalog(), projection)
+                .map(|tools| tools.into_iter().filter(|tool| crate::whatsapp::is_whatsapp_tool(&tool.name)).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let owner = whatsapp_tools(&context(BackendScope::Library), &principal(), ToolCatalogProjection::Full);
+        assert_eq!(owner.len(), crate::whatsapp::WHATSAPP_TOOLS.len());
+        for tool in &owner {
+            let sends = crate::whatsapp::is_whatsapp_send_tool(&tool.name);
+            assert_eq!(tool.read_only, !sends, "{}", tool.name);
+            assert_eq!(tool.requires_confirmation, sends, "{}", tool.name);
+            assert!(tool_schemas().contains_key(&tool.name), "{} has no schema", tool.name);
+            assert_eq!(crate::tool_routing::tool_area(&tool.name), Some(crate::tool_routing::ToolArea::WhatsApp), "{}", tool.name);
+        }
+        let mut telegram = context(BackendScope::Library);
+        telegram.channel = BackendChannel::Telegram;
+        telegram.actor.external_identity =
+            Some(crate::context::ExternalIdentity { provider: "telegram".into(), user_id: "1".into(), chat_id: Some(1) });
+        assert_eq!(whatsapp_tools(&telegram, &principal(), ToolCatalogProjection::Full).len(), owner.len());
+        let mut guest = context(BackendScope::Library);
+        guest.actor.library_user_id = "user-ana".into();
+        let guest_principal = AuthorizationPrincipal { library_user_id: "user-ana".into(), all_contexts: true, ..principal() };
+        assert!(whatsapp_tools(&guest, &guest_principal, ToolCatalogProjection::Full).is_empty());
+        let mut published = context(BackendScope::TaskManager);
+        published.channel = BackendChannel::Published;
+        published.persistence_policy = super::super::PersistencePolicy::PublishedNoMemory;
+        assert!(whatsapp_tools(&published, &principal(), ToolCatalogProjection::PublishedTaskManager).is_empty());
+        assert!(whatsapp_tools(&published, &principal(), ToolCatalogProjection::Full).is_empty());
+        let mut meeting = context(BackendScope::Library);
+        meeting.channel = BackendChannel::Meeting;
+        assert!(whatsapp_tools(&meeting, &principal(), ToolCatalogProjection::Full).is_empty());
+        // A read-only run (the hourly review) reads, never sends.
+        let read_only = restrict_tool_access(owner, ToolAccess::ReadOnly, true);
+        assert!(!read_only.is_empty() && read_only.iter().all(|tool| !crate::whatsapp::is_whatsapp_send_tool(&tool.name)));
+    }
+
+    #[test]
+    fn the_support_scripts_are_the_owners_where_the_terminal_is_and_saving_asks_first() {
+        let script_tools = |context: &BackendRequestContext, principal: &AuthorizationPrincipal, projection| {
+            project_tool_catalog(context, principal, &canonical_tool_catalog(), projection)
+                .map(|tools| tools.into_iter().filter(|tool| crate::agent_scripts::is_script_tool(&tool.name)).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let owner = script_tools(&context(BackendScope::Library), &principal(), ToolCatalogProjection::Full);
+        assert_eq!(owner.len(), crate::agent_scripts::SCRIPT_TOOLS.len());
+        for tool in &owner {
+            assert_eq!(tool.requires_confirmation, tool.name == crate::agent_scripts::SAVE_TOOL, "{}", tool.name);
+            assert_eq!(tool.read_only, tool.name == crate::agent_scripts::LIST_TOOL, "{}", tool.name);
+            assert!(tool_schemas().contains_key(&tool.name), "{} has no schema", tool.name);
+            assert_eq!(crate::tool_routing::tool_area(&tool.name), Some(crate::tool_routing::ToolArea::Scripts), "{}", tool.name);
+        }
+        let mut guest = context(BackendScope::Library);
+        guest.actor.library_user_id = "user-ana".into();
+        let guest_principal = AuthorizationPrincipal { library_user_id: "user-ana".into(), all_contexts: true, ..principal() };
+        assert!(script_tools(&guest, &guest_principal, ToolCatalogProjection::Full).is_empty());
+        let mut published = context(BackendScope::TaskManager);
+        published.channel = BackendChannel::Published;
+        published.persistence_policy = super::super::PersistencePolicy::PublishedNoMemory;
+        assert!(script_tools(&published, &principal(), ToolCatalogProjection::PublishedTaskManager).is_empty());
+        assert!(script_tools(&published, &principal(), ToolCatalogProjection::Full).is_empty());
+        let mut meeting = context(BackendScope::Library);
+        meeting.channel = BackendChannel::Meeting;
+        assert!(script_tools(&meeting, &principal(), ToolCatalogProjection::Full).is_empty());
+        let read_only = restrict_tool_access(owner, ToolAccess::ReadOnly, true);
+        assert_eq!(read_only.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), [crate::agent_scripts::LIST_TOOL]);
     }
 
     #[test]

@@ -277,6 +277,10 @@ pub struct AgentRequest {
     /// Telegram chat whose request is the action's prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_action: Option<crate::ai_actions::prompts::ScheduledActionPrompt>,
+    /// The run of a webhook call (see `webhooks`): a turn of the Owner's
+    /// Telegram chat whose request is the prompt another program sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_call: Option<crate::webhooks::WebhookCallPrompt>,
     /// Tool areas routed for this run (see `tool_routing`). With them,
     /// `tools` holds every tool the actor may use and each round offers the
     /// tools of these areas; the agent changes them with `change_tool_areas`.
@@ -827,6 +831,7 @@ mod tests {
             library_search: true,
             autonomous: false,
             scheduled_action: None,
+            webhook_call: None,
             tool_areas: None,
             thinking: None,
             conversational: false,

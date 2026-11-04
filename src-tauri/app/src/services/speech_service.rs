@@ -313,6 +313,11 @@ pub fn prepare_recognizer(app: &AppHandle, language: &str) -> Result<(), String>
         .preparation
         .lock()
         .map_err(|_| "No se pudo coordinar la preparación del modelo de voz.".to_string())?;
+    // A recording holds the model and gives it back when it ends; a view that
+    // opens meanwhile must not load a second copy.
+    if state.active_session.lock().is_ok_and(|slot| slot.is_some()) {
+        return Ok(());
+    }
     let resolved = crate::services::speech_model_repository::resolve_asr_model(app, language)?;
     {
         let cache = state
@@ -954,6 +959,40 @@ pub fn validate_active_session(
     _session_id: &str,
 ) -> Result<u64, String> {
     Err("No hay una sesion de voz activa.".to_string())
+}
+
+/// Whether `session_id` is gone: no session holds it and none is finishing
+/// it, as when its worker ended without reporting it. A recording phase left
+/// without any session returns to idle, so another recording can start.
+#[cfg(any(target_os = "windows", target_os = "android"))]
+pub fn release_lost_session(state: &SpeechRuntimeState, session_id: &str) -> bool {
+    let Ok(slot) = state.active_session.lock() else { return false };
+    if slot.as_ref().is_some_and(|session| session.session_id == session_id) {
+        return false;
+    }
+    let finishing = state
+        .finalizing_session
+        .lock()
+        .map(|finalizing| finalizing.as_deref() == Some(session_id))
+        .unwrap_or(true);
+    if finishing {
+        return false;
+    }
+    let Ok(mut phase) = state.phase.lock() else { return false };
+    log::error!(
+        "[notia:speech] a session was asked to end but is gone (phase {:?}, another session active: {})",
+        *phase,
+        slot.is_some()
+    );
+    if slot.is_none() && matches!(*phase, SpeechPhase::Recording | SpeechPhase::Paused) {
+        *phase = SpeechPhase::Idle;
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
+pub fn release_lost_session(_state: &SpeechRuntimeState, _session_id: &str) -> bool {
+    false
 }
 
 /// How a finished session separates its speakers.
@@ -2191,6 +2230,24 @@ mod tests {
         DiarizationResult, DiarizationSegment, SpeakerEmbedding,
     };
     use crate::services::speech_worker::RecognitionUpdate;
+
+    #[cfg(any(target_os = "windows", target_os = "android"))]
+    #[test]
+    fn only_a_session_nobody_holds_or_finishes_is_lost() {
+        use super::{release_lost_session, set_finalizing_session, SpeechRuntimeState};
+        let state = SpeechRuntimeState::default();
+        *state.phase.lock().expect("phase") = SpeechPhase::Finalizing;
+        set_finalizing_session(&state, Some("a".to_string()));
+        assert!(!release_lost_session(&state, "a"));
+        // Another session finishing keeps its phase.
+        assert!(release_lost_session(&state, "b"));
+        assert_eq!(*state.phase.lock().expect("phase"), SpeechPhase::Finalizing);
+
+        set_finalizing_session(&state, None);
+        *state.phase.lock().expect("phase") = SpeechPhase::Paused;
+        assert!(release_lost_session(&state, "a"));
+        assert_eq!(*state.phase.lock().expect("phase"), SpeechPhase::Idle);
+    }
 
     #[test]
     fn speech_phase_rejects_invalid_transitions() {

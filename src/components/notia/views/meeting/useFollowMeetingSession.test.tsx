@@ -54,18 +54,4 @@ describe('useFollowMeetingSession', () => {
 
     expect(attach).not.toHaveBeenCalled()
   })
-
-  it('follows the session before an action that needs it', async () => {
-    const attach = vi.fn(async () => false)
-    const refresh = vi.fn(async () => undefined)
-    const view = render(attach, refresh)
-    await act(async () => undefined)
-    attach.mockResolvedValue(true)
-
-    let ready = false
-    await act(async () => { ready = await view.result.current() })
-
-    expect(ready).toBe(true)
-    expect(attach).toHaveBeenLastCalledWith('meeting-1')
-  })
 })

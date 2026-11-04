@@ -9,6 +9,10 @@
 //! - `mail`: a new message in a Gmail thread (a reply to a sent mail) or one
 //!   that matches a search; the adapter looks every `MAIL_POLL_MS` without
 //!   calling the model.
+//! - `whatsapp`: a reply in a WhatsApp chat (a company's bot or support),
+//!   once its author stopped writing for `reply_wait::WHATSAPP_TASK_WAIT`;
+//!   the adapter looks when a message arrives in the chat, and at least
+//!   every `WHATSAPP_POLL_MS`, without calling the model.
 //! - `time`: until a moment.
 //! - `check`: something only the agent can tell (a ticket moved, a file
 //!   appeared): the executor runs every `checkEveryMinutes` to look and
@@ -28,6 +32,9 @@ use crate::error::BackendError;
 pub const WAIT_TOOL: &str = "wait_ai_task";
 /// How often the adapter looks at the mail a task waits for.
 pub const MAIL_POLL_MS: i64 = 5 * 60 * 1000;
+/// How often it looks at the WhatsApp chat at least (the store, nothing
+/// goes out); a message that arrives there makes it look sooner.
+pub const WHATSAPP_POLL_MS: i64 = 60 * 1000;
 pub const MIN_CHECK_MINUTES: i64 = 10;
 pub const DEFAULT_CHECK_MINUTES: i64 = 60;
 pub const DEFAULT_WAIT_HOURS: f64 = 72.0;
@@ -56,9 +63,21 @@ pub enum WaitFor {
         #[serde(default)]
         query: Option<String>,
     },
+    /// What others write in `chat` from `since_ms` on (the message the task
+    /// sent). `name` is the chat's name when the wait began, for the panel.
+    #[serde(rename = "whatsapp", rename_all = "camelCase")]
+    WhatsApp { chat: String, name: String, since_ms: i64 },
     Time,
     #[serde(rename_all = "camelCase")]
     Check { every_ms: i64 },
+}
+
+/// How often the adapter looks at what a wait waits for, when it looks.
+pub fn poll_ms(wait_for: &WaitFor) -> i64 {
+    match wait_for {
+        WaitFor::WhatsApp { .. } => WHATSAPP_POLL_MS,
+        _ => MAIL_POLL_MS,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +127,7 @@ pub fn parse_moment(value: &str, zone: &TimeZone) -> Option<i64> {
 /// only one there is.
 pub fn wait_request(arguments: &Value, step_id: &str, accounts: &[String], zone: &TimeZone, now_ms: i64) -> Result<AiTaskWait, BackendError> {
     let reason = text(arguments, "reason").ok_or_else(|| BackendError::invalid_input("Falta reason: qué esperás, en una frase para la persona."))?;
-    let kind = text(arguments, "kind").ok_or_else(|| BackendError::invalid_input("Falta kind: mail, time o check."))?;
+    let kind = text(arguments, "kind").ok_or_else(|| BackendError::invalid_input("Falta kind: mail, whatsapp, time o check."))?;
     let hours = number(arguments, "maxWaitHours").unwrap_or(DEFAULT_WAIT_HOURS);
     if !(hours > 0.0 && hours <= MAX_WAIT_HOURS) {
         return Err(BackendError::invalid_input(format!("maxWaitHours va de más de 0 a {MAX_WAIT_HOURS} (30 días).")));
@@ -128,6 +147,14 @@ pub fn wait_request(arguments: &Value, step_id: &str, accounts: &[String], zone:
                 return Err(BackendError::invalid_input(format!("query tiene más de {MAX_QUERY_CHARS} caracteres.")));
             }
             (WaitFor::Mail { account, thread_id, query }, now_ms + MAIL_POLL_MS)
+        }
+        // The adapter resolves the chat (and its name and where the replies
+        // start) against the linked WhatsApp before the wait is saved.
+        "whatsapp" => {
+            let chat = text(arguments, "chat").ok_or_else(|| {
+                BackendError::invalid_input("Un wait de whatsapp necesita chat: el id del chat (de whatsapp_list_chats o el que devolvió whatsapp_send_message) o su nombre.")
+            })?;
+            (WaitFor::WhatsApp { chat, name: String::new(), since_ms: now_ms }, now_ms + WHATSAPP_POLL_MS)
         }
         "time" => {
             let at = match (text(arguments, "until"), number(arguments, "afterMinutes")) {
@@ -154,7 +181,7 @@ pub fn wait_request(arguments: &Value, step_id: &str, accounts: &[String], zone:
             let every_ms = minutes * MINUTE_MS;
             (WaitFor::Check { every_ms }, now_ms + every_ms)
         }
-        other => return Err(BackendError::invalid_input(format!("kind «{other}» no existe: usá mail, time o check."))),
+        other => return Err(BackendError::invalid_input(format!("kind «{other}» no existe: usá mail, whatsapp, time o check."))),
     };
     Ok(AiTaskWait {
         step_id: step_id.to_string(),
@@ -194,16 +221,21 @@ pub enum Due {
     NotYet,
     /// Look at the mail; with nothing new and the deadline passed, wake.
     LookAtMail,
+    /// Look at the WhatsApp chat, the same way.
+    LookAtWhatsApp,
     /// Wake the executor with this note.
     Wake(String),
 }
 
 pub fn due(wait: &AiTaskWait, zone: &TimeZone, now_ms: i64) -> Due {
-    if now_ms < wait.wake_at_ms && now_ms < wait.deadline_ms {
+    let whatsapp = matches!(wait.wait_for, WaitFor::WhatsApp { .. });
+    if !whatsapp && now_ms < wait.wake_at_ms && now_ms < wait.deadline_ms {
         return Due::NotYet;
     }
     match wait.wait_for {
         WaitFor::Mail { .. } => Due::LookAtMail,
+        // Reading the store is cheap: the adapter looks whenever it is asked.
+        WaitFor::WhatsApp { .. } => Due::LookAtWhatsApp,
         WaitFor::Time => Due::Wake(format!("Llegó el momento que esperabas ({}).", when(zone, wait.deadline_ms, now_ms))),
         WaitFor::Check { .. } if now_ms >= wait.deadline_ms => Due::Wake(deadline_note(wait, zone, now_ms)),
         WaitFor::Check { .. } => Due::Wake(format!(
@@ -216,11 +248,11 @@ pub fn due(wait: &AiTaskWait, zone: &TimeZone, now_ms: i64) -> Due {
 /// The note of a wait whose deadline passed without what it waited for.
 pub fn deadline_note(wait: &AiTaskWait, zone: &TimeZone, now_ms: i64) -> String {
     let mut note = format!(
-        "Se cumplió el plazo de la espera ({}) sin que pase lo que esperabas. Decidí: insistir (por ejemplo, otro correo o un recordatorio) y volver a esperar con wait_ai_task, o terminar el paso explicando qué falta.",
+        "Se cumplió el plazo de la espera ({}) sin que pase lo que esperabas. Decidí: insistir (por ejemplo, otro correo, otro mensaje o un recordatorio) y volver a esperar con wait_ai_task, o terminar el paso explicando qué falta.",
         when(zone, wait.deadline_ms, now_ms).to_lowercase()
     );
     if let Some(error) = &wait.last_error {
-        note.push_str(&format!(" La última vez que se miró el correo falló: {error}"));
+        note.push_str(&format!(" La última revisión falló: {error}"));
     }
     note
 }
@@ -308,6 +340,7 @@ pub fn kind_label(wait: &AiTaskWait, zone: &TimeZone, now_ms: i64) -> String {
     match &wait.wait_for {
         WaitFor::Mail { account, thread_id: Some(_), .. } => format!("Respuesta por correo en el hilo ({account})"),
         WaitFor::Mail { account, query, .. } => format!("Correo que coincida con «{}» ({account})", query.as_deref().unwrap_or_default()),
+        WaitFor::WhatsApp { name, .. } => format!("Respuesta por WhatsApp de {name}"),
         WaitFor::Time => format!("Hasta {}", when(zone, wait.deadline_ms, now_ms).to_lowercase()),
         WaitFor::Check { every_ms } => format!("Controla {}", every_label(*every_ms)),
     }
@@ -327,6 +360,10 @@ pub fn next_label(wait: &AiTaskWait, zone: &TimeZone, now_ms: i64) -> Option<Str
     let next = when(zone, wait.wake_at_ms.max(now_ms), now_ms);
     match wait.wait_for {
         WaitFor::Mail { .. } => Some(format!("Próxima revisión del correo: {}", next.to_lowercase())),
+        WaitFor::WhatsApp { .. } => Some(format!(
+            "Sigue {} s después del último mensaje que llegue",
+            crate::reply_wait::WHATSAPP_TASK_WAIT.as_secs()
+        )),
         WaitFor::Check { .. } => Some(format!("Próximo control: {}", next.to_lowercase())),
         WaitFor::Time => None,
     }

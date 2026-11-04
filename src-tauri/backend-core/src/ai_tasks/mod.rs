@@ -288,6 +288,10 @@ pub struct AiTask {
     pub phase: Option<AiTaskPhase>,
     #[serde(default)]
     pub steps: Vec<AiTaskStep>,
+    /// Its goal changed (`resume_ai_task` with `goal`): the planner plans
+    /// what is still missing after the steps already done.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replan: bool,
     #[serde(default)]
     pub reviews: Vec<AiTaskReview>,
     /// What the agent asked a new review to check (`review_ai_task`).
@@ -344,6 +348,7 @@ impl AiTask {
             status: AiTaskStatus::Planning,
             phase: Some(AiTaskPhase::Planner),
             steps: Vec::new(),
+            replan: false,
             reviews: Vec::new(),
             review_request: None,
             pending: None,
@@ -363,7 +368,7 @@ impl AiTask {
     }
 
     pub fn next_work(&self) -> NextWork {
-        if self.steps.is_empty() {
+        if self.steps.is_empty() || self.replan {
             return NextWork::Plan;
         }
         if let Some(index) = self.steps.iter().position(|step| step.status != StepStatus::Done) {
@@ -383,9 +388,46 @@ impl AiTask {
         (self.steps.iter().filter(|step| step.status == StepStatus::Done).count(), self.steps.len())
     }
 
-    /// The plan the planner returned, as the steps of the first round.
+    /// The plan the planner returned, as the steps of the first round. A
+    /// task planned again after its goal changed keeps the steps already
+    /// done and adds the new ones after them, in a new round (so a review
+    /// of the old goal does not approve them).
     pub fn set_plan(&mut self, planned: Vec<PlannedStep>) {
-        self.steps = numbered_steps(planned, 0, 0);
+        if !self.replan {
+            self.steps = numbered_steps(planned, 0, 0);
+            return;
+        }
+        self.replan = false;
+        let start = self.steps.iter().filter_map(|step| step.id.strip_prefix('s')?.parse::<usize>().ok()).max().unwrap_or(0);
+        let round = self.current_round() + 1;
+        self.steps.extend(numbered_steps(planned, round, start));
+    }
+
+    /// Points the task at a new `goal` (when given) and plans it again,
+    /// from the person's correction: the steps already done stay, with their
+    /// reports, and the planner adds only what is missing. `restart` also
+    /// forgets the steps and reviews, so the task starts over. Whatever the
+    /// old plan waited for or asked is dropped.
+    pub fn replan(&mut self, goal: Option<&str>, restart: bool) {
+        if let Some(goal) = goal {
+            self.goal = goal.trim().to_string();
+        }
+        if restart {
+            self.steps.clear();
+            self.reviews.clear();
+        } else {
+            self.steps.retain(|step| step.status == StepStatus::Done);
+        }
+        self.replan = !self.steps.is_empty();
+        self.status = AiTaskStatus::Planning;
+        self.phase = Some(AiTaskPhase::Planner);
+        self.review_request = None;
+        self.pending = None;
+        self.wait = None;
+        self.wake = None;
+        self.result = None;
+        self.error = None;
+        self.finished_at_ms = None;
     }
 
     /// Ends the review of the current round. An approval completes the task

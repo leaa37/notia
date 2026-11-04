@@ -52,19 +52,17 @@ pub fn markdown_to_telegram_html(markdown: &str) -> String {
             continue;
         }
 
-        let (line, prefix) = list_prefix(line);
-        if let Some(prefix) = prefix {
-            output.push_str(prefix);
-        }
-        if let Some(heading) = line.strip_prefix("### ") {
-            output.push_str("<b>");
-            output.push_str(&render_inline(heading));
-            output.push_str("</b>");
-        } else if let Some(heading) = line.strip_prefix("## ") {
-            output.push_str("<b>");
-            output.push_str(&render_inline(heading));
-            output.push_str("</b>");
-        } else if let Some(heading) = line.strip_prefix("# ") {
+        // An indented item keeps its indentation before the bullet.
+        let body = line.trim_start();
+        let line = match list_prefix(body) {
+            (rest, Some(prefix)) => {
+                output.push_str(&line[..line.len() - body.len()]);
+                output.push_str(prefix);
+                rest
+            }
+            (_, None) => line,
+        };
+        if let Some(heading) = heading_text(line) {
             output.push_str("<b>");
             output.push_str(&render_inline(heading));
             output.push_str("</b>");
@@ -87,13 +85,40 @@ fn list_prefix(value: &str) -> (&str, Option<&'static str>) {
         return (rest, Some("• "));
     }
     let digits = value.bytes().take_while(u8::is_ascii_digit).count();
-    if digits > 0 && value.as_bytes().get(digits) == Some(&b'.') {
+    if digits > 0 && matches!(value.as_bytes().get(digits), Some(b'.' | b')')) {
         let start = digits + 1;
         if value.as_bytes().get(start) == Some(&b' ') {
             return (&value[start + 1..], Some("• "));
         }
     }
     (value, None)
+}
+
+/// The text of a `#` to `######` heading.
+fn heading_text(line: &str) -> Option<&str> {
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&hashes).then(|| line[hashes..].strip_prefix(' ')).flatten()
+}
+
+/// Where the emphasis `marker` opening `rest` closes, counted from its
+/// content. The content neither starts nor ends with a space, so «2 * 3»
+/// is no emphasis, and a single `*` is not half of a `**`.
+fn emphasis_end(rest: &str, marker: &str) -> Option<usize> {
+    let inner = &rest[marker.len()..];
+    if inner.is_empty() || inner.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(found) = inner[from..].find(marker) {
+        let at = from + found;
+        let after_space = inner[..at].ends_with(char::is_whitespace);
+        let half_of_double = marker.len() == 1 && inner[at + 1..].starts_with(marker);
+        if at > 0 && !after_space && !half_of_double {
+            return Some(at);
+        }
+        from = at + marker.len();
+    }
+    None
 }
 
 fn render_inline(value: &str) -> String {
@@ -133,7 +158,9 @@ fn render_inline(value: &str) -> String {
             continue;
         }
 
-        let marker = if rest.starts_with("**") {
+        let marker = if rest.starts_with("***") {
+            Some(("***", "<b><i>", "</i></b>"))
+        } else if rest.starts_with("**") {
             Some(("**", "<b>", "</b>"))
         } else if rest.starts_with("__") {
             Some(("__", "<b>", "</b>"))
@@ -147,11 +174,17 @@ fn render_inline(value: &str) -> String {
             None
         };
         if let Some((marker, open, close)) = marker {
-            if let Some(end) = rest[marker.len()..].find(marker) {
+            if let Some(end) = emphasis_end(rest, marker) {
                 output.push_str(open);
                 output.push_str(&render_inline(&rest[marker.len()..marker.len() + end]));
                 output.push_str(close);
                 index += marker.len() * 2 + end;
+                continue;
+            }
+            // A bold or strike that never closes on its line (it spans two
+            // lines, or the model left it open) would show its asterisks.
+            if marker.len() >= 2 && marker != "__" {
+                index += marker.len();
                 continue;
             }
         }
@@ -259,6 +292,17 @@ mod tests {
         );
         assert_eq!(markdown_to_telegram_html("<strong>x</strong> <em>y</em>"), "<b>x</b> <i>y</i>");
         assert_eq!(markdown_to_telegram_html("<b onclick=\"x\">a</b> <b>sin cierre"), "&lt;b onclick=\"x\"&gt;a&lt;/b&gt; &lt;b&gt;sin cierre");
+    }
+
+    #[test]
+    fn short_reminders_never_show_their_markdown() {
+        assert_eq!(markdown_to_telegram_html("⏰ **Recordatorio:** sacar la basura"), "⏰ <b>Recordatorio:</b> sacar la basura");
+        assert_eq!(markdown_to_telegram_html("**Recordatorio\nsigue**"), "Recordatorio\nsigue");
+        assert_eq!(markdown_to_telegram_html("***Importante***"), "<b><i>Importante</i></b>");
+        assert_eq!(markdown_to_telegram_html("Precio 2 * 3 y **bold**"), "Precio 2 * 3 y <b>bold</b>");
+        assert_eq!(markdown_to_telegram_html("#### Hoy\n  - **sub** item\n1) **Pagar** luz"), "<b>Hoy</b>\n  • <b>sub</b> item\n• <b>Pagar</b> luz");
+        assert_eq!(markdown_to_telegram_html("*Ana* y **Luis**"), "<i>Ana</i> y <b>Luis</b>");
+        assert_eq!(markdown_to_telegram_html("#hashtag"), "#hashtag");
     }
 
     #[test]

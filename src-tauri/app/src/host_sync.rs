@@ -47,6 +47,10 @@ pub(crate) struct SyncManifest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SyncLibraryPayload {
     library_id: String,
+    /// The computer that syncs, for deciding which one runs the library's
+    /// services (`device_role`). Android sends none.
+    #[serde(default)]
+    device: Option<crate::backend::connection::DevicePower>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +248,9 @@ pub(crate) fn delete_synced(root: &Path, target: &Path) -> Result<(), BackendErr
 
 pub(crate) fn host_sync_manifest(app: &AppHandle, payload: SyncLibraryPayload) -> Result<SyncManifest, BackendError> {
     let root = library_root(app, &payload.library_id)?;
+    if let Some(device) = payload.device {
+        crate::device_role::note_client(app, device);
+    }
     let database_file = root.join(".notia").join("notia.db");
     let database = std::fs::metadata(&database_file).ok().map(|metadata| stamp_of(&metadata));
     let database_id = database.is_some().then(|| stored_database_id(&database_file)).flatten();

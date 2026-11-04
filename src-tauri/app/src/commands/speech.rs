@@ -365,7 +365,15 @@ pub async fn stop_speech_session(
     state: State<'_, SpeechRuntimeState>,
 ) -> Result<(), String> {
     validate_session_command(&payload)?;
-    speech_service::validate_active_session(&state, &payload.session_id)?;
+    if let Err(error) = speech_service::validate_active_session(&state, &payload.session_id) {
+        // A meeting whose session is gone finishes with the lines it has.
+        if speech_service::release_lost_session(&state, &payload.session_id)
+            && crate::meeting::finish_lost_session(&app, &payload.session_id)
+        {
+            return Ok(());
+        }
+        return Err(error);
+    }
     {
         let mut phase = state
             .phase
@@ -432,7 +440,15 @@ pub fn cancel_speech_session(
     state: State<'_, SpeechRuntimeState>,
 ) -> Result<(), String> {
     validate_session_command(&payload)?;
-    speech_service::validate_active_session(&state, &payload.session_id)?;
+    if let Err(error) = speech_service::validate_active_session(&state, &payload.session_id) {
+        // A meeting whose session is gone is dropped all the same.
+        if speech_service::release_lost_session(&state, &payload.session_id)
+            && crate::meeting::discard_session(&app, &payload.session_id)
+        {
+            return Ok(());
+        }
+        return Err(error);
+    }
     let result = speech_service::cancel_platform_audio(&state);
     crate::meeting::discard_session(&app, &payload.session_id);
     #[cfg(target_os = "android")]

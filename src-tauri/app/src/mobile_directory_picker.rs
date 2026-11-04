@@ -289,10 +289,21 @@ pub fn tree_cache_epoch(state: &AndroidDirectoryPickerState, tree_uri: &str) -> 
         .unwrap_or(0)
 }
 
+/// Writes and entry changes this process made in library folders. The sync
+/// of a client's copy lists its SAF folder again only after one.
+#[cfg(target_os = "android")]
+static LIBRARY_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "android")]
+pub(crate) fn library_writes() -> u64 {
+    LIBRARY_WRITES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Marks a tree as mutated: the cache becomes stale and every tree read that
 /// started earlier is discarded when it tries to update the cache.
 #[cfg(target_os = "android")]
 pub fn mark_tree_mutated(state: &AndroidDirectoryPickerState, tree_uri: &str) {
+    LIBRARY_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut epochs) = state.cache_epochs.lock() {
         let epoch = epochs.entry(tree_uri.to_string()).or_insert(0);
         *epoch = epoch.wrapping_add(1);
@@ -1164,6 +1175,7 @@ pub(crate) fn write_android_content_bytes_stamped(
     if !response.ok {
         return Err("No se pudo escribir el archivo Android.".to_string());
     }
+    LIBRARY_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     Ok(response.size.zip(response.last_modified))
 }

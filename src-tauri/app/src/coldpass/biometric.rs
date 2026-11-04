@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::{unlock_with_password, ColdPassPayload};
 use crate::backend::{BackendError, BackendErrorCode};
@@ -188,13 +188,9 @@ async fn blocking<T: Send + 'static>(
         .map_err(|_| BackendError::new(BackendErrorCode::Internal, "La huella se interrumpió: volvé a intentarlo.", true))?
 }
 
-/// `coldpass_unlock` with `password` where the vault is: on the host when
-/// this device is its client, here otherwise. Returns its `{ entries }`.
+/// `coldpass_unlock` with `password` on the vault of this device's library
+/// (a client's copy too). Returns its `{ entries }`.
 async fn unlock_where_the_vault_is(app: &AppHandle, library_id: &str, password: String) -> Result<Value, BackendError> {
-    if crate::host_client::uses_host(app) {
-        let args = json!({ "payload": { "libraryId": library_id, "password": password } });
-        return crate::host_client::call_host(app, "coldpass_unlock", args).await;
-    }
     let app = app.clone();
     let payload = ColdPassPayload {
         library_id: library_id.to_string(),

@@ -24,6 +24,8 @@ import type { TelegramPreferences } from '../../services/preferences/telegramSet
 import { checkTelegramBot } from '../../services/telegram/telegramRuntime'
 import { MailAccountsSection } from './settings/MailAccountsSection'
 import { PublicSpacesSection } from './settings/PublicSpacesSection'
+import { WebhookSection } from './settings/WebhookSection'
+import { WhatsAppSection } from './settings/WhatsAppSection'
 import { WeatherSection } from './settings/WeatherSection'
 import { ImageModelsSection } from './settings/ImageModelsSection'
 import { RunModeSection } from './settings/RunModeSection'
@@ -1530,6 +1532,10 @@ export function SettingsModal({
                     ))}
                   </SettingsCard>
                 </>
+              ) : activeSection === 'WhatsApp' ? (
+                <WhatsAppSection libraryId={activeLibrary?.id ?? null} />
+              ) : activeSection === 'Webhook' ? (
+                <WebhookSection libraryId={activeLibrary?.id ?? null} />
               ) : activeSection === 'Cuentas asociadas' ? (
                 <MailAccountsSection libraryId={activeLibrary?.id ?? null} />
               ) : activeSection === 'Imágenes' ? (

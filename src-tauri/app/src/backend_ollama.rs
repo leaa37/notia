@@ -978,8 +978,26 @@ fn map_service_error(error: String) -> BackendError {
             Some(detail) => format!("Ollama no pudo completar la solicitud: {detail}"),
             None => "Ollama no pudo completar la solicitud.".to_string(),
         },
-        false,
+        is_server_failure(&normalized),
     )
+}
+
+/// A failure of the server itself (an HTTP 5xx, an overloaded model) that
+/// usually passes: the round is asked again before ending the turn.
+fn is_server_failure(normalized_error: &str) -> bool {
+    [
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "overloaded",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    .iter()
+    .any(|marker| normalized_error.contains(marker))
 }
 
 fn safe_validation_message(normalized_error: &str) -> &'static str {
@@ -1319,6 +1337,10 @@ mod tests {
         assert!(map_service_error("{\"error\":\"context length exceeded\"}".to_string())
             .message
             .ends_with("context length exceeded"));
+        // A server failure is asked again; a rejected request is not.
+        assert!(map_service_error("{\"error\":\"Internal Server Error (ref: 6b8fcb4a)\"}".to_string()).retryable);
+        assert!(map_service_error("La IA respondio con HTTP 503 Service Unavailable.".to_string()).retryable);
+        assert!(!map_service_error("{\"error\":\"context length exceeded\"}".to_string()).retryable);
         assert!(!map_service_error("bad Bearer abc".to_string()).message.contains("abc"));
         assert!(
             !map_service_error("No se pudo conectar con la IA. api_key=secret".to_string())

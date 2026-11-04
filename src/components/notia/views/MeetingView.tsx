@@ -141,10 +141,13 @@ function MeetingViewComponent() {
 
   const attachVoice = voice.attach
   const runningId = snapshot && (snapshot.status === 'live' || snapshot.status === 'processing') ? snapshot.id : null
-  const ensureFollowing = useFollowMeetingSession(attachVoice, runningId, status, refreshSnapshot)
-  // The recording actions follow the session first when the view lost it.
-  const onSession = (action: () => Promise<unknown>) => async () => {
-    if (await ensureFollowing()) await action()
+  useFollowMeetingSession(attachVoice, runningId, status, refreshSnapshot)
+  // A view that opened again acts on the meeting's session without waiting
+  // to read its state; the backend answers, or finishes a meeting whose
+  // session is gone, and an error shows in the banner.
+  const onSession = (action: () => Promise<unknown>) => () => {
+    if (status === 'idle' && runningId) voice.holdSession(runningId)
+    void action()
   }
   const levels = useSpeechLevels(stage === 'recording' ? snapshot?.id ?? null : monitorId, LEVEL_HISTORY)
   const history = useMeetingHistory(library?.id ?? null, stage === 'ready')

@@ -19,11 +19,13 @@ pub fn phase_guidance(phase: AiTaskPhase) -> String {
     let specific = match phase {
         AiTaskPhase::Planner => {
             "Sos el PLANIFICADOR. Mirá lo que haga falta con herramientas de lectura y respondé SOLO con el plan, con este formato exacto:\nPASOS:\n1. Título corto del paso — qué hacer, sobre qué y cuándo está terminado\n2. …\nUn paso por línea, numerados, sin texto antes ni después.
-Si el objetivo depende de otros (que respondan un correo, que alguien haga algo) o de una fecha, planificá también esos pasos: el Ejecutor puede esperar respuestas, una fecha o controlar cada tanto, y seguir cuando pase. Un paso así dice qué esperar y qué hacer con la respuesta (por ejemplo «Mandar el pedido de acceso a soporte y esperar su respuesta — seguir la conversación hasta que confirmen el acceso»)."
+Si el objetivo depende de otros (que respondan un correo o un WhatsApp, que alguien haga algo) o de una fecha, planificá también esos pasos: el Ejecutor puede esperar respuestas, una fecha o controlar cada tanto, y seguir cuando pase. Un paso así dice qué esperar y qué hacer con la respuesta (por ejemplo «Mandar el pedido de acceso a soporte y esperar su respuesta — seguir la conversación hasta que confirmen el acceso»).
+Una pregunta a la persona es un paso del Ejecutor (le llega por Telegram y la tarea espera su respuesta); el resultado final le llega solo al terminar, así que no planifiques un paso aparte para mandarlo."
         }
         AiTaskPhase::Executor => {
             "Sos el EJECUTOR. Hacé solo el paso que te toca, con tus herramientas, hasta terminarlo. Tu respuesta final es el informe del paso: qué hiciste, sobre qué y qué quedó pendiente. Si no pudiste terminarlo, empezá el informe con «NO TERMINADO:» y explicá por qué.
-Si el paso depende de algo que todavía no pasó (la respuesta a un correo que mandaste, una fecha, que alguien haga algo), no lo des por terminado ni por fallido: llamá wait_ai_task con qué esperás y terminá tu respuesta con lo que hiciste hasta ahora. Notia deja la tarea esperando sin gastar corridas y te vuelve a llamar en este mismo paso cuando llegue lo esperado, en cada control o cuando venza el plazo, con lo que pasó. Para esperar la respuesta a un correo usá kind mail con el threadId que devolvió send_gmail_message. Así seguís la conversación (responder, insistir, volver a esperar) hasta lograr el objetivo del paso."
+Si el paso depende de algo que todavía no pasó (la respuesta a un correo que mandaste, una fecha, que alguien haga algo), no lo des por terminado ni por fallido: llamá wait_ai_task con qué esperás y terminá tu respuesta con lo que hiciste hasta ahora. Notia deja la tarea esperando sin gastar corridas y te vuelve a llamar en este mismo paso cuando llegue lo esperado, en cada control o cuando venza el plazo, con lo que pasó. Para esperar la respuesta a un correo usá kind mail con el threadId que devolvió send_gmail_message; para una respuesta por WhatsApp (un bot o el soporte de una empresa), kind whatsapp con el chat que devolvió whatsapp_send_message: Notia te llama cuando dejaron de escribir, con todo lo que mandaron; si mandan un menú con opciones, elegí la opción con whatsapp_send_message, replyTo = el id del menú y text = la opción tal cual. Así seguís la conversación (responder, insistir, volver a esperar) hasta lograr el objetivo del paso.
+Para preguntarle algo a la persona (un dato, una decisión, que revise una lista) usá request_user_clarification: le llega por Telegram, si lo vinculó, y al panel, y la tarea espera su respuesta (un botón o un mensaje respondiendo a la pregunta). El resultado de la tarea le llega solo por Telegram cuando termina: un paso de «avisar» o «mandar el informe por Telegram» se cumple con tu informe."
         }
         AiTaskPhase::Review => {
             "Sos el REVIEW. Verificá el trabajo con herramientas de lectura y respondé con este formato exacto:\nVEREDICTO: aprobada | rehacer\nCOMENTARIOS:\nqué está bien y qué falta o está mal\nPASOS:\n1. Paso para corregir — qué hacer (solo si el veredicto es rehacer)\nRESULTADO:\nel resultado para la persona: qué se hizo y dónde quedó (solo si el veredicto es aprobada)"
@@ -32,9 +34,19 @@ Si el paso depende de algo que todavía no pasó (la respuesta a un correo que m
     format!("{common}\n{specific}")
 }
 
-/// The request of the planner.
+/// The request of the planner. A task planned again after its goal
+/// changed shows what was already done, so only what is missing is planned.
 pub fn planner_request(task: &AiTask) -> String {
-    format!("[Tarea IA «{}» · Planificador]\nObjetivo:\n{}\n\nArmá el plan de pasos para cumplir este objetivo.", task.title, task.goal.trim())
+    let mut text = format!("[Tarea IA «{}» · Planificador]\nObjetivo:\n{}", task.title, task.goal.trim());
+    let reports = done_reports(task);
+    if task.replan && !reports.is_empty() {
+        text.push_str(&format!(
+            "\n\nEl objetivo se corrigió después de empezar. Lo que ya se hizo:\n{reports}\n\nArmá solo los pasos que faltan para cumplir el objetivo, sin repetir lo hecho; si ya está cumplido, un solo paso que lo verifique y cierre."
+        ));
+    } else {
+        text.push_str("\n\nArmá el plan de pasos para cumplir este objetivo.");
+    }
+    text
 }
 
 /// The request of the executor for the step at `index`.
@@ -71,7 +83,10 @@ Cómo terminó la espera:
     }
     if step.status == StepStatus::Failed {
         if let Some(report) = step.report.as_deref() {
-            text.push_str(&format!("\n\nEste paso ya se intentó y quedó así:\n{}", clipped(report, REPORT_CHARS_IN_REQUEST)));
+            text.push_str(&format!(
+                "\n\nEste paso ya se intentó y quedó así:\n{}\nNo repitas lo que ya cambió datos o mandó mensajes: verificá cómo quedó y seguí desde ahí.",
+                clipped(report, REPORT_CHARS_IN_REQUEST)
+            ));
         }
     }
     text.push_str(&format!(
@@ -136,13 +151,19 @@ fn done_reports(task: &AiTask) -> String {
 }
 
 /// The steps of a planner's answer: its numbered lines (`1.`, `1)`), or its
-/// bullets when it numbered none. `Err` when it has no step.
-pub fn parse_plan(answer: &str) -> Result<Vec<PlannedStep>, String> {
+/// bullets when it numbered none. A planner that wrote no step does not fail
+/// the task: the steps written in `goal` are the plan, or the whole goal is
+/// one step.
+pub fn parse_plan(answer: &str, goal: &str) -> Vec<PlannedStep> {
     let steps = list_steps(answer);
-    if steps.is_empty() {
-        return Err("El planificador no devolvió pasos.".to_string());
+    if !steps.is_empty() {
+        return steps;
     }
-    Ok(steps)
+    let written = list_steps(goal);
+    if !written.is_empty() {
+        return written;
+    }
+    vec![PlannedStep { title: "Cumplir el objetivo".to_string(), detail: clipped(goal, MAX_STEP_DETAIL_CHARS) }]
 }
 
 fn list_steps(text: &str) -> Vec<PlannedStep> {
@@ -246,6 +267,12 @@ pub fn step_unfinished(report: &str) -> bool {
     fold(report.trim_start().trim_start_matches(['*', '#', ' '])).starts_with("no terminado")
 }
 
+/// The run of a step worked but the model wrote no report: the answer is
+/// only the count of its actions, so the step has no deliverable.
+pub fn step_without_report(answer: &str) -> bool {
+    answer.trim_start().starts_with(crate::agent::WORK_SUMMARY_START)
+}
+
 /// The Telegram message of a task that ended.
 pub fn finished_message(task: &AiTask) -> String {
     match task.status {
@@ -274,8 +301,12 @@ pub fn approval_message(task: &AiTask, approval: &super::AiTaskApproval) -> Stri
     if !approval.detail.trim().is_empty() {
         text.push_str(&format!("\n\n{}", clipped(&approval.detail, 2_500)));
     }
-    if approval.kind == super::ApprovalKind::Clarification && approval.options.is_empty() {
-        text.push_str("\n\nRespondela desde Notia → Tareas IA.");
-    }
+    text.push_str(match approval.kind {
+        super::ApprovalKind::Clarification if approval.options.is_empty() => {
+            "\n\nRespondé a este mensaje (Responder) o desde Notia → Tareas IA."
+        }
+        super::ApprovalKind::Clarification => "\n\nElegí una opción o respondé a este mensaje con otra respuesta.",
+        _ => "\n\nPara pedir otra cosa en lugar de esto, respondé a este mensaje (Responder).",
+    });
     text
 }

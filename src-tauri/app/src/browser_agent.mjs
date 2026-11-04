@@ -26,6 +26,7 @@ let current = null;
 let closing = false;
 let acceptNextDialog = false;
 const dialogs = [];
+const notes = [];
 
 function send(answer) {
   process.stdout.write(`${JSON.stringify(answer)}\n`);
@@ -94,15 +95,73 @@ function element(target, ref) {
   return target.locator(`aria-ref=${ref}`);
 }
 
-// An element of the last snapshot that is still on the page; a page that
-// changed fails right away instead of waiting for the action's timeout.
-async function present(target, ref) {
+// The role and name of a snapshot line or of how Rust described an
+// element: `button "Enviar"` → ['button', 'Enviar'].
+function identity(text) {
+  const match = text.trim().replace(/^- /, '').match(/^([a-z]+) "((?:[^"\\]|\\.)*)"/);
+  return match ? [match[1], match[2]] : null;
+}
+
+// The element `described` names on the page as it is now, when exactly one
+// has that role and name: the page drew it again with another reference.
+async function relocated(target, ref, described) {
+  const wanted = described ? identity(described) : null;
+  if (!wanted) return null;
+  const snapshot = await target.ariaSnapshot({ mode: 'ai' }).catch(() => '');
+  const refs = snapshot
+    .split('\n')
+    .filter((line) => {
+      const found = identity(line);
+      return found && found[0] === wanted[0] && found[1] === wanted[1];
+    })
+    .map((line) => line.match(/\[ref=(\w+)\]/)?.[1])
+    .filter(Boolean);
+  if (refs.length !== 1) return null;
+  if (refs[0] !== ref) notes.push(`La referencia ${ref} ya no estaba en la página: se usó ${refs[0]}, el mismo ${described}.`);
+  return element(target, refs[0]);
+}
+
+// An element of the last snapshot that is still on the page, or the same
+// one drawn again; otherwise it fails right away instead of waiting for the
+// action's timeout.
+async function present(target, ref, described) {
   const found = element(target, ref);
   const count = await found.count().catch(() => 0);
-  if (count === 0) {
-    throw new Error(`la referencia ${ref} ya no está en la página (cambió desde la última instantánea): pedí browser_snapshot y usá una de las nuevas.`);
+  if (count > 0) return found;
+  const again = await relocated(target, ref, described);
+  if (again) return again;
+  throw new Error(`la referencia ${ref} ya no está en la página (cambió desde la última instantánea): pedí browser_snapshot y usá una de las nuevas.`);
+}
+
+// Runs `action` on the element of `request`. A page that draws the element
+// again while Playwright waits for it (a banner, a menu that renders twice)
+// makes the action time out; it is tried once more on the element found
+// again by its role and name.
+async function act(target, request, action) {
+  const found = await present(target, request.ref, request.described);
+  try {
+    return await action(found);
+  } catch (error) {
+    if (!/Timeout|detached|not attached/i.test(String(error?.message ?? error))) throw error;
+    const again = await relocated(target, request.ref, request.described);
+    if (!again) throw error;
+    notes.push('El elemento cambió mientras se esperaba: se intentó una vez más.');
+    return action(again);
   }
-  return found;
+}
+
+// A Flutter web app draws on a canvas and exposes its fields only after its
+// «Enable accessibility» placeholder is pressed, so the snapshot showed
+// nothing else; it is pressed here, once per page address.
+const accessibleAt = new WeakMap();
+async function enableAccessibility(target) {
+  if (accessibleAt.get(target) === target.url()) return;
+  const placeholder = target.locator('flt-semantics-placeholder');
+  if ((await placeholder.count().catch(() => 0)) === 0) return;
+  accessibleAt.set(target, target.url());
+  await placeholder.first().dispatchEvent('click').catch(() => {});
+  await target.waitForTimeout(SETTLE_DELAY_MS).catch(() => {});
+  notes.push('La página es una app de Flutter: se activó su accesibilidad para ver los campos.');
 }
 
 // What a screenshot covers, in viewport pixels: one element (scrolled into
@@ -202,6 +261,7 @@ async function screenshot(target, request) {
 async function settle(target) {
   await target.waitForTimeout(SETTLE_DELAY_MS).catch(() => {});
   await target.waitForLoadState('domcontentloaded', { timeout: SETTLE_TIMEOUT_MS }).catch(() => {});
+  await enableAccessibility(target);
 }
 
 async function tabs() {
@@ -226,7 +286,19 @@ async function state(target, { ref, withSnapshot = true } = {}) {
     tabs: await tabs(),
     snapshot,
     dialogs: dialogs.splice(0),
+    notes: notes.splice(0),
+    signIn: await asksToSignIn(target),
   };
+}
+
+// A visible password field, in the page or one of its frames, means the
+// site asks to sign in: the profile's session is not active there.
+async function asksToSignIn(target) {
+  for (const frame of target.frames()) {
+    const count = await frame.locator('input[type="password"]:visible').count().catch(() => 0);
+    if (count > 0) return true;
+  }
+  return false;
 }
 
 async function run(request) {
@@ -245,11 +317,12 @@ async function run(request) {
       else await target.reload({ waitUntil: 'domcontentloaded' });
       break;
     case 'snapshot':
+      if (!request.ref) await enableAccessibility(target);
       return { page: await state(target, { ref: request.ref }) };
     case 'click':
       acceptNextDialog = Boolean(request.acceptDialog);
       try {
-        await (await present(target, request.ref)).click({ button: request.button, clickCount: request.double ? 2 : 1 });
+        await act(target, request, (found) => found.click({ button: request.button, clickCount: request.double ? 2 : 1 }));
         // A dialog opens right after the click.
         await settle(target);
       } finally {
@@ -275,16 +348,17 @@ async function run(request) {
       await target.mouse.up();
       break;
     case 'type': {
-      const field = await present(target, request.ref);
-      await field.fill(request.text);
-      if (request.submit) await field.press('Enter');
+      await act(target, request, async (field) => {
+        await field.fill(request.text);
+        if (request.submit) await field.press('Enter');
+      });
       break;
     }
     case 'press':
       await target.keyboard.press(request.key);
       break;
     case 'select':
-      await (await present(target, request.ref)).selectOption(request.values);
+      await act(target, request, (found) => found.selectOption(request.values));
       break;
     case 'screenshot': {
       const shot = await screenshot(target, request);

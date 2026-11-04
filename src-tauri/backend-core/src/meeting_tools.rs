@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::error::BackendError;
 use crate::library_config::normalize_context_tag;
+use crate::meeting::MeetingRecord;
 use crate::meeting_ai::{
     clip, normalized_folder, parse_clock, MeetingContextChoice, MeetingNoteTask, MeetingNoteTopic, MAX_ITEM_CHARS,
     MAX_LIST_ITEMS, MAX_NOTE_TASKS, MAX_OBJECTIVE_CHARS, MAX_TASK_FIELD_CHARS, MAX_TOPICS, MAX_TOPIC_TITLE_CHARS,
@@ -210,6 +211,57 @@ pub fn parse_replacements(arguments: &Value) -> Result<Vec<(String, String)>, Ba
         .collect()
 }
 
+/// What the confirmation of a Meeting change shows, after checking its
+/// input as the execution will. A transcript correction lists each pair
+/// with how many times it changes the open meeting, tried in order on a
+/// copy as the execution applies them; the other changes show what they
+/// ask for. Without an open meeting only the AI context can change.
+pub fn preview_text(name: &str, arguments: &Value, record: Option<&MeetingRecord>) -> Result<String, BackendError> {
+    let open = || record.ok_or_else(|| invalid("No hay una reunión abierta en Meeting."));
+    let (summary, detail) = match name {
+        "correct_meeting_transcript" => {
+            let replacements = parse_replacements(arguments)?;
+            let mut copy = open()?.clone();
+            let mut total = 0;
+            let mut lines = Vec::new();
+            for (from, to) in &replacements {
+                let count = copy.replace_in_transcript(from, to);
+                total += count;
+                lines.push(format!("- «{from}» → «{to}»: {}", appearances(count)));
+            }
+            (format!("Corregir la transcripción: {} en total", appearances(total)), lines.join("\n"))
+        }
+        "update_meeting_notes" => {
+            parse_notes_update(arguments)?;
+            open()?;
+            ("Reemplazar secciones de las Notas IA de la reunión".to_string(), pretty(arguments))
+        }
+        "add_meeting_notes" => {
+            parse_notes_addition(arguments)?;
+            open()?;
+            ("Sumar a las Notas IA de la reunión".to_string(), pretty(arguments))
+        }
+        "set_meeting_ai_context" => {
+            parse_context_choice(arguments)?;
+            ("Cambiar el contexto que lee la IA de Meeting".to_string(), pretty(arguments))
+        }
+        _ => return Err(invalid("La herramienta de reunión no existe.")),
+    };
+    Ok(format!("{summary}\n{detail}"))
+}
+
+fn appearances(count: usize) -> String {
+    match count {
+        0 => "ninguna aparición".to_string(),
+        1 => "1 aparición".to_string(),
+        count => format!("{count} apariciones"),
+    }
+}
+
+fn pretty(arguments: &Value) -> String {
+    serde_json::to_string_pretty(arguments).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +371,27 @@ mod tests {
         assert_eq!(replacements, vec![("carreo".to_string(), "correo".to_string())]);
         assert!(parse_replacements(&json!({ "replacements": [{ "from": "a", "to": "b" }] })).is_err());
         assert!(parse_replacements(&json!({ "replacements": [] })).is_err());
+    }
+
+    #[test]
+    fn the_confirmation_counts_each_replacement_without_changing_the_meeting() {
+        let record = record();
+        let arguments = json!({ "replacements": [
+            { "from": "carreo", "to": "correo" },
+            { "from": "correo corporativo", "to": "correo de la empresa" },
+            { "from": "inexistente", "to": "algo" },
+        ] });
+        let text = preview_text("correct_meeting_transcript", &arguments, Some(&record)).expect("preview");
+        assert_eq!(
+            text,
+            "Corregir la transcripción: 4 apariciones en total\n\
+             - «carreo» → «correo»: 3 apariciones\n\
+             - «correo corporativo» → «correo de la empresa»: 1 aparición\n\
+             - «inexistente» → «algo»: ninguna aparición"
+        );
+        assert_eq!(record, self::record(), "the preview works on a copy");
+        assert!(preview_text("correct_meeting_transcript", &arguments, None).is_err());
+        assert!(preview_text("add_meeting_notes", &json!({}), Some(&record)).is_err());
+        assert!(preview_text("set_meeting_ai_context", &json!({ "mode": "ninguno" }), None).is_ok());
     }
 }

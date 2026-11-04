@@ -8,6 +8,7 @@ const runtime = vi.hoisted(() => ({
   saveConnection: vi.fn(),
   testHostConnection: vi.fn(),
   pickCopyFolder: vi.fn(),
+  syncCopyNow: vi.fn(),
 }))
 
 vi.mock('../../../services/connection/connectionRuntime', async (importOriginal) => ({
@@ -19,19 +20,16 @@ const { RunModeSection } = await import('./RunModeSection')
 
 const view = (overrides: Partial<ConnectionView> = {}): ConnectionView => ({
   mode: 'host',
-  clientKind: 'copy',
   hostAddress: '',
   canHost: true,
   server: { listening: true, port: 52480, error: null },
-  link: { state: 'unknown', library: null, platform: null, signedIn: false, message: null, moveTo: null },
-  hostOnlyCommands: [],
-  canKeepCopy: true,
+  link: { state: 'unknown', library: null, platform: null, signedIn: false, message: null },
   copyNeedsFolder: false,
   copyFolder: null,
-  offlineCopy: false,
+  copyReady: false,
   copy: null,
-  collaboration: true,
-  deviceName: 'NOTEBOOK',
+  progress: null,
+  runsServices: true,
   statusInNotification: false,
   ...overrides,
 })
@@ -42,12 +40,13 @@ describe('RunModeSection', () => {
   })
   afterEach(cleanup)
 
-  it('shows the port a host listens on', async () => {
+  it('shows the port a host listens on and that it runs the services', async () => {
     runtime.fetchConnection.mockResolvedValue(view())
     render(<RunModeSection />)
     expect(await screen.findByText('Escuchando')).toBeTruthy()
     expect(screen.getByText('52480')).toBeTruthy()
     expect(screen.getByRole('radio', { name: /Host/ }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByText('En esta computadora')).toBeTruthy()
   })
 
   it('becomes a client once the address of the host is saved', async () => {
@@ -57,47 +56,65 @@ describe('RunModeSection', () => {
     render(<RunModeSection />)
     fireEvent.click(await screen.findByRole('radio', { name: /Cliente/ }))
     expect(runtime.saveConnection).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('radio', { name: /Remoto/ }))
     fireEvent.change(screen.getByLabelText('Dirección del host'), { target: { value: '192.168.0.10' } })
     fireEvent.click(screen.getByRole('button', { name: 'Guardar' }))
     await waitFor(() => expect(runtime.saveConnection).toHaveBeenCalledWith({
       mode: 'client',
-      clientKind: 'remote',
       hostAddress: '192.168.0.10',
       trustNewCertificate: true,
     }))
     expect(await screen.findByText('Conectado')).toBeTruthy()
   })
 
-  it('reports a host that does not answer', async () => {
-    runtime.fetchConnection.mockResolvedValue(view({ mode: 'client', hostAddress: '192.168.0.10:52480' }))
+  it('reports a host that does not answer and that the copy keeps working', async () => {
+    const offline = view({
+      mode: 'client',
+      hostAddress: '192.168.0.10:52480',
+      runsServices: false,
+      link: { state: 'offline', library: 'gaia', platform: null, signedIn: false, message: null },
+    })
+    runtime.fetchConnection.mockResolvedValue(offline)
     runtime.testHostConnection.mockResolvedValue({ ok: false, library: null, latencyMs: 0, message: 'No se pudo contactar al host de Notia.' })
     render(<RunModeSection />)
     expect(await screen.findByText('No responde')).toBeTruthy()
     expect(screen.getByRole('alert').textContent).toContain('No se pudo contactar')
+    expect(screen.getByText(/trabajás con la copia local/)).toBeTruthy()
+    expect(screen.getByText('En otra computadora')).toBeTruthy()
   })
 
-  it('offers only the remote client where no copy is kept', async () => {
-    runtime.fetchConnection.mockResolvedValue(view({ mode: 'client', hostAddress: 'casa:52480', canHost: false, canKeepCopy: false }))
-    runtime.testHostConnection.mockResolvedValue({ ok: true, library: null, latencyMs: 1, message: null })
+  it('syncs the copy now and shows the last sync', async () => {
+    const client = view({
+      mode: 'client',
+      hostAddress: 'casa:52480',
+      link: { state: 'online', library: 'gaia', platform: 'windows', signedIn: true, message: null },
+    })
+    const synced = { ...client, copy: { downloaded: 1, uploaded: 0, deleted: 0, rowsUploaded: 0, rowsDownloaded: 2, skipped: [], atMs: Date.UTC(2026, 10, 3, 15, 30), error: null } }
+    runtime.fetchConnection.mockResolvedValueOnce(client).mockResolvedValue(synced)
+    runtime.testHostConnection.mockResolvedValue({ ok: true, library: 'gaia', latencyMs: 2, message: null })
+    runtime.syncCopyNow.mockResolvedValue(synced.copy)
     render(<RunModeSection />)
-    const copy = await screen.findByRole('radio', { name: /Con copia/ }) as HTMLButtonElement
-    expect(copy.disabled).toBe(true)
-    expect(screen.getByRole('radio', { name: /^Remoto/ }).getAttribute('aria-checked')).toBe('true')
+    expect(await screen.findByText('Todavía no se sincronizó.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Sincronizar ahora' }))
+    expect(runtime.syncCopyNow).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText(/^Sincronizado a las/)).toBeTruthy()
   })
 
-  it('asks Android for the folder of the copy before keeping it', async () => {
-    const android = view({ mode: 'client', clientKind: 'remote', hostAddress: 'casa:52480', canHost: false, copyNeedsFolder: true })
+  it('asks Android for the folder of the copy before becoming a client', async () => {
+    const android = view({ canHost: false, copyNeedsFolder: true })
     runtime.fetchConnection.mockResolvedValue(android)
-    runtime.testHostConnection.mockResolvedValue({ ok: true, library: 'gaia', latencyMs: 3, message: null })
     runtime.pickCopyFolder.mockResolvedValue({ ...android, copyFolder: 'NotiaCopia' })
-    runtime.saveConnection.mockResolvedValue({ connection: { ...android, clientKind: 'copy', copyFolder: 'NotiaCopia' }, reload: true })
+    runtime.saveConnection.mockResolvedValue({ connection: { ...android, mode: 'client', copyFolder: 'NotiaCopia' }, reload: true })
     render(<RunModeSection />)
-    fireEvent.click(await screen.findByRole('radio', { name: /Con copia/ }))
-    expect(runtime.saveConnection).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole('radio', { name: /Cliente/ }))
     expect(screen.getByText('Sin elegir')).toBeTruthy()
+    // Android never runs the services: there is no row for them.
+    expect(screen.queryByText('Servicios de la biblioteca')).toBeNull()
+    fireEvent.change(screen.getByLabelText('Dirección del host'), { target: { value: 'casa' } })
+    expect((screen.getByRole('button', { name: 'Guardar' }) as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'Elegir carpeta' }))
-    await waitFor(() => expect(runtime.saveConnection).toHaveBeenCalledWith({ mode: 'client', clientKind: 'copy', hostAddress: 'casa:52480' }))
+    expect(await screen.findByText('NotiaCopia')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Guardar' }))
+    await waitFor(() => expect(runtime.saveConnection).toHaveBeenCalledWith({ mode: 'client', hostAddress: 'casa', trustNewCertificate: true }))
     expect(runtime.pickCopyFolder).toHaveBeenCalledTimes(1)
   })
 })

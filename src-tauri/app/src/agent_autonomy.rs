@@ -89,8 +89,8 @@ fn review_due(last_ms: Option<u64>, now_ms: u64) -> bool {
 }
 
 fn tick(app: &AppHandle, clock: &mut Clock) {
-    // The host keeps the agent of a client's library.
-    if crate::connection::is_client(app) {
+    // Only the computer that runs the library's services keeps the agent.
+    if !crate::device_role::runs_services(app) {
         return;
     }
     let Some(library) = crate::library_catalog::selected_library(app) else {

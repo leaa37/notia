@@ -393,19 +393,29 @@ function useLocalVoiceTranscription({
     }
   }, [audioInput, capabilities, captureMicrophone, captureSystemAudio, continuousSession, draft, expectedSpeakers, maxDurationSeconds, meeting, speechRecognition])
 
-  /** Follows a session that kept recording or separating speakers while its view was closed. */
   /**
-   * Follows `sessionId` again and reads its state. Following it already (a
-   * dismissed error leaves the session here) reads the state again. Resolves
-   * whether the session is followed; `false` when it ended or another one is.
+   * Follows `sessionId` from now on without reading its state: its events
+   * reach this hook and pause, stop and cancel act on it. Whether it is the
+   * followed session; `false` when another one is.
    */
-  const attach = useCallback(async (sessionId: string) => {
+  const holdSession = useCallback((sessionId: string) => {
     if (sessionIdRef.current && sessionIdRef.current !== sessionId) return false
     if (!sessionIdRef.current) {
       sessionIdRef.current = sessionId
       confirmedTextRef.current = ''
       visiblePartialTextRef.current = ''
     }
+    return true
+  }, [])
+
+  /**
+   * Follows a session that kept recording or separating speakers while its
+   * view was closed, and reads its state. Following it already (a dismissed
+   * error leaves the session here) reads the state again. Resolves whether
+   * the session is followed; `false` when it ended or another one is.
+   */
+  const attach = useCallback(async (sessionId: string) => {
+    if (!holdSession(sessionId)) return false
     const eventsBefore = stateEventsRef.current
     try {
       const current = await getSpeechSessionState(sessionId)
@@ -418,7 +428,7 @@ function useLocalVoiceTranscription({
       if (sessionIdRef.current === sessionId) sessionIdRef.current = null
       return false
     }
-  }, [])
+  }, [holdSession])
 
   const invokeForCurrentSession = useCallback(async (operation: (sessionId: string) => Promise<void>) => {
     const sessionId = sessionIdRef.current
@@ -470,6 +480,7 @@ function useLocalVoiceTranscription({
     stop: () => invokeForCurrentSession(stopSpeechSession),
     cancel,
     attach,
+    holdSession,
     dismissError: () => setState(INITIAL_STATE),
   }
 }

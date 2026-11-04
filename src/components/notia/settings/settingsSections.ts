@@ -6,6 +6,7 @@ import {
   Globe,
   ImageIcon,
   Info,
+  MessageCircle,
   Mic,
   PanelRight,
   PenLine,
@@ -14,18 +15,19 @@ import {
   Sparkles,
   Tag,
   Users,
+  Webhook,
   type LucideIcon,
 } from 'lucide-react'
 
-export type SettingsSection = 'General' | 'Contextos' | 'Clima' | 'Roles' | 'Usuarios' | 'Panel desplegable' | 'InkMath' | 'IA' | 'Imágenes' | 'Voz' | 'Telegram' | 'Cuentas asociadas' | 'Finanzas' | 'Backups' | 'Publicar'
+export type SettingsSection = 'General' | 'Contextos' | 'Clima' | 'Roles' | 'Usuarios' | 'Panel desplegable' | 'InkMath' | 'IA' | 'Imágenes' | 'Voz' | 'Telegram' | 'WhatsApp' | 'Webhook' | 'Cuentas asociadas' | 'Finanzas' | 'Backups' | 'Publicar'
 
-export const SETTINGS_SECTIONS: SettingsSection[] = ['General', 'Contextos', 'Clima', 'Roles', 'Usuarios', 'Panel desplegable', 'InkMath', 'IA', 'Imágenes', 'Voz', 'Telegram', 'Cuentas asociadas', 'Finanzas', 'Backups', 'Publicar']
+export const SETTINGS_SECTIONS: SettingsSection[] = ['General', 'Contextos', 'Clima', 'Roles', 'Usuarios', 'Panel desplegable', 'InkMath', 'IA', 'Imágenes', 'Voz', 'Telegram', 'WhatsApp', 'Webhook', 'Cuentas asociadas', 'Finanzas', 'Backups', 'Publicar']
 
 export const SETTINGS_GROUPS: Array<{ label: string; sections: SettingsSection[] }> = [
   { label: 'Biblioteca', sections: ['General', 'Contextos', 'Clima'] },
   { label: 'Acceso', sections: ['Usuarios', 'Roles'] },
   { label: 'Editor', sections: ['Panel desplegable', 'InkMath'] },
-  { label: 'Integraciones', sections: ['IA', 'Imágenes', 'Voz', 'Telegram', 'Cuentas asociadas'] },
+  { label: 'Integraciones', sections: ['IA', 'Imágenes', 'Voz', 'Telegram', 'WhatsApp', 'Webhook', 'Cuentas asociadas'] },
   { label: 'Datos', sections: ['Backups', 'Publicar', 'Finanzas'] },
 ]
 
@@ -48,6 +50,8 @@ export const SETTINGS_SECTION_META: Record<SettingsSection, SettingsSectionMeta>
   'Imágenes': { description: 'Modelo local con el que el asistente genera y edita imágenes.', icon: ImageIcon, keywords: 'imagen foto dibujo qwen image generar editar gpu modelo descargar' },
   Voz: { description: 'Reconocimiento y síntesis de voz locales.', icon: Mic, keywords: 'dictado whisper qwen tts idioma' },
   Telegram: { description: 'Bot de esta biblioteca y usuarios vinculados.', icon: Send, keywords: 'bot token' },
+  WhatsApp: { description: 'Tu WhatsApp vinculado: qué chats lee y escribe el asistente y cuáles responde solo.', icon: MessageCircle, keywords: 'whatsapp wpp chat mensajes autorespuesta prompt baileys qr' },
+  Webhook: { description: 'Acciones que otros programas pueden pedirle a Notia; la respuesta llega por Telegram.', icon: Webhook, keywords: 'webhook api http post endpoint accion prompt token alerta programa integracion' },
   'Cuentas asociadas': { description: 'Credenciales de Google Cloud y cuenta de Gmail de la biblioteca activa.', icon: AtSign, keywords: 'gmail correo mail email google cloud gcp client id secret oauth' },
   Backups: { description: 'Copias automáticas de la biblioteca activa.', icon: Archive, keywords: 'copia zip carpeta' },
   Publicar: { description: 'Compartí tableros del Task Manager y espacios públicos de lectura en la red local.', icon: Globe, keywords: 'task manager puerto navegador red espacios públicos gitbook sitio' },

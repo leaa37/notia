@@ -5,7 +5,8 @@ use crate::host::{State, Window};
 
 use super::types::OperationResult;
 
-const LIBRARY_TREE_CHANGED_EVENT: &str = "notia-library-tree-changed";
+/// The files of the library changed: the explorer reads them again.
+pub(crate) const LIBRARY_TREE_CHANGED_EVENT: &str = "notia-library-tree-changed";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

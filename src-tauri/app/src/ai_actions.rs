@@ -1047,8 +1047,8 @@ struct Due {
 }
 
 fn tick(app: &AppHandle) -> AiActionsResult<()> {
-    // The host runs the actions of a client's library.
-    if crate::connection::is_client(app) {
+    // Only the computer that runs the library's services runs the actions.
+    if !crate::device_role::runs_services(app) {
         return Ok(());
     }
     let Some(library) = crate::library_catalog::selected_library(app) else {

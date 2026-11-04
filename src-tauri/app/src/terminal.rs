@@ -33,24 +33,23 @@ const READ_BUFFER: usize = 8 * 1024;
 /// How often the status thread looks whether the command ended.
 const STATUS_POLL: Duration = Duration::from_millis(250);
 
-/// Whether this device runs the agent's commands.
-pub(crate) fn is_available(app: &AppHandle) -> bool {
-    cfg!(not(any(target_os = "android", target_os = "ios"))) && !crate::connection::is_client(app)
+/// Whether this device runs the agent's commands: any computer (Windows,
+/// Linux or macOS), a client too, never Android.
+pub(crate) fn is_available(_app: &AppHandle) -> bool {
+    cfg!(not(any(target_os = "android", target_os = "ios")))
 }
 
-fn unavailable(app: &AppHandle) -> BackendError {
-    let message = if crate::connection::is_client(app) {
-        "Este dispositivo es un cliente: la terminal corre solo en la PC host, cuando hay conexión."
-    } else {
-        "La terminal existe solo en la PC host de Notia, no en este dispositivo."
-    };
-    BackendError::new(BackendErrorCode::Unsupported, message, false)
+fn unavailable(_app: &AppHandle) -> BackendError {
+    BackendError::new(BackendErrorCode::Unsupported, "La terminal existe solo en las computadoras con Notia, no en Android.", false)
 }
 
 /// The confirmation's title and the command whole, with the folder it runs in.
 pub(crate) fn preview(app: &AppHandle, context: &BackendRequestContext, arguments: &Value) -> Result<(String, String), BackendError> {
     if !is_available(app) {
         return Err(unavailable(app));
+    }
+    if let Some(scan) = terminal::DiskUsageRequest::from_arguments(arguments)? {
+        return Ok((scan.summary(), scan.detail()));
     }
     let request = TerminalRequest::from_arguments(arguments)?;
     let cwd = working_folder(app, &context.library_id, request.cwd.as_deref())?;
@@ -71,6 +70,11 @@ pub(crate) fn execute_tool(
 ) -> Result<Value, BackendError> {
     if !is_available(app) {
         return Err(unavailable(app));
+    }
+    if let Some(scan) = terminal::DiskUsageRequest::from_arguments(arguments)? {
+        let (usage, elapsed) = scan_disk(&scan, control)?;
+        log::info!("[notia:terminal] uso de disco medido en {} s", elapsed.as_secs());
+        return Ok(terminal::disk_usage_result(&scan, usage, elapsed));
     }
     let request = TerminalRequest::from_arguments(arguments)?;
     let cwd = working_folder(app, &context.library_id, request.cwd.as_deref())?;
@@ -276,6 +280,88 @@ fn follow(
 
 /// The folder the command runs in: the one asked for, which must exist;
 /// otherwise the library's folder, or the user's home.
+/// Measures `request.path` in one pass: what each folder or file directly
+/// inside it holds, and the largest files. Links and junctions are not
+/// followed, so nothing is counted twice; what cannot be read is counted
+/// apart. It stops at its time limit or a cancel with what it measured.
+fn scan_disk(request: &terminal::DiskUsageRequest, control: &RequestControl) -> Result<(terminal::DiskUsage, Duration), BackendError> {
+    let root = PathBuf::from(&request.path);
+    let children = std::fs::read_dir(&root).map_err(|_| BackendError::invalid_input(format!("No se puede leer la carpeta {} en la PC host.", request.path)))?;
+    let started = Instant::now();
+    let mut usage = terminal::DiskUsage::default();
+    let mut seen = 0_u64;
+    for child in children {
+        let Ok(child) = child else {
+            usage.unreadable += 1;
+            continue;
+        };
+        let Ok(kind) = child.file_type() else {
+            usage.unreadable += 1;
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        let mut entry = terminal::DiskEntry { name: child.file_name().to_string_lossy().into_owned(), bytes: 0, files: 0, folder: kind.is_dir() };
+        let mut pending = vec![child.path()];
+        if !kind.is_dir() {
+            pending.clear();
+            entry.files = 1;
+            entry.bytes = child.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            keep_largest(&mut usage.largest, child.path(), entry.bytes);
+        }
+        while let Some(folder) = pending.pop() {
+            seen += 1;
+            if seen % 500 == 0 {
+                if control.is_cancelled() {
+                    return Err(BackendError::cancelled());
+                }
+                if started.elapsed() >= terminal::DISK_SCAN_TIMEOUT {
+                    usage.partial = true;
+                    break;
+                }
+            }
+            let Ok(items) = std::fs::read_dir(&folder) else {
+                usage.unreadable += 1;
+                continue;
+            };
+            for item in items {
+                let Ok(item) = item else {
+                    usage.unreadable += 1;
+                    continue;
+                };
+                match item.file_type() {
+                    Ok(kind) if kind.is_symlink() => {}
+                    Ok(kind) if kind.is_dir() => pending.push(item.path()),
+                    Ok(_) => match item.metadata() {
+                        Ok(metadata) => {
+                            entry.bytes += metadata.len();
+                            entry.files += 1;
+                            keep_largest(&mut usage.largest, item.path(), metadata.len());
+                        }
+                        Err(_) => usage.unreadable += 1,
+                    },
+                    Err(_) => usage.unreadable += 1,
+                }
+            }
+        }
+        usage.entries.push(entry);
+        if usage.partial {
+            break;
+        }
+    }
+    Ok((usage, started.elapsed()))
+}
+
+/// Keeps the `DISK_LARGEST_FILES` largest files seen.
+fn keep_largest(largest: &mut Vec<(String, u64)>, path: PathBuf, bytes: u64) {
+    if largest.len() < terminal::DISK_LARGEST_FILES {
+        largest.push((path.to_string_lossy().into_owned(), bytes));
+    } else if let Some(smallest) = largest.iter_mut().min_by_key(|(_, size)| *size).filter(|(_, size)| *size < bytes) {
+        *smallest = (path.to_string_lossy().into_owned(), bytes);
+    }
+}
+
 fn working_folder(app: &AppHandle, library_id: &str, asked: Option<&str>) -> Result<PathBuf, BackendError> {
     if let Some(asked) = asked {
         let path = PathBuf::from(asked);
@@ -366,8 +452,8 @@ fn read_output(child: &mut Child) -> mpsc::Receiver<Vec<u8>> {
     receiver
 }
 
-/// Stops the shell and everything it started.
-fn stop(child: &mut Child) {
+/// Stops the shell and everything it started (also a support script).
+pub(crate) fn stop(child: &mut Child) {
     let pid = child.id();
     #[cfg(target_os = "windows")]
     {

@@ -140,6 +140,14 @@ pub fn normalize_library_config(value: &Value) -> NormalizedLibraryConfig {
     if let Some(accounts) = crate::mail_accounts::normalize_mail_accounts(candidate.get(crate::mail_accounts::MAIL_ACCOUNTS_KEY)) {
         config.insert(crate::mail_accounts::MAIL_ACCOUNTS_KEY.into(), accounts);
     }
+    // The WhatsApp link and what each chat allows; clients never receive it.
+    if let Some(whatsapp) = crate::whatsapp::normalize_whatsapp_config(candidate.get(crate::whatsapp::WHATSAPP_KEY)) {
+        config.insert(crate::whatsapp::WHATSAPP_KEY.into(), whatsapp);
+    }
+    // The webhook endpoint and its actions; clients never receive it.
+    if let Some(webhook) = crate::webhooks::normalize_webhook_config(candidate.get(crate::webhooks::WEBHOOK_KEY)) {
+        config.insert(crate::webhooks::WEBHOOK_KEY.into(), webhook);
+    }
     // The weather place, chosen in Settings among Open-Meteo's places.
     if let Some(weather) = crate::weather::normalize_weather_config(candidate.get(crate::weather::WEATHER_KEY)) {
         config.insert(crate::weather::WEATHER_KEY.into(), weather);

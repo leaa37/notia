@@ -20,10 +20,10 @@
 //! panel reloads. A task that was working when Notia closed is marked
 //! interrupted at the next start and can be resumed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::backend::ai_actions::time_zone;
 use crate::backend::ai_tasks::prompts::{
     approval_message, executor_request, finished_message, parse_plan, parse_review, planner_request, review_request, step_unfinished,
+    step_without_report,
 };
 use crate::backend::ai_tasks::tools::{self, NewTask};
 use crate::backend::ai_tasks::views::{self, AiTaskCard, AiTaskDetail, AiTaskThinking};
@@ -63,6 +64,9 @@ const FIRST_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How often the watch looks at the waiting tasks.
 const WAIT_WATCH_INTERVAL: Duration = Duration::from_secs(60);
+/// A look asked for a moment ends this long after it, so a reply counted
+/// as quiet at that moment already is.
+const LOOK_MARGIN: Duration = Duration::from_secs(1);
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as i64).unwrap_or_default()
@@ -203,7 +207,15 @@ struct Runner {
     /// The run of the phase that works now, to cancel it and show its thinking.
     current: Option<CurrentRun>,
     /// The approval it waits for and where its answer goes.
-    waiting: Option<(String, mpsc::Sender<ApprovalAnswer>)>,
+    waiting: Option<WaitingApproval>,
+}
+
+struct WaitingApproval {
+    approval_id: String,
+    /// Its message in the Owner's Telegram chat: a reply to it answers.
+    telegram: Option<(i64, i64)>,
+    kind: ApprovalKind,
+    sender: mpsc::Sender<ApprovalAnswer>,
 }
 
 #[derive(Clone)]
@@ -212,6 +224,7 @@ struct CurrentRun {
     idempotency_key: String,
     phase: AiTaskPhase,
     step_id: Option<String>,
+    started_ms: i64,
 }
 
 fn runners() -> &'static Mutex<HashMap<String, Runner>> {
@@ -383,9 +396,39 @@ pub(crate) fn answer_from_telegram(data: &str) {
         },
     };
     if let Ok(runners) = runners().lock() {
-        if let Some((_, sender)) = runners.values().filter_map(|runner| runner.waiting.as_ref()).find(|(id, _)| id == approval_id) {
-            let _ = sender.send(answer);
+        if let Some(waiting) = runners.values().filter_map(|runner| runner.waiting.as_ref()).find(|waiting| waiting.approval_id == approval_id) {
+            let _ = waiting.sender.send(answer);
         }
+    }
+}
+
+/// A text the Owner wrote in Telegram as a reply («Responder») to the
+/// message of a task's approval: it answers a question, or proposes
+/// something else instead of a change or a plan. Whether it was one.
+pub(crate) fn answer_reply_from_telegram(chat_id: i64, reply_to_message_id: i64, text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let Ok(runners) = runners().lock() else { return false };
+    let Some(waiting) = runners
+        .values()
+        .filter_map(|runner| runner.waiting.as_ref())
+        .find(|waiting| waiting.telegram == Some((chat_id, reply_to_message_id)))
+    else {
+        return false;
+    };
+    let choice = if waiting.kind == ApprovalKind::Clarification { AnswerChoice::Answer } else { AnswerChoice::Propose };
+    waiting.sender.send(ApprovalAnswer { choice, text: Some(text.to_string()), option_index: None }).is_ok()
+}
+
+/// The Telegram chat where a task talks to the Owner: the one it was
+/// created in, or the chat the Owner linked, wherever the task was created
+/// (the app, an AI action); `None` while the Owner has no Telegram linked.
+fn owner_chat(app: &AppHandle, database: &LibraryDatabaseContext, task: &AiTask) -> Option<i64> {
+    match (task.origin, task.telegram_chat_id) {
+        (AiTaskOrigin::Telegram, Some(chat_id)) => Some(chat_id),
+        _ => crate::library_users::owner_telegram_link(app, database).ok().flatten().map(|(_, chat_id)| chat_id),
     }
 }
 
@@ -399,6 +442,41 @@ enum PhaseStop {
     /// The task was deleted while it worked.
     Gone,
     Failed(String),
+    /// The provider failed or answered nothing: the same work is tried
+    /// again (`MAX_RUN_RETRIES`) before the task fails.
+    Interrupted(String),
+}
+
+/// A run that ended for the provider (down, a server failure, an empty
+/// answer) is tried again; any other failure stops the task.
+fn run_failure(error: BackendError) -> PhaseStop {
+    if matches!(error.code, BackendErrorCode::ProviderUnavailable | BackendErrorCode::Timeout) {
+        PhaseStop::Interrupted(error.message)
+    } else {
+        PhaseStop::Failed(error.message)
+    }
+}
+
+/// Retries of one phase (the plan, a step, the review) whose run was cut or,
+/// for a step, ended without its report; the steps done stay.
+const MAX_RUN_RETRIES: u32 = 2;
+const RUN_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
+/// The step goes back to be done again, with how the last try ended.
+fn retry_step(task: &mut AiTask, index: usize, report: &str) {
+    let step = &mut task.steps[index];
+    step.status = StepStatus::Failed;
+    step.report = Some(clipped_report(report));
+    step.finished_at_ms = Some(now_ms());
+}
+
+/// Waits before trying a phase again; a cancel ends the wait (the loop
+/// then finishes the task as cancelled).
+fn pause_before_retry(cancel: &AtomicBool) {
+    let until = Instant::now() + RUN_RETRY_PAUSE;
+    while Instant::now() < until && !cancel.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Starts working a stored task in a thread of this process, unless one
@@ -454,8 +532,8 @@ fn finish(app: &AppHandle, library_id: &str, database: &LibraryDatabaseContext, 
     if !save(app, library_id, database, task)? {
         return Ok(());
     }
-    if let (AiTaskOrigin::Telegram, Some(chat_id)) = (task.origin, task.telegram_chat_id) {
-        if status != AiTaskStatus::Cancelled {
+    if status != AiTaskStatus::Cancelled {
+        if let Some(chat_id) = owner_chat(app, database, task) {
             crate::telegram_worker::send_task_message(app, library_id, chat_id, &finished_message(task), Vec::new());
         }
     }
@@ -465,6 +543,7 @@ fn finish(app: &AppHandle, library_id: &str, database: &LibraryDatabaseContext, 
 /// Works the task until it ends, is cancelled or waits too long.
 fn work(app: &AppHandle, library_id: &str, task_id: &str, cancel: &AtomicBool) -> Result<(), BackendError> {
     let database = database(app, library_id)?;
+    let mut retries = 0;
     loop {
         let Some(mut task) = read(app, &database, |connection| load_task(connection, task_id))? else {
             return Ok(());
@@ -502,8 +581,20 @@ fn work(app: &AppHandle, library_id: &str, task_id: &str, cancel: &AtomicBool) -
                     return Ok(());
                 };
                 return match stop {
+                    PhaseStop::Interrupted(error) if retries < MAX_RUN_RETRIES => {
+                        retries += 1;
+                        log::warn!("[notia:ai-task] {} se cortó ({error}); intento {} de {}", phase.label(), retries + 1, MAX_RUN_RETRIES + 1);
+                        if let Some(index) = step_index {
+                            retry_step(&mut task, index, &format!("No terminado: la corrida se cortó ({error})."));
+                        }
+                        if !save(app, library_id, &database, &mut task)? {
+                            return Ok(());
+                        }
+                        pause_before_retry(cancel);
+                        continue;
+                    }
                     PhaseStop::Cancelled => finish(app, library_id, &database, &mut task, AiTaskStatus::Cancelled, None),
-                    PhaseStop::Failed(error) => {
+                    PhaseStop::Failed(error) | PhaseStop::Interrupted(error) => {
                         finish(app, library_id, &database, &mut task, AiTaskStatus::Failed, Some(format!("{}: {error}", phase.label())))
                     }
                     PhaseStop::Gone => Ok(()),
@@ -516,10 +607,10 @@ fn work(app: &AppHandle, library_id: &str, task_id: &str, cancel: &AtomicBool) -
         };
         let now = now_ms();
         match next {
-            NextWork::Plan => match parse_plan(&answer) {
-                Ok(steps) => task.set_plan(steps),
-                Err(error) => return finish(app, library_id, &database, &mut task, AiTaskStatus::Failed, Some(error)),
-            },
+            NextWork::Plan => {
+                let steps = parse_plan(&answer, &task.goal);
+                task.set_plan(steps);
+            }
             NextWork::Execute(index) => {
                 // The note of the last wait went in this run's request.
                 task.wake = None;
@@ -527,9 +618,25 @@ fn work(app: &AppHandle, library_id: &str, task_id: &str, cancel: &AtomicBool) -
                     // The step waits: the thread ends and the watch wakes it.
                     waits::begin_wait(&mut task, index, &answer);
                     save(app, library_id, &database, &mut task)?;
+                    // A reply that arrived during the run wakes it now.
+                    look_at_waits_at(Instant::now() + LOOK_MARGIN);
                     return Ok(());
                 }
                 task.wait = None;
+                if step_without_report(&answer) {
+                    if retries < MAX_RUN_RETRIES {
+                        retries += 1;
+                        log::warn!("[notia:ai-task] el paso {} terminó sin informe; intento {} de {}", index + 1, retries + 1, MAX_RUN_RETRIES + 1);
+                        retry_step(&mut task, index, &answer);
+                        if !save(app, library_id, &database, &mut task)? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    retry_step(&mut task, index, &answer);
+                    let error = format!("El paso {} no tuvo informe en {} intentos.", index + 1, MAX_RUN_RETRIES + 1);
+                    return finish(app, library_id, &database, &mut task, AiTaskStatus::Failed, Some(error));
+                }
                 let step = &mut task.steps[index];
                 step.report = Some(clipped_report(&answer));
                 step.finished_at_ms = Some(now);
@@ -550,6 +657,7 @@ fn work(app: &AppHandle, library_id: &str, task_id: &str, cancel: &AtomicBool) -
             },
             NextWork::Done => {}
         }
+        retries = 0;
         if !save(app, library_id, &database, &mut task)? {
             return Ok(());
         }
@@ -589,7 +697,13 @@ fn run_phase(
     let context = phase_context(library_id);
     let idempotency_key = format!("{library_id}:{}", context.request_id);
     with_runner(task_id, |runner| {
-        runner.current = Some(CurrentRun { context: context.clone(), idempotency_key: idempotency_key.clone(), phase, step_id: step_id.clone() })
+        runner.current = Some(CurrentRun {
+            context: context.clone(),
+            idempotency_key: idempotency_key.clone(),
+            phase,
+            step_id: step_id.clone(),
+            started_ms: now_ms(),
+        })
     });
     let mut request = BackendRequest::Run(AgentRequest {
         context: context.clone(),
@@ -603,6 +717,7 @@ fn run_phase(
         library_search: true,
         autonomous: false,
         scheduled_action: None,
+        webhook_call: None,
         tool_areas: None,
         thinking: None,
         conversational: false,
@@ -623,7 +738,7 @@ fn run_phase(
             Ok(envelope) => envelope.response,
             Err(error) => {
                 crate::backend_runtime::log_request_failure(&runtime, "ai-task", &context, &error);
-                break Err(PhaseStop::Failed(error.message));
+                break Err(run_failure(error));
             }
         };
         match response {
@@ -635,7 +750,7 @@ fn run_phase(
             }
             BackendResponse::Error { error, .. } => {
                 crate::backend_runtime::log_request_failure(&runtime, "ai-task", &context, &error);
-                break Err(PhaseStop::Failed(error.message));
+                break Err(run_failure(error));
             }
             BackendResponse::Operation { status } | BackendResponse::Resumed { status, .. } => {
                 let (Some(operation), Some(interaction)) = (status.operation.clone(), status.interaction.clone()) else {
@@ -711,12 +826,19 @@ fn approve(
     }
     let mut approval = approval_of(interaction, phase, step_id);
     let previous_status = task.status;
-    if let (AiTaskOrigin::Telegram, Some(chat_id)) = (task.origin, task.telegram_chat_id) {
+    let chat = owner_chat(app, database, &task);
+    if let Some(chat_id) = chat {
         approval.telegram_message_id =
             crate::telegram_worker::send_task_message(app, library_id, chat_id, &approval_message(&task, &approval), telegram_buttons(&approval));
     }
     let (sender, receiver) = mpsc::channel();
-    with_runner(task_id, |runner| runner.waiting = Some((approval.id.clone(), sender)));
+    let waiting = WaitingApproval {
+        approval_id: approval.id.clone(),
+        telegram: chat.zip(approval.telegram_message_id),
+        kind: approval.kind,
+        sender,
+    };
+    with_runner(task_id, |runner| runner.waiting = Some(waiting));
     task.pending = Some(approval.clone());
     task.status = AiTaskStatus::AwaitingApproval;
     if !save(app, library_id, database, &mut task).map_err(stored)? {
@@ -739,7 +861,7 @@ fn approve(
         }
     };
     with_runner(task_id, |runner| runner.waiting = None);
-    if let (Some(chat_id), Some(message_id)) = (task.telegram_chat_id, approval.telegram_message_id) {
+    if let (Some(chat_id), Some(message_id)) = (chat, approval.telegram_message_id) {
         let mark = match &outcome {
             Ok((_, _, outcome)) => outcome.clone(),
             Err(_) => "Sin respuesta.".to_string(),
@@ -789,12 +911,22 @@ fn load(app: &AppHandle, library_id: &str, task_id: &str) -> Result<AiTask, Back
     read(app, &database, |connection| load_task(connection, task_id))?.ok_or_else(not_found)
 }
 
-/// Stops a task: the run of its phase is cancelled; a task no runner holds
-/// is marked cancelled at once.
-fn cancel(app: &AppHandle, library_id: &str, task_id: &str) -> Result<(), BackendError> {
+/// How long a cancel waits for the run at work to let go of the task, so
+/// the list read right after shows it cancelled.
+const STOP_WAIT: Duration = Duration::from_secs(20);
+
+/// Stops a task: the run of its phase is cancelled and the runner is waited
+/// for (up to `STOP_WAIT`); a task no runner holds is marked cancelled at
+/// once. Returns whether it already stopped.
+fn cancel(app: &AppHandle, library_id: &str, task_id: &str) -> Result<bool, BackendError> {
     let mut task = load(app, library_id, task_id)?;
     tools::check_cancellable(&task)?;
-    let current = with_runner(task_id, |runner| {
+    stop(app, library_id, &mut task)
+}
+
+fn stop(app: &AppHandle, library_id: &str, task: &mut AiTask) -> Result<bool, BackendError> {
+    let task_id = task.id.clone();
+    let current = with_runner(&task_id, |runner| {
         runner.cancel.store(true, Ordering::SeqCst);
         runner.current.clone()
     });
@@ -807,21 +939,44 @@ fn cancel(app: &AppHandle, library_id: &str, task_id: &str) -> Result<(), Backen
         Some(None) => {}
         None => {
             let database = database(app, library_id)?;
-            finish(app, library_id, &database, &mut task, AiTaskStatus::Cancelled, None)?;
+            finish(app, library_id, &database, task, AiTaskStatus::Cancelled, None)?;
+            return Ok(true);
         }
     }
-    Ok(())
+    let deadline = Instant::now() + STOP_WAIT;
+    while with_runner(&task_id, |_| ()).is_some() {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(true)
 }
 
 /// Goes on with a task that stopped, from its first step not done; a
-/// waiting one goes on without waiting more.
-fn resume(app: &AppHandle, library_id: &str, task_id: &str) -> Result<AiTask, BackendError> {
+/// waiting one goes on without waiting more. With a correction, a task at
+/// work stops first, then its goal changes and it plans again.
+fn resume(app: &AppHandle, library_id: &str, task_id: &str, replan: Option<&tools::Replan>) -> Result<AiTask, BackendError> {
     let mut task = load(app, library_id, task_id)?;
-    tools::check_resumable(&task)?;
-    if task.status == AiTaskStatus::Waiting {
+    tools::check_resumable(&task, replan)?;
+    if let Some(replan) = replan {
+        if task.status.is_active() && task.status != AiTaskStatus::Waiting {
+            if !stop(app, library_id, &mut task)? {
+                return Err(BackendError::new(
+                    BackendErrorCode::Conflict,
+                    "La tarea sigue terminando lo que hacía; probá de nuevo en unos segundos.",
+                    true,
+                ));
+            }
+            task = load(app, library_id, task_id)?;
+        }
+        task.replan(replan.goal.as_deref(), replan.restart);
+    } else if task.status == AiTaskStatus::Waiting {
         waits::wake(&mut task, waits::RESUMED_NOTE);
     }
-    task.status = if task.steps.is_empty() { AiTaskStatus::Planning } else { AiTaskStatus::Running };
+    if replan.is_none() {
+        task.status = if task.steps.is_empty() { AiTaskStatus::Planning } else { AiTaskStatus::Running };
+    }
     task.error = None;
     task.finished_at_ms = None;
     let database = database(app, library_id)?;
@@ -857,7 +1012,7 @@ fn delete(app: &AppHandle, library_id: &str, task_id: &str) -> Result<AiTask, Ba
 /// Sends the Owner's answer to the approval a task waits for.
 fn answer(task_id: &str, approval_id: &str, answer: ApprovalAnswer) -> Result<(), BackendError> {
     let sent = with_runner(task_id, |runner| match runner.waiting.as_ref() {
-        Some((waiting, sender)) if waiting == approval_id => sender.send(answer).is_ok(),
+        Some(waiting) if waiting.approval_id == approval_id => waiting.sender.send(answer).is_ok(),
         _ => false,
     });
     if sent == Some(true) {
@@ -962,7 +1117,7 @@ pub async fn ai_task_answer(app: AppHandle, context: AiTasksContext, task_id: St
 pub async fn ai_task_cancel(app: AppHandle, context: AiTasksContext, task_id: String) -> Result<(), BackendError> {
     blocking(move || {
         let library_id = context.library()?.to_string();
-        cancel(&app, &library_id, &task_id)
+        cancel(&app, &library_id, &task_id).map(|_| ())
     })
     .await
 }
@@ -970,7 +1125,7 @@ pub async fn ai_task_cancel(app: AppHandle, context: AiTasksContext, task_id: St
 pub async fn ai_task_resume(app: AppHandle, context: AiTasksContext, task_id: String) -> Result<(), BackendError> {
     blocking(move || {
         let library_id = context.library()?.to_string();
-        resume(&app, &library_id, &task_id).map(|_| ())
+        resume(&app, &library_id, &task_id, None).map(|_| ())
     })
     .await
 }
@@ -1003,7 +1158,10 @@ pub(crate) fn preview_tool(app: &AppHandle, context: &BackendRequestContext, nam
     let task = tools::resolve_task(&tasks, arguments)?;
     match name {
         "cancel_ai_task" => tools::check_cancellable(task).map(|()| tools::cancel_summary(task)),
-        "resume_ai_task" => tools::check_resumable(task).map(|()| tools::resume_summary(task)),
+        "resume_ai_task" => {
+            let replan = tools::replan_request(arguments)?;
+            tools::check_resumable(task, replan.as_ref()).map(|()| tools::resume_summary(task, replan.as_ref()))
+        }
         "review_ai_task" => tools::check_reviewable(task).map(|()| tools::review_summary(task, tools::review_instructions(arguments).as_deref())),
         "delete_ai_task" => Ok(tools::delete_summary(task)),
         _ => Err(BackendError::invalid_input("La herramienta no es de Tareas IA.")),
@@ -1029,7 +1187,8 @@ pub(crate) fn execute_tool(app: &AppHandle, context: &BackendRequestContext, nam
             "title": task.title,
             "created": true,
             "approveAll": task.approve_all,
-            "note": "La tarea ya empezó: la persona la sigue en Tareas IA. No la hagas vos en este turno.",
+            "status": task.status.label(),
+            "note": "La tarea quedó creada y el Planificador ya está armando el plan; si el objetivo pide esperar una hora o una respuesta, ese paso espera solo. La persona la sigue en Tareas IA. No la hagas vos en este turno. Para sumarle o corregirle algo al objetivo usá resume_ai_task con goal (en cualquier estado), sin crear otra tarea.",
         }));
     }
     let tasks = tasks_of(app, library_id)?;
@@ -1038,12 +1197,30 @@ pub(crate) fn execute_tool(app: &AppHandle, context: &BackendRequestContext, nam
         "get_ai_task" => Ok(tools::detail_view(tools::resolve_task(&tasks, arguments)?)),
         "cancel_ai_task" => {
             let task = tools::resolve_task(&tasks, arguments)?;
-            cancel(app, library_id, &task.id)?;
-            Ok(json!({ "id": task.id, "title": task.title, "cancelled": true }))
+            if cancel(app, library_id, &task.id)? {
+                Ok(json!({ "id": task.id, "title": task.title, "cancelled": true, "status": AiTaskStatus::Cancelled.label() }))
+            } else {
+                Ok(json!({
+                    "id": task.id,
+                    "title": task.title,
+                    "cancelled": true,
+                    "note": "La tarea se está deteniendo: termina la llamada que tenía en curso y queda cancelada; hasta entonces list_ai_tasks puede mostrarla trabajando.",
+                }))
+            }
         }
         "resume_ai_task" => {
-            let task = resume(app, library_id, &tools::resolve_task(&tasks, arguments)?.id)?;
-            Ok(json!({ "id": task.id, "title": task.title, "resumed": true }))
+            let replan = tools::replan_request(arguments)?;
+            let task = resume(app, library_id, &tools::resolve_task(&tasks, arguments)?.id, replan.as_ref())?;
+            let (done, _) = task.progress();
+            Ok(json!({
+                "id": task.id,
+                "title": task.title,
+                "resumed": true,
+                "goalChanged": replan.as_ref().is_some_and(|replan| replan.goal.is_some()),
+                "restarted": replan.as_ref().is_some_and(|replan| replan.restart),
+                "stepsKept": done,
+                "status": task.status.label(),
+            }))
         }
         "review_ai_task" => {
             let task = review_again(app, library_id, &tools::resolve_task(&tasks, arguments)?.id, tools::review_instructions(arguments))?;
@@ -1067,19 +1244,28 @@ fn start_wait(app: &AppHandle, context: &BackendRequestContext, arguments: &Valu
     let library_id = context.library_id.as_str();
     let run = runners().lock().ok().and_then(|runners| {
         runners.iter().find_map(|(task_id, runner)| {
-            runner.current.as_ref().filter(|run| run.context.request_id == context.request_id).map(|run| (task_id.clone(), run.phase, run.step_id.clone()))
+            runner
+                .current
+                .as_ref()
+                .filter(|run| run.context.request_id == context.request_id)
+                .map(|run| (task_id.clone(), run.phase, run.step_id.clone(), run.started_ms))
         })
     });
-    let Some((task_id, AiTaskPhase::Executor, Some(step_id))) = run else {
+    let Some((task_id, AiTaskPhase::Executor, Some(step_id), run_started_ms)) = run else {
         return Err(BackendError::invalid_input("wait_ai_task solo se usa en el Ejecutor de una Tarea IA, mientras hace un paso."));
     };
     let accounts = crate::mail_tools::gmail_accounts(app, library_id).into_iter().map(|account| account.email).collect::<Vec<_>>();
     let zone = library_zone(app, library_id);
     let now = now_ms();
-    let wait = waits::wait_request(arguments, &step_id, &accounts, &zone, now)?;
+    let mut wait = waits::wait_request(arguments, &step_id, &accounts, &zone, now)?;
     if let WaitFor::Mail { account, thread_id: Some(thread_id), .. } = &wait.wait_for {
         // A thread that does not exist would wait for nothing.
         mail_thread(app, library_id, account, thread_id)?;
+    }
+    if let WaitFor::WhatsApp { chat, .. } = &wait.wait_for {
+        let (chat, name, since_ms) = crate::whatsapp::wait_target(app, library_id, chat, run_started_ms)?;
+        watched_chats().lock().map(|mut chats| chats.insert(chat.clone())).ok();
+        wait.wait_for = WaitFor::WhatsApp { chat, name, since_ms };
     }
     let database = database(app, library_id)?;
     let saved = write(app, &database, |connection| {
@@ -1177,14 +1363,85 @@ fn wait_step(app: &AppHandle, library_id: &str, wait: &AiTaskWait, zone: &jiff::
                 }
             })
         }
+        Due::LookAtWhatsApp => {
+            let WaitFor::WhatsApp { chat, since_ms, .. } = &wait.wait_for else { return None };
+            let looked = crate::whatsapp::wait_replies(app, library_id, chat, *since_ms, now);
+            Some(match looked {
+                Ok(Some(note)) => WaitStep::Wake(note),
+                _ if now >= wait.deadline_ms => {
+                    let mut wait = wait.clone();
+                    if let Err(error) = &looked {
+                        wait.last_error = Some(error.message.clone());
+                    }
+                    WaitStep::Wake(waits::deadline_note(&wait, zone, now))
+                }
+                Ok(None) => WaitStep::Later { error: None },
+                Err(error) => WaitStep::Later { error: Some(error.message) },
+            })
+        }
+    }
+}
+
+/// The chats a waiting task waits for a WhatsApp reply in.
+fn watched_chats() -> &'static Mutex<HashSet<String>> {
+    static CHATS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CHATS.get_or_init(Default::default)
+}
+
+/// The moments the watch was asked to look before its interval, and the
+/// signal that wakes it.
+fn looks() -> &'static (Mutex<Vec<Instant>>, Condvar) {
+    static LOOKS: OnceLock<(Mutex<Vec<Instant>>, Condvar)> = OnceLock::new();
+    LOOKS.get_or_init(Default::default)
+}
+
+fn look_at_waits_at(at: Instant) {
+    let (moments, signal) = looks();
+    if let Ok(mut moments) = moments.lock() {
+        moments.push(at);
+        signal.notify_all();
+    }
+}
+
+/// Someone else wrote in a WhatsApp chat: when a task waits for a reply
+/// there, the watch looks once they could have stopped writing.
+pub(crate) fn whatsapp_message_arrived(chat: &str) {
+    if watched_chats().lock().is_ok_and(|chats| chats.contains(chat)) {
+        look_at_waits_at(Instant::now() + crate::backend::reply_wait::WHATSAPP_TASK_WAIT + LOOK_MARGIN);
+    }
+}
+
+/// Sleeps until the watch's interval passes or a look it was asked for is
+/// due; the looks that are due are taken.
+fn wait_for_next_look() {
+    let (moments, signal) = looks();
+    let Ok(mut pending) = moments.lock() else {
+        std::thread::sleep(WAIT_WATCH_INTERVAL);
+        return;
+    };
+    let interval_end = Instant::now() + WAIT_WATCH_INTERVAL;
+    loop {
+        let now = Instant::now();
+        if pending.iter().any(|at| *at <= now) {
+            pending.retain(|at| *at > now);
+            return;
+        }
+        if now >= interval_end {
+            return;
+        }
+        let until = pending.iter().copied().min().unwrap_or(interval_end).min(interval_end);
+        pending = match signal.wait_timeout(pending, until - now) {
+            Ok((pending, _)) => pending,
+            Err(_) => return,
+        };
     }
 }
 
 /// Looks at the waiting tasks of the open library and starts again the
 /// ones whose wait ended.
 fn watch_waits(app: &AppHandle) -> Result<(), BackendError> {
-    // The host works the tasks of a client's library.
-    if crate::connection::is_client(app) {
+    // Only the computer that runs the library's services works the tasks.
+    if !crate::device_role::runs_services(app) {
         return Ok(());
     }
     let Some(library) = crate::library_catalog::selected_library(app) else {
@@ -1194,10 +1451,18 @@ fn watch_waits(app: &AppHandle) -> Result<(), BackendError> {
         return Ok(());
     };
     let held = runners().lock().map(|runners| runners.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-    let waiting = read(app, &database, load_tasks)?
-        .into_iter()
-        .filter(|task| task.status == AiTaskStatus::Waiting && !held.contains(&task.id))
-        .collect::<Vec<_>>();
+    let tasks = read(app, &database, load_tasks)?;
+    // The chats of the waits, also of a run that asks for one now.
+    let chats = tasks.iter().filter(|task| task.status == AiTaskStatus::Waiting || held.contains(&task.id)).filter_map(|task| {
+        match task.wait.as_ref().map(|wait| &wait.wait_for) {
+            Some(WaitFor::WhatsApp { chat, .. }) => Some(chat.clone()),
+            _ => None,
+        }
+    });
+    if let Ok(mut watched) = watched_chats().lock() {
+        *watched = chats.collect();
+    }
+    let waiting = tasks.into_iter().filter(|task| task.status == AiTaskStatus::Waiting && !held.contains(&task.id)).collect::<Vec<_>>();
     if waiting.is_empty() {
         return Ok(());
     }
@@ -1223,7 +1488,7 @@ fn watch_waits(app: &AppHandle) -> Result<(), BackendError> {
                 }
                 WaitStep::Later { error } => {
                     if let Some(current) = task.wait.as_mut() {
-                        current.wake_at_ms = (now + waits::MAIL_POLL_MS).min(current.deadline_ms);
+                        current.wake_at_ms = (now + waits::poll_ms(&current.wait_for)).min(current.deadline_ms);
                         current.last_error = error.clone();
                     }
                     update_task(connection, &task).map(|_| false)
@@ -1245,8 +1510,8 @@ fn watch_waits(app: &AppHandle) -> Result<(), BackendError> {
 /// The tasks that were working when Notia closed become interrupted; the
 /// ones older than a week are deleted.
 fn clean_up(app: &AppHandle, first: bool) -> Result<(), BackendError> {
-    // The host works the tasks of a client's library.
-    if crate::connection::is_client(app) {
+    // Only the computer that runs the library's services works the tasks.
+    if !crate::device_role::runs_services(app) {
         return Ok(());
     }
     let Some(library) = crate::library_catalog::selected_library(app) else {
@@ -1306,7 +1571,7 @@ pub(crate) fn init() -> crate::host::plugin::TauriPlugin<crate::host::Wry> {
                     if let Err(error) = watch_waits(&app) {
                         log::error!("[notia:ai-tasks] no se pudieron revisar las esperas: {:?}", error.code);
                     }
-                    std::thread::sleep(WAIT_WATCH_INTERVAL);
+                    wait_for_next_look();
                 }
             });
             Ok(())
@@ -1317,6 +1582,22 @@ pub(crate) fn init() -> crate::host::plugin::TauriPlugin<crate::host::Wry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_in_a_watched_chat_makes_the_watch_look_early() {
+        let pending = || looks().0.lock().map(|moments| moments.len()).unwrap_or_default();
+        let before = pending();
+        whatsapp_message_arrived("5491100000001@s.whatsapp.net");
+        assert_eq!(pending(), before, "nobody waits in that chat");
+        watched_chats().lock().expect("chats").insert("5491100000002@s.whatsapp.net".into());
+        whatsapp_message_arrived("5491100000002@s.whatsapp.net");
+        assert_eq!(pending(), before + 1);
+        look_at_waits_at(Instant::now());
+        let started = Instant::now();
+        wait_for_next_look();
+        assert!(started.elapsed() < Duration::from_secs(5), "the due look ends the sleep");
+        assert_eq!(pending(), before + 1, "the later look is kept");
+    }
 
     fn memory() -> Connection {
         let connection = Connection::open_in_memory().expect("memory");

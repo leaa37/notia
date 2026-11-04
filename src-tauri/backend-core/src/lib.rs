@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod agent_autonomy;
 pub mod agent_knowledge;
+pub mod agent_scripts;
 pub mod agent_workspace;
 pub mod ai_actions;
 pub mod ai_tasks;
@@ -74,6 +75,7 @@ pub mod health;
 pub mod recipes;
 pub mod protocol;
 pub mod remote_audio;
+pub mod reply_wait;
 pub mod runtime;
 pub mod speech_text;
 pub mod task_board_actions;
@@ -94,6 +96,8 @@ pub mod tool_routing;
 pub mod turn_interrupts;
 pub mod weather;
 pub mod web_search;
+pub mod webhooks;
+pub mod whatsapp;
 pub mod wiki_links;
 
 pub use agent::{

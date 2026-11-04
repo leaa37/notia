@@ -1,40 +1,33 @@
 import { lazy, Suspense, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
-// The screens before the app (sign-in, connection) use the app's styles and
+// The screens before the app (sign-in, first copy) use the app's styles and
 // theme tokens, which otherwise load only with the app.
 import '../../styles/notia.css'
-import { installBackendTransport, subscribeBackend } from '../../services/transport'
-import { createHostTransport } from '../../services/transport/hostTransport'
+import { subscribeBackend } from '../../services/transport'
 import {
-  HOST_LINK_EVENT,
-  leaveOfflineCopy,
+  COPY_SYNC_EVENT,
+  fetchConnection,
   openClient,
   saveConnection,
   type ConnectionView,
-  type HostLink,
 } from '../../services/connection/connectionRuntime'
-import {
-  APP_AUTH_CHANGED_EVENT,
-  authErrorMessage,
-  fetchAppAuthStatus,
-  type AppAuthStatus,
-} from '../../services/auth/appAuthRuntime'
+import { authErrorMessage, fetchAppAuthStatus, type AppAuthStatus } from '../../services/auth/appAuthRuntime'
 import { LoginScreen } from '../notia/auth/LoginScreen'
 
-// Loaded after the host transport is installed: modules of the interface
-// read which backend they talk to when they load.
 const App = lazy(() => import('../../App'))
 
 type Stage =
   | { kind: 'checking' }
-  | { kind: 'offline'; message: string }
-  | { kind: 'login'; status: AppAuthStatus & { libraryId: string } }
-  | { kind: 'ready' }
-  /** «Con copia» without the host: the app works on the local copy. */
+  /** The app works on the copy, with or without the host. */
   | { kind: 'copy' }
+  /** The first copy: the Owner signs in with the host. */
+  | { kind: 'sign-in'; status: AppAuthStatus & { libraryId: string } }
+  /** The first copy is being made. */
+  | { kind: 'copying' }
+  /** The first copy cannot start: the host does not answer. */
+  | { kind: 'unreachable'; message: string }
 
-/** Seconds the window waits, once the host answers again, before going back
- * to it: the editor saves what the person was writing meanwhile. */
-const RETURN_DELAY_SECONDS = 5
+/** How often the first copy screen reads how far the sync went. */
+const PROGRESS_INTERVAL_MS = 2000
 
 function prefersLightTheme(): boolean {
   return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-color-scheme: light)').matches
@@ -61,23 +54,8 @@ function ClientScreen({ library, children }: { library?: string | null; children
   )
 }
 
-/**
- * How the link is, on Windows and Linux: a small notice in a corner, with
- * the theme tokens of the app (it is drawn outside the app). Android shows
- * it in its fixed notification instead (`statusInNotification`).
- */
-function ClientNotice({ tone, role, children }: { tone?: 'online'; role: 'status' | 'alert'; children: ReactNode }) {
-  return (
-    <div className={`notia-app-shell notia-client-notice ${prefersLightTheme() ? 'notia-theme-light' : 'notia-theme-dark'}`}>
-      <div className="notia-remote-banner notia-client-banner" data-tone={tone} role={role}>
-        {children}
-      </div>
-    </div>
-  )
-}
-
-/** The host does not answer: retry, point to another host or use this device. */
-function OfflineScreen({ connection, message, onRetry }: { connection: ConnectionView; message: string; onRetry: () => void }) {
+/** The first copy cannot start: retry, point to another host or use this device. */
+function UnreachableScreen({ connection, message, onRetry }: { connection: ConnectionView; message: string; onRetry: () => void }) {
   const [address, setAddress] = useState(connection.hostAddress)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -97,7 +75,7 @@ function OfflineScreen({ connection, message, onRetry }: { connection: Connectio
   const submitAddress = (event: FormEvent) => {
     event.preventDefault()
     if (!address.trim() || busy) return
-    void apply({ mode: 'client', clientKind: connection.clientKind, hostAddress: address, trustNewCertificate: true })
+    void apply({ mode: 'client', hostAddress: address, trustNewCertificate: true })
   }
 
   return (
@@ -106,6 +84,7 @@ function OfflineScreen({ connection, message, onRetry }: { connection: Connectio
         <div className="notia-login-heading">
           <h1>Sin conexión con el host</h1>
           <p>{message}</p>
+          <p>La primera vez, este dispositivo copia la biblioteca del host. Después funciona sin conexión y se sincroniza cuando el host responde.</p>
         </div>
         <div className="notia-login-fields">
           <div className="notia-login-field">
@@ -133,7 +112,7 @@ function OfflineScreen({ connection, message, onRetry }: { connection: Connectio
             type="button"
             className="notia-login-link"
             disabled={busy}
-            onClick={() => { void apply({ mode: 'host', clientKind: connection.clientKind, hostAddress: connection.hostAddress }) }}
+            onClick={() => { void apply({ mode: 'host', hostAddress: connection.hostAddress }) }}
           >
             {connection.canHost ? 'Usar este equipo como host' : 'Usar la biblioteca de este dispositivo'}
           </button>
@@ -143,159 +122,120 @@ function OfflineScreen({ connection, message, onRetry }: { connection: Connectio
   )
 }
 
-/**
- * Window of a client (Settings → General → «Modo de ejecución»): the
- * backend decides where it opens (`openClient`): on the host, after signing
- * in with the Owner of its library, or on the copy when the host does not
- * answer. The copy syncs in the background; the window never waits for it.
- */
-export function ClientApp({ initial }: { initial: ConnectionView }) {
-  const [connection, setConnection] = useState(initial)
-  const [stage, setStage] = useState<Stage>({ kind: 'checking' })
-  const [link, setLink] = useState<HostLink>(initial.link)
-  const [returnIn, setReturnIn] = useState<number | null>(null)
+function progressText(connection: ConnectionView): string {
+  const progress = connection.progress
+  if (progress && progress.total > 0) {
+    return `${progress.done} de ${progress.total === 1 ? '1 archivo' : `${progress.total} archivos`}.`
+  }
+  return 'Preparando la copia…'
+}
 
-  const check = useCallback(async () => {
-    setStage({ kind: 'checking' })
-    const opened = await openClient()
-    const next = opened.connection
-    setConnection(next)
-    if (opened.opening === 'copy') {
-      setStage({ kind: 'copy' })
-      return
-    }
-    if (opened.opening === 'offline') {
-      setStage({ kind: 'offline', message: opened.message ?? '' })
-      return
-    }
-    installBackendTransport(createHostTransport({ hostPlatform: next.link.platform, hostOnlyCommands: next.hostOnlyCommands }))
-    const status = await fetchAppAuthStatus(null)
-    if ((status.state === 'locked' || status.state === 'setup') && status.libraryId) {
-      setStage({ kind: 'login', status: { ...status, libraryId: status.libraryId } })
-      return
-    }
-    setStage({ kind: 'ready' })
-  }, [])
+/** The first copy: how far it went, until the copy opens. */
+function CopyingScreen({ connection, onReady }: { connection: ConnectionView; onReady: () => void }) {
+  const [view, setView] = useState(connection)
 
   useEffect(() => {
-    void check().catch((reason: unknown) => {
-      setStage({ kind: 'offline', message: authErrorMessage(reason, 'No se pudo conectar con el host.') })
-    })
-  }, [check])
-
-  // While the app is open: where the backend says the window goes, and the
-  // sign-in window again when the host ends the session.
-  useEffect(() => {
-    let unsubscribe: (() => void) | null = null
     let active = true
-    void subscribeBackend<HostLink>(HOST_LINK_EVENT, (next) => {
-      setLink((previous) => {
-        if (previous.signedIn && !next.signedIn) window.dispatchEvent(new Event(APP_AUTH_CHANGED_EVENT))
-        return next
-      })
-    }).then((stop) => {
+    const read = () => {
+      void fetchConnection()
+        .then((next) => { if (active) setView(next) })
+        .catch(() => {})
+    }
+    const timer = window.setInterval(read, PROGRESS_INTERVAL_MS)
+    let unsubscribe: (() => void) | null = null
+    void subscribeBackend(COPY_SYNC_EVENT, read).then((stop) => {
       if (active) unsubscribe = stop
       else stop()
     })
     return () => {
       active = false
+      window.clearInterval(timer)
       unsubscribe?.()
     }
   }, [])
 
-  // On the host: when it has not answered for a while, the window reopens
-  // and `openClient` opens the copy (the backend decides when).
-  const toCopy = stage.kind === 'ready' && link.moveTo === 'copy'
+  const ready = view.copyReady
   useEffect(() => {
-    if (toCopy) window.location.reload()
-  }, [toCopy])
+    if (ready) onReady()
+  }, [ready, onReady])
 
-  // Working on the copy: once the host answers again, back to it.
-  const hostBack = stage.kind === 'copy' && link.moveTo === 'host'
-  useEffect(() => {
-    if (!hostBack) {
-      setReturnIn(null)
+  const error = view.copy?.error ?? null
+  return (
+    <ClientScreen library={view.link.library}>
+      <div className="notia-login-body">
+        <div className="notia-login-heading">
+          <h1>Copiando la biblioteca</h1>
+          <p>Este dispositivo guarda una copia de la biblioteca de {view.hostAddress} para usarla también sin conexión. La primera vez puede tardar unos minutos.</p>
+        </div>
+        <p className="notia-login-text" role="status">{progressText(view)}</p>
+        {error ? <p className="notia-login-error" role="alert">{error} Se vuelve a intentar sola.</p> : null}
+      </div>
+    </ClientScreen>
+  )
+}
+
+/**
+ * Window of a client (Settings → General → «Modo de ejecución»): it always
+ * works on the copy of the host's library, and the backend syncs the copy
+ * whenever the host answers. Only the first time, before there is a copy,
+ * the Owner signs in with the host and the window waits for the first copy.
+ */
+export function ClientApp({ initial }: { initial: ConnectionView }) {
+  const [connection, setConnection] = useState(initial)
+  const [stage, setStage] = useState<Stage>({ kind: 'checking' })
+
+  const open = useCallback(async () => {
+    setStage({ kind: 'checking' })
+    const opened = await openClient()
+    setConnection(opened.connection)
+    if (opened.opening === 'copy') {
+      setStage({ kind: 'copy' })
       return
     }
-    setReturnIn(RETURN_DELAY_SECONDS)
-    const timer = window.setInterval(() => {
-      setReturnIn((seconds) => (seconds === null ? null : Math.max(0, seconds - 1)))
-    }, 1000)
-    return () => window.clearInterval(timer)
-  }, [hostBack])
-
-  const returnToHost = useCallback(() => {
-    void leaveOfflineCopy().finally(() => window.location.reload())
+    // The first copy: the backend asks the host for its sign-in.
+    try {
+      const status = await fetchAppAuthStatus(null)
+      if (status.state === 'unlocked') {
+        setStage({ kind: 'copying' })
+      } else if (status.libraryId) {
+        setStage({ kind: 'sign-in', status: { ...status, libraryId: status.libraryId } })
+      } else {
+        setStage({ kind: 'unreachable', message: opened.message ?? 'El host no tiene una biblioteca abierta.' })
+      }
+    } catch (reason) {
+      setStage({ kind: 'unreachable', message: opened.message ?? authErrorMessage(reason, 'No se pudo conectar con el host.') })
+    }
   }, [])
 
-  useEffect(() => {
-    if (returnIn === 0) returnToHost()
-  }, [returnIn, returnToHost])
+  const retry = useCallback(() => {
+    void open().catch((reason: unknown) => {
+      setStage({ kind: 'unreachable', message: authErrorMessage(reason, 'No se pudo conectar con el host.') })
+    })
+  }, [open])
 
-  const notices = !connection.statusInNotification
+  useEffect(() => {
+    retry()
+  }, [retry])
 
   if (stage.kind === 'copy') {
     return (
-      <>
-        {notices ? (
-          <ClientNotice tone={hostBack ? 'online' : undefined} role="status">
-            {hostBack ? (
-              <>
-                <span>El host volvió a responder. Volviendo en {returnIn ?? RETURN_DELAY_SECONDS} s; los cambios se concilian en segundo plano.</span>
-                <button type="button" className="notia-client-banner-action" onClick={returnToHost}>Volver ahora</button>
-              </>
-            ) : (
-              <span>Sin conexión con el host: trabajás con la copia local. Los cambios se concilian cuando vuelva.</span>
-            )}
-          </ClientNotice>
-        ) : null}
-        <Suspense fallback={<ClientScreen><p className="notia-login-text" role="status">Cargando Notia…</p></ClientScreen>}>
-          <App />
-        </Suspense>
-      </>
+      <Suspense fallback={<ClientScreen><p className="notia-login-text" role="status">Cargando Notia…</p></ClientScreen>}>
+        <App />
+      </Suspense>
     )
   }
-
-  if (stage.kind === 'ready') {
-    return (
-      <>
-        {notices && link.state === 'offline' ? (
-          <ClientNotice role="alert">
-            <span>{link.message ?? 'Sin conexión con el host. Reintentando…'}</span>
-            {connection.clientKind === 'copy' && connection.canKeepCopy ? (
-              <button type="button" className="notia-client-banner-action" onClick={() => window.location.reload()}>Usar la copia local</button>
-            ) : null}
-          </ClientNotice>
-        ) : null}
-        <Suspense fallback={<ClientScreen><p className="notia-login-text" role="status">Cargando Notia…</p></ClientScreen>}>
-          <App />
-        </Suspense>
-      </>
-    )
-  }
-  if (stage.kind === 'login') {
+  if (stage.kind === 'sign-in') {
     return (
       <div className={`notia-app-shell ${prefersLightTheme() ? 'notia-theme-light' : 'notia-theme-dark'}`}>
-        <LoginScreen status={stage.status} canRemember onUnlocked={() => setStage({ kind: 'ready' })} />
+        <LoginScreen status={stage.status} canRemember onUnlocked={() => setStage({ kind: 'copying' })} />
       </div>
     )
   }
-  if (stage.kind === 'offline') {
-    return (
-      <OfflineScreen
-        connection={connection}
-        message={stage.message}
-        onRetry={() => {
-          void check().catch((reason: unknown) => {
-            setStage({ kind: 'offline', message: authErrorMessage(reason, 'No se pudo conectar con el host.') })
-          })
-        }}
-      />
-    )
+  if (stage.kind === 'copying') {
+    return <CopyingScreen connection={connection} onReady={retry} />
   }
-  return (
-    <ClientScreen library={connection.link.library}>
-      <p className="notia-login-text" role="status">Conectando con el host {connection.hostAddress}…</p>
-    </ClientScreen>
-  )
+  if (stage.kind === 'unreachable') {
+    return <UnreachableScreen connection={connection} message={stage.message} onRetry={retry} />
+  }
+  return null
 }

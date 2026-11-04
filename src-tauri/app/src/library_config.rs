@@ -18,6 +18,8 @@ use crate::backend::library_config::{
     serialize_library_config, LIBRARY_CONFIG_DIRECTORY, LIBRARY_CONFIG_LOGICAL_PATH,
 };
 use crate::backend::mail_accounts::{without_google_secrets, GOOGLE_CLOUD_KEY, MAIL_ACCOUNTS_KEY};
+use crate::backend::webhooks::{without_webhook, WEBHOOK_KEY};
+use crate::backend::whatsapp::{without_whatsapp, WHATSAPP_KEY};
 use crate::backend::{BackendError, BackendErrorCode, DocumentLocatorDto};
 use crate::filesystem::adapter::TauriFilesystemDocumentAdapter;
 use crate::library_registry::{LibraryBinding, LibraryBindingRegistry, LibraryBindingRoot};
@@ -41,13 +43,14 @@ pub(crate) struct LibraryConfigResult {
 }
 
 impl LibraryConfigResult {
-    /// The Google Cloud client and the mail accounts' tokens stay in the
-    /// backend: clients get the configuration without them.
+    /// The Google Cloud client, the mail accounts' tokens, the WhatsApp
+    /// chats and the webhook actions stay in the backend: clients get the
+    /// configuration without them.
     fn from_result(result: Result<Option<Value>, BackendError>) -> Self {
         match result {
             Ok(config) => Self {
                 ok: true,
-                config: config.map(without_google_secrets),
+                config: config.map(|config| without_webhook(without_whatsapp(without_google_secrets(config)))),
                 error: None,
             },
             Err(error) => Self {
@@ -253,7 +256,7 @@ pub(crate) fn backend_read_library_config(payload: LibraryConfigPayload, app: &A
 
 /// Sections only the host changes: a client's write and its offline copy
 /// keep the host's value (Telegram is never turned on from a client).
-const HOST_ONLY_KEYS: [&str; 3] = [TELEGRAM_KEY, MAIL_ACCOUNTS_KEY, GOOGLE_CLOUD_KEY];
+const HOST_ONLY_KEYS: [&str; 5] = [TELEGRAM_KEY, MAIL_ACCOUNTS_KEY, GOOGLE_CLOUD_KEY, WHATSAPP_KEY, WEBHOOK_KEY];
 const TELEGRAM_KEY: &str = "telegram";
 
 /// Normalizes and stores the configuration sent by the window and returns
@@ -297,9 +300,10 @@ pub(crate) fn backend_write_library_config(payload: LibraryConfigPayload, app: &
         };
         let mut merged = stored.unwrap_or_else(|| Value::Object(Default::default()));
         if let (Some(target), Some(updates)) = (merged.as_object_mut(), config.as_object()) {
-            // The Google Cloud client, the mail accounts and the weather
-            // place are written only by the backend's own commands.
-            let backend_owned = [MAIL_ACCOUNTS_KEY, GOOGLE_CLOUD_KEY, crate::backend::weather::WEATHER_KEY];
+            // The Google Cloud client, the mail accounts, the weather place,
+            // WhatsApp and the webhook are written only by the backend's own
+            // commands.
+            let backend_owned = [MAIL_ACCOUNTS_KEY, GOOGLE_CLOUD_KEY, crate::backend::weather::WEATHER_KEY, WHATSAPP_KEY, WEBHOOK_KEY];
             let kept = |key: &str| backend_owned.contains(&key) || (from_client && key == TELEGRAM_KEY);
             for (key, value) in updates.iter().filter(|(key, _)| !kept(key.as_str())) {
                 target.insert(key.clone(), value.clone());

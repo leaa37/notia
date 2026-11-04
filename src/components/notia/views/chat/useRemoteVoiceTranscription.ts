@@ -191,6 +191,7 @@ export function useRemoteVoiceTranscription({ draft, setDraft, onCompleted }: Us
     // Meeting, the only session that outlives its view, is not offered in a
     // browser connected to a server.
     attach: async () => false,
+    holdSession: () => false,
     dismissError: () => setState(INITIAL_STATE),
   }
 }

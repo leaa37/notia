@@ -19,11 +19,6 @@ pub const RECOVERY_COMMAND: &str = "/reanudar";
 pub const MAX_HISTORY_MESSAGES: usize = 20;
 /// Files of earlier requests a new request still shows: an album's worth.
 pub const MAX_HISTORY_FILES: usize = 10;
-/// Telegram clients cut a text over the 4096-character limit into several
-/// messages, each longer than half that limit. Counted in UTF-16 units, as
-/// Telegram does, leaving room for the spaces trimmed at each cut.
-const SPLIT_PART_MIN_UNITS: usize = 2_000;
-
 /// Messages of a request: the chat's history and the new message with its
 /// own files. A file sent earlier stays on the message it came with (the
 /// latest `MAX_HISTORY_FILES` of the history), so the model still sees it
@@ -48,12 +43,6 @@ pub fn turn_messages(history: &[BackendMessage], text: &str, attachments: Vec<Me
         attachments,
     });
     messages
-}
-
-/// Whether a typed message is long enough to be a part of a text Telegram
-/// delivers in several messages, so the next message may continue it.
-pub fn may_continue(text: &str) -> bool {
-    text.encode_utf16().count() >= SPLIT_PART_MIN_UNITS
 }
 
 fn fold(value: &str) -> String {
@@ -346,6 +335,14 @@ pub fn tool_label(tool: &str) -> &'static str {
         crate::browser::CLICK_TOOL => "haciendo clic en el navegador",
         crate::browser::TYPE_TOOL => "escribiendo en el navegador",
         name if crate::browser::is_browser_tool(name) => "usando el navegador",
+        crate::agent_scripts::LIST_TOOL => "revisando los scripts de soporte",
+        crate::agent_scripts::RUN_TOOL => "corriendo un script de soporte",
+        crate::agent_scripts::SAVE_TOOL => "escribiendo un script de soporte",
+        crate::whatsapp::LIST_CHATS_TOOL => "buscando el chat de WhatsApp",
+        crate::whatsapp::READ_MESSAGES_TOOL => "leyendo el chat de WhatsApp",
+        crate::whatsapp::SEND_MESSAGE_TOOL => "escribiendo por WhatsApp",
+        crate::whatsapp::SEND_FILE_TOOL => "mandando el archivo por WhatsApp",
+        crate::whatsapp::GET_IMAGE_TOOL => "mirando la imagen de WhatsApp",
         "generate_image" => "generando la imagen",
         "edit_image" => "editando la imagen",
         "list_gmail_messages" | "read_gmail_message" | "list_gmail_labels" => "revisando tu correo",
@@ -776,15 +773,6 @@ mod tests {
         let choices = vec!["Banco".to_string(), "Efectivo".to_string()];
         assert_eq!(resolve_choice_reply("2)", &choices), ("Efectivo".to_string(), Some(1)));
         assert_eq!(resolve_choice_reply("otra", &choices), ("otra".to_string(), None));
-    }
-
-    #[test]
-    fn only_a_message_long_enough_to_be_a_split_part_may_continue() {
-        assert!(!may_continue("contrastalo con el tablero default"));
-        assert!(!may_continue(&"a".repeat(SPLIT_PART_MIN_UNITS - 1)));
-        assert!(may_continue(&"a".repeat(SPLIT_PART_MIN_UNITS)));
-        // Telegram counts UTF-16 units: an emoji takes two.
-        assert!(may_continue(&"😀".repeat(SPLIT_PART_MIN_UNITS / 2)));
     }
 
     #[test]

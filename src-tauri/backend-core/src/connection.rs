@@ -1,9 +1,15 @@
 //! How this installation runs (a device setting, not a library one):
 //!
-//! - **Host**: it keeps the library and serves it to clients on a port
-//!   (Windows and Linux; Android has no server).
-//! - **Client**: it uses the library of a host. **Remote** clients keep no
-//!   files; **copy** clients keep a synced copy to work without connection.
+//! - **Host**: it keeps the library and serves it on a port to the devices
+//!   that sync with it (Windows, Linux and macOS; Android has no server).
+//! - **Client**: it keeps a copy of a host's library and works on it as
+//!   its own, with or without connection; the copy and the host sync
+//!   whenever they see each other.
+//!
+//! The library's services (Telegram, WhatsApp, the webhook, the autonomous
+//! agent, the AI actions and tasks, the Google sync and the backups) run on
+//! one computer only: the one with the most processing among the computers
+//! that see each other ([`runs_services_among`]). Android never runs them.
 //!
 //! The adapter stores these settings in the app data folder; the
 //! certificate the client trusts is pinned on the first connection. On
@@ -27,21 +33,15 @@ pub enum RunMode {
     Client,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClientKind {
-    #[default]
-    Copy,
-    Remote,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionSettings {
     #[serde(default)]
     pub mode: RunMode,
+    /// Id of this installation, made on first use. The computers that see
+    /// each other use it to break a tie of processing.
     #[serde(default)]
-    pub client_kind: ClientKind,
+    pub device_id: String,
     /// `host:port` of the host, as the person wrote it (normalized).
     #[serde(default)]
     pub host_address: String,
@@ -75,7 +75,7 @@ impl Default for ConnectionSettings {
     fn default() -> Self {
         Self {
             mode: RunMode::Host,
-            client_kind: ClientKind::Copy,
+            device_id: String::new(),
             host_address: String::new(),
             port: DEFAULT_HOST_PORT,
             host_certificate: None,
@@ -158,87 +158,36 @@ pub fn normalize_connection(settings: ConnectionSettings) -> ConnectionSettings 
     }
 }
 
-/// Commands a client runs on its own device even while it uses a host:
-/// its sign-in with the host, its connection settings, the preferences of
-/// the device itself and its speech: dictation and the whole Meeting
-/// (microphone, recognizer, speakers and the meeting itself; the meeting
-/// note, its tasks and the AI run on the host). Everything else goes to the
-/// host.
-pub const CLIENT_LOCAL_COMMANDS: &[&str] = &[
-    "app_auth_status",
-    "app_auth_login",
-    "app_auth_first_login",
-    "app_auth_create_password",
-    "app_auth_change_password",
-    "app_auth_logout",
-    "connection_settings",
-    "save_connection_settings",
-    "test_host_connection",
-    "client_open",
-    "enter_offline_copy",
-    "leave_offline_copy",
-    "sync_copy_now",
-    "pick_copy_folder",
-    "backend_device_preferences",
-    "backend_save_device_preferences",
-    // The clipboard of the device the person is using.
-    "coldpass_copy_secret",
-    // Rating a password being typed needs nothing from the host, and keeps
-    // each keystroke's text off the network.
-    "coldpass_rate_password",
-    // The diagram editor's rules need nothing from the host.
-    "mermaid_document",
-    "mermaid_edit",
-    // The fingerprint sensor of the device the person is using: the
-    // unlock it opens still runs on the host.
-    "coldpass_biometric_status",
-    "coldpass_enable_biometric",
-    "coldpass_disable_biometric",
-    "coldpass_unlock_biometric",
-    // Speech runs on the device the person holds: a tablet dictates and
-    // transcribes a meeting in the room, also without the network.
-    "get_speech_capabilities",
-    "probe_speech_audio_input",
-    "speech_audio_devices",
-    "probe_sherpa_runtime",
-    "prepare_device_speech_model",
-    "start_speech_session",
-    "pause_speech_session",
-    "resume_speech_session",
-    "consume_speech_turn",
-    "stop_speech_session",
-    "cancel_speech_session",
-    "skip_speech_diarization",
-    "speech_session_state",
-    "start_audio_monitor",
-    "stop_audio_monitor",
-    "meeting_media_begin",
-    "meeting_media_chunk",
-    "meeting_media_finish",
-    "meeting_media_discard",
-    "meeting_start_file_session",
-    "meeting_snapshot",
-    "meeting_context",
-    "meeting_notes_text",
-    "meeting_discard",
-    "meeting_add_mark",
-    "meeting_remove_mark",
-    "meeting_set_notes",
-    "meeting_set_live_answers",
-    "meeting_set_ai_notes",
-    "meeting_call_notes_agent",
-    "meeting_regenerate_answer",
-    "meeting_pin_answer",
-    "meeting_rename_speaker",
-    "meeting_merge_speakers",
-    "meeting_generate_insights",
-    "meeting_save_note",
-    "meeting_export",
-    "meeting_send_tasks",
-];
+/// How much a computer can process, as it reports itself to the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePower {
+    pub device_id: String,
+    /// Threads the processor runs at once.
+    pub threads: u32,
+    /// Physical memory, in MiB (0 when the system does not say).
+    pub memory_mib: u64,
+    /// The computer serves the library (Host mode).
+    #[serde(default)]
+    pub host: bool,
+}
 
-pub fn is_client_local_command(command: &str) -> bool {
-    CLIENT_LOCAL_COMMANDS.contains(&command)
+impl DevicePower {
+    /// Processing first (threads, then memory); on a tie the computer in
+    /// Host mode, and last the id, so every computer decides the same.
+    fn rank(&self) -> (u32, u64, bool, &str) {
+        (self.threads, self.memory_mib, self.host, self.device_id.as_str())
+    }
+}
+
+/// Whether `local` runs the library's services among the computers it
+/// sees now (`others`, without itself): it does unless one of them has
+/// more processing. A computer that sees no other one runs them.
+pub fn runs_services_among(local: &DevicePower, others: &[DevicePower]) -> bool {
+    others
+        .iter()
+        .filter(|other| other.device_id != local.device_id)
+        .all(|other| other.rank() < local.rank())
 }
 
 #[cfg(test)]
@@ -261,7 +210,7 @@ mod tests {
     fn stored_settings_are_normalized() {
         let settings = normalize_connection(ConnectionSettings {
             mode: RunMode::Client,
-            client_kind: ClientKind::Remote,
+            device_id: "equipo".into(),
             host_address: "Casa:6000".into(),
             port: 80,
             host_certificate: Some("ab".repeat(32)),
@@ -281,8 +230,31 @@ mod tests {
         assert_eq!(without_host.host_certificate, None);
         let parsed: ConnectionSettings = serde_json::from_str("{}").expect("defaults");
         assert_eq!(parsed, ConnectionSettings::default());
-        assert!(is_client_local_command("app_auth_login") && !is_client_local_command("finance_overview"));
-        assert!(is_client_local_command("start_speech_session") && is_client_local_command("meeting_snapshot"));
-        assert!(!is_client_local_command("meeting_task_boards"));
+        // A file from before keeps its mode; the old kind of client is ignored.
+        let older: ConnectionSettings = serde_json::from_str(r#"{"mode":"client","clientKind":"remote","hostAddress":"casa:6000"}"#).expect("older");
+        assert_eq!((older.mode, older.host_address.as_str()), (RunMode::Client, "casa:6000"));
+    }
+
+    fn power(device_id: &str, threads: u32, memory_mib: u64, host: bool) -> DevicePower {
+        DevicePower { device_id: device_id.into(), threads, memory_mib, host }
+    }
+
+    #[test]
+    fn the_computer_with_the_most_processing_runs_the_services() {
+        let desktop = power("pc", 24, 32_768, true);
+        let laptop = power("notebook", 8, 16_384, false);
+        assert!(runs_services_among(&desktop, &[laptop.clone()]));
+        assert!(!runs_services_among(&laptop, &[desktop.clone()]));
+        // Alone, each computer runs them.
+        assert!(runs_services_among(&laptop, &[]));
+        // Memory breaks a tie of threads, then Host mode, then the id.
+        let bigger = power("notebook", 24, 65_536, false);
+        assert!(runs_services_among(&bigger, &[desktop.clone()]) && !runs_services_among(&desktop, &[bigger]));
+        let twin = power("otra", 24, 32_768, false);
+        assert!(runs_services_among(&desktop, &[twin.clone()]) && !runs_services_among(&twin, &[desktop.clone()]));
+        let (a, b) = (power("a", 4, 0, false), power("b", 4, 0, false));
+        assert!(runs_services_among(&a, &[b.clone()]) != runs_services_among(&b, &[a]));
+        // The computer itself among the others does not count.
+        assert!(runs_services_among(&desktop, &[desktop.clone()]));
     }
 }

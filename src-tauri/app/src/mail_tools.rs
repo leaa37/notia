@@ -15,13 +15,13 @@ use crate::backend::mail_accounts::{
     with_mail_account, with_refreshed_tokens, MailProvider, CALENDAR_SCOPE,
 };
 use crate::backend::mail_tools::{
-    account_refs, batch_modify_body, batch_modify_url, calendar_bound, change_preview, check_movable,
+    account_refs, batch_modify_body, batch_modify_url, calendar_bound, change_preview, change_query, check_movable,
     compose_raw_message, create_event_url, create_label_body, event_body, event_summary, events_url, events_view,
     is_calendar_tool, label_changes, labels_url, labels_view, list_messages_url, message_detail, message_full_url,
     attachment_bytes, attachment_url, attachment_view, find_attachment,
     message_line, message_metadata_url, message_summary, parse_labels, parse_mail_tool, reply_context, resolve_labels,
     select_accounts, send_body, send_url, trash_url, with_account, AccountSelection, GmailLabel, MailAccountRef,
-    MailToolRequest, CALENDAR_API,
+    MailToolRequest, CALENDAR_API, MAX_QUERY_MESSAGES,
 };
 use crate::backend::{BackendError, BackendErrorCode, BackendRequestContext, ToolCall};
 use crate::host::AppHandle;
@@ -283,14 +283,58 @@ async fn message_lines(session: &Session, ids: &[String]) -> Result<Vec<String>,
     Ok(lines)
 }
 
+/// The ids of the messages `query` finds, up to `MAX_QUERY_MESSAGES`; a
+/// search that finds none goes back to the model.
+async fn query_matches(session: &Session, query: &str) -> Result<Vec<String>, BackendError> {
+    let mut ids = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let wanted = (MAX_QUERY_MESSAGES - ids.len()) as u64;
+        let list = get(session, &list_messages_url(query, &[], wanted, page_token.as_deref())).await?;
+        ids.extend(list.get("messages").and_then(Value::as_array).into_iter().flatten().filter_map(|item| item.get("id").and_then(Value::as_str)).map(str::to_string));
+        page_token = list.get("nextPageToken").and_then(Value::as_str).map(str::to_string);
+        if page_token.is_none() || ids.len() >= MAX_QUERY_MESSAGES {
+            break;
+        }
+    }
+    ids.truncate(MAX_QUERY_MESSAGES);
+    if ids.is_empty() {
+        return Err(BackendError::invalid_input(format!("Ningún correo de {} coincide con «{query}».", session.account.email)));
+    }
+    Ok(ids)
+}
+
+/// A change named by a Gmail search, over the messages it finds now.
+async fn with_query_matches(session: &Session, request: MailToolRequest, query: Option<&str>) -> Result<MailToolRequest, BackendError> {
+    match query {
+        Some(query) => Ok(request.with_message_ids(query_matches(session, query).await?)),
+        None => Ok(request),
+    }
+}
+
+/// How the messages look after a change: their folders and whether they
+/// are still unread, so the model reads the final state.
+async fn final_state(session: &Session, ids: &[String]) -> Result<Value, BackendError> {
+    let known = account_labels(session).await?;
+    let mut messages = Vec::new();
+    for id in ids.iter().take(PREVIEW_MESSAGES) {
+        let message = get(session, &message_metadata_url(id)).await?;
+        let summary = message_summary(&message, &known);
+        messages.push(json!({ "id": id, "subject": summary["subject"], "labels": summary["labels"], "unread": summary["unread"] }));
+    }
+    Ok(json!(messages))
+}
+
 /// Summary and detail shown before a change is confirmed. It only reads.
 pub(crate) fn preview(app: &AppHandle, context: &BackendRequestContext, call: &ToolCall) -> Result<(String, String), BackendError> {
     let request = parse_mail_tool(&call.name, &call.arguments)?;
+    let query = change_query(&call.arguments)?.filter(|_| is_change(&request));
     let AccountSelection::One(account) = selection(app, context, call)? else {
         return Err(BackendError::invalid_input("Indicá en account sobre qué cuenta operar."));
     };
     let session = session(app, &context.library_id, &account, &call.name)?;
     crate::host::async_runtime::block_on(async {
+        let request = with_query_matches(&session, request, query.as_deref()).await?;
         let (lines, new_labels) = match &request {
             MailToolRequest::Trash { message_ids } | MailToolRequest::MarkSpam { message_ids, .. } | MailToolRequest::MarkRead { message_ids, .. } => {
                 (message_lines(&session, message_ids).await?, Vec::new())
@@ -311,8 +355,18 @@ pub(crate) fn preview(app: &AppHandle, context: &BackendRequestContext, call: &T
             },
             _ => (Vec::new(), Vec::new()),
         };
-        Ok(change_preview(&request, &session.account, &lines, &new_labels))
+        let (summary, detail) = change_preview(&request, &session.account, &lines, &new_labels);
+        Ok(match query {
+            Some(query) => (summary, format!("Los que coinciden con la búsqueda «{query}» (hasta {MAX_QUERY_MESSAGES}):\n{detail}")),
+            None => (summary, detail),
+        })
     })
+}
+
+/// A change of messages (trash, move, spam, read), which may name them by a
+/// search instead of by id.
+fn is_change(request: &MailToolRequest) -> bool {
+    matches!(request, MailToolRequest::Trash { .. } | MailToolRequest::Move { .. } | MailToolRequest::MarkSpam { .. } | MailToolRequest::MarkRead { .. })
 }
 
 /// Guidance for the model when the mail tools are offered: the connected
@@ -388,12 +442,12 @@ async fn run(session: &Session, request: MailToolRequest) -> Result<Value, Backe
             let remove_ids = label_ids(session, remove_labels, false).await?;
             let (add, remove) = label_changes(&request, &add_ids, &remove_ids);
             post(session, &batch_modify_url(), batch_modify_body(message_ids, &add, &remove)).await?;
-            Ok(json!({ "ok": true, "changed": true, "moved": message_ids.len() }))
+            Ok(json!({ "ok": true, "changed": true, "moved": message_ids.len(), "finalState": final_state(session, message_ids).await? }))
         }
         MailToolRequest::MarkSpam { ref message_ids, .. } | MailToolRequest::MarkRead { ref message_ids, .. } => {
             let (add, remove) = label_changes(&request, &[], &[]);
             post(session, &batch_modify_url(), batch_modify_body(message_ids, &add, &remove)).await?;
-            Ok(json!({ "ok": true, "changed": true, "updated": message_ids.len() }))
+            Ok(json!({ "ok": true, "changed": true, "updated": message_ids.len(), "finalState": final_state(session, message_ids).await? }))
         }
         MailToolRequest::Send(mail) => {
             let reply = match &mail.reply_to_message_id {
@@ -424,7 +478,11 @@ pub(crate) fn execute(app: &AppHandle, context: &BackendRequestContext, call: &T
     let accounts = match selection(app, context, call)? {
         AccountSelection::One(account) if !matches!(request, MailToolRequest::ListMessages { .. } | MailToolRequest::ListLabels | MailToolRequest::ListEvents { .. }) => {
             let session = session(app, &context.library_id, &account, &call.name)?;
-            let result = crate::host::async_runtime::block_on(run(&session, request))?;
+            let query = change_query(&call.arguments)?.filter(|_| is_change(&request));
+            let result = crate::host::async_runtime::block_on(async {
+                let request = with_query_matches(&session, request, query.as_deref()).await?;
+                run(&session, request).await
+            })?;
             return Ok(with_account(result, &account));
         }
         AccountSelection::One(account) => vec![account],

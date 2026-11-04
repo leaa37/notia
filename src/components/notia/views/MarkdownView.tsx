@@ -16,7 +16,6 @@ import { cursor } from '@milkdown/plugin-cursor'
 import { indent } from '@milkdown/plugin-indent'
 import { trailing } from '@milkdown/plugin-trailing'
 import { clipboard } from '@milkdown/plugin-clipboard'
-import { collab } from '@milkdown/plugin-collab'
 import { codeBlockConfig } from '@milkdown/kit/component/code-block'
 import { commandsCtx } from '@milkdown/kit/core'
 import { blockConfig } from '@milkdown/kit/plugin/block'
@@ -47,10 +46,6 @@ import {
 import { configureWikiLinkSerializer, createWikiLinkPlugin, type WikiLinkMenuContext } from './markdown/wikiLinkPlugin'
 import { sheetFitScale, useMarkdownZoom } from './markdown/useMarkdownZoom'
 import { leaveStylusToSystem, marqueeTakesPress } from './markdown/stylusWriting'
-import { createCollabBlocksPlugin } from './markdown/collab/collabBlocksPlugin'
-import { startMarkdownCollab, type MarkdownCollabSession } from './markdown/collab/markdownCollab'
-import { replaceEditorBody, type EditorSharing } from './markdown/collab/externalBody'
-import { collaborationSettings } from '../../../services/collab/collabRuntime'
 import { createXGraphPlaceholder, isXGraphLanguage } from '../../../engines/markdown/xgraphEngine'
 import { observeXGraphPreviews } from '../../../services/markdown/xgraphPreviewRuntime'
 import './markdown/xgraph.css'
@@ -72,7 +67,7 @@ import { shouldShowMarkdownBlockHandle } from '../../../engines/markdown/markdow
 import { markdownTableBlockView } from './markdown/markdownTableBlockView'
 import { ChatAttachmentImages } from './ChatAttachmentImages'
 import { suggestLinkTargets } from '../../../services/libraries/libraryLinkRuntime'
-import { $prose } from '@milkdown/kit/utils'
+import { $prose, replaceAll } from '@milkdown/kit/utils'
 import { toggleLinkCommand } from '@milkdown/kit/component/link-tooltip'
 import { configureBlockAlignment, richTextPlugins } from './markdown/richTextMarks'
 import {
@@ -129,11 +124,6 @@ const WIKI_LINK_MENU_WIDTH = 320
 const WIKI_LINK_MENU_MARGIN = 12
 const MATH_CODE_BLOCK_LANGUAGES = new Set(['latex', 'math', 'tex'])
 
-/** How the editor holds its note, for changes that come from outside it. */
-function sharingOf(session: MarkdownCollabSession | null, follower: boolean): EditorSharing {
-  if (!session) return 'alone'
-  return follower ? 'follower' : 'saver'
-}
 const LIST_BULLET_ICON = '<svg viewBox="0 0 6 6"><circle cx="3" cy="3" r="2.35"/><rect x="0.6" y="0.6" width="4.8" height="4.8"/></svg>'
 const TASK_CHECKED_ICON = '<svg viewBox="0 0 18 18"><rect class="notia-check-box" x="0" y="0" width="18" height="18" rx="5"/><path class="notia-check-mark" d="M4.9 9.6l2.9 2.7 5.3-6.1" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 const TASK_UNCHECKED_ICON = '<svg viewBox="0 0 18 18"><rect class="notia-check-box" x="0.75" y="0.75" width="16.5" height="16.5" rx="4.25" stroke-width="1.5"/></svg>'
@@ -158,12 +148,6 @@ interface MarkdownViewProps {
    * may already be the active one.
    */
   onSourceChange: (nextSource: string, documentPath: string) => void
-  /**
-   * The note is shared with other windows of the host and another editor
-   * saves it: the source changes without leaving anything to save. Without
-   * it the note is never edited together.
-   */
-  onSharedSourceChange?: (nextSource: string) => void
   wikiLinkTargets: MarkdownWikiLinkTarget[]
   onOpenLinkedFile: (filePath: string) => void
   onSelectionChange: (selection: MarkdownSelectionContext | null) => void
@@ -518,7 +502,6 @@ function MarkdownViewInner({
   readOnly,
   libraryId,
   onSourceChange,
-  onSharedSourceChange,
   wikiLinkTargets,
   onOpenLinkedFile,
   onSelectionChange,
@@ -612,11 +595,6 @@ function MarkdownViewInner({
   const documentPathRef = useRef(documentPath)
   const onSourceChangeRef = useRef(onSourceChange)
   const readOnlyRef = useRef(Boolean(readOnly))
-  const onSharedSourceChangeRef = useRef(onSharedSourceChange)
-  // Shared editing: the session, its cursors and whether another editor saves.
-  const collabSessionRef = useRef<MarkdownCollabSession | null>(null)
-  const collabAwarenessRef = useRef<MarkdownCollabSession['awareness'] | null>(null)
-  const isCollabFollowerRef = useRef(false)
   const wikiLinkSuggestionRequestRef = useRef(0)
   const libraryIdRef = useRef(libraryId)
   const wikiLinkLookupRef = useRef<MarkdownWikiLinkLookup>(wikiLinkLookup)
@@ -751,10 +729,6 @@ function MarkdownViewInner({
   useEffect(() => {
     onSourceChangeRef.current = onSourceChange
   }, [onSourceChange])
-
-  useEffect(() => {
-    onSharedSourceChangeRef.current = onSharedSourceChange
-  }, [onSharedSourceChange])
 
   useEffect(() => {
     libraryIdRef.current = libraryId
@@ -1226,9 +1200,6 @@ function MarkdownViewInner({
     crepe.editor.use($prose(() => createBlockGapPlugin()))
     crepe.editor.use(clipboard)
 
-    crepe.editor.use(collab)
-    crepe.editor.use($prose(() => createCollabBlocksPlugin(() => collabAwarenessRef.current)))
-
     const handleEditorMarkdown = (markdown: string) => {
       if (!isMounted || isApplyingExternalUpdateRef.current) {
         return
@@ -1251,12 +1222,7 @@ function MarkdownViewInner({
       }
 
       latestComposedSourceRef.current = nextSource
-      const onShared = onSharedSourceChangeRef.current
-      if (isCollabFollowerRef.current && onShared) {
-        onShared(nextSource)
-      } else {
-        onSourceChangeRef.current(nextSource, documentPathRef.current)
-      }
+      onSourceChangeRef.current(nextSource, documentPathRef.current)
     }
 
     // The note's Markdown is written once typing pauses, not per keystroke.
@@ -1272,41 +1238,6 @@ function MarkdownViewInner({
 
     crepeRef.current = crepe
 
-    const endCollaboration = () => {
-      collabSessionRef.current?.destroy()
-      collabSessionRef.current = null
-      collabAwarenessRef.current = null
-      isCollabFollowerRef.current = false
-    }
-
-    // With other windows of the host on the same note, everyone edits it at
-    // once; the backend keeps the room and picks who saves.
-    const startCollaboration = async () => {
-      const currentLibraryId = libraryIdRef.current
-      if (!currentLibraryId || !onSharedSourceChangeRef.current) return
-      const settings = await collaborationSettings()
-      if (!settings.enabled || !isMounted) return
-      try {
-        const session = await startMarkdownCollab({
-          crepe,
-          libraryId: currentLibraryId,
-          path: documentPathRef.current,
-          deviceName: settings.deviceName,
-          onSaverChange: (saver) => { isCollabFollowerRef.current = !saver },
-          onLost: endCollaboration,
-        })
-        if (!isMounted) {
-          session.destroy()
-          return
-        }
-        collabSessionRef.current = session
-        collabAwarenessRef.current = session.awareness
-      } catch {
-        // The note keeps working on its own.
-        endCollaboration()
-      }
-    }
-
     void crepe.create().then(() => {
       if (!isMounted) {
         return
@@ -1315,7 +1246,6 @@ function MarkdownViewInner({
       isReadyRef.current = true
       setIsEditorReady(true)
       followPenTool(crepe, penToolRef.current, readOnlyRef.current)
-      void startCollaboration()
       addMathOcrButtons()
       addInlineLatexInkMathButtons()
       const editorView = crepe.editor.action((ctx) => ctx.get(editorViewCtx))
@@ -1413,7 +1343,6 @@ function MarkdownViewInner({
       clearDocumentRefs()
       selectionCleanupRef.current?.()
       selectionCleanupRef.current = null
-      endCollaboration()
       void crepe.destroy()
     }
   }, [])
@@ -1436,7 +1365,7 @@ function MarkdownViewInner({
 
     const nextDocument = parseFrontmatterDocument(externalSourceUpdate.source)
     isApplyingExternalUpdateRef.current = true
-    replaceEditorBody(crepe.editor, nextDocument.body, sharingOf(collabSessionRef.current, isCollabFollowerRef.current))
+    crepe.editor.action(replaceAll(nextDocument.body, true))
     isApplyingExternalUpdateRef.current = false
     latestComposedSourceRef.current = externalSourceUpdate.source
     latestBodyRef.current = nextDocument.body
@@ -1472,7 +1401,7 @@ function MarkdownViewInner({
     }
 
     isApplyingExternalUpdateRef.current = true
-    replaceEditorBody(crepe.editor, parsedDocument.body, sharingOf(collabSessionRef.current, isCollabFollowerRef.current))
+    crepe.editor.action(replaceAll(parsedDocument.body, true))
     isApplyingExternalUpdateRef.current = false
     latestBodyRef.current = parsedDocument.body
   }, [parsedDocument.body, source])

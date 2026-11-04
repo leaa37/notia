@@ -20,24 +20,28 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::Value;
 
-use crate::backend::browser::{self, AgentAnswer, BrowserCommand, BrowserPage, GridSpec};
+use crate::backend::browser::{self, AgentAnswer, BrowserCommand, GridSpec, SeenPages};
 use crate::backend::{BackendError, BackendErrorCode, BackendRequestContext, RequestControl};
 use crate::host::{AppHandle, Manager};
+use crate::node_packages::{hide_console, NodePackage};
 
 /// The Playwright Notia installs and drives (its public `ariaSnapshot`
 /// with `mode: "ai"` gives the references).
-const PLAYWRIGHT_VERSION: &str = "1.64.1";
-const AGENT_SCRIPT: &str = include_str!("browser_agent.mjs");
-const AGENT_SCRIPT_NAME: &str = "browser_agent.mjs";
-const MIN_NODE_MAJOR: u32 = 18;
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const AGENT_PACKAGE: NodePackage = NodePackage {
+    name: "notia-browser-agent",
+    script_name: "browser_agent.mjs",
+    script: include_str!("browser_agent.mjs"),
+    packages: &[("playwright-core", "1.64.1")],
+    min_node_major: 18,
+    needed_by: "El navegador",
+};
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// A screenshot reaches the model at most this many pixels on its longest
 /// side.
 const SCREENSHOT_MAX_SIDE: u32 = 1600;
 const SCREENSHOT_QUALITY: u8 = 70;
 
-/// The browser process of this device, the last page it showed whole and
+/// The browser process of this device, the last pages it showed whole and
 /// the grid of its last screenshot with one.
 #[derive(Default)]
 pub(crate) struct BrowserState {
@@ -48,7 +52,7 @@ pub(crate) struct BrowserState {
 
 #[derive(Default, Clone)]
 struct Remembered {
-    page: Option<BrowserPage>,
+    pages: SeenPages,
     grid: Option<GridSpec>,
 }
 
@@ -90,18 +94,14 @@ impl Drop for Session {
     }
 }
 
-/// Whether this device runs the agent's browser.
-pub(crate) fn is_available(app: &AppHandle) -> bool {
-    cfg!(not(any(target_os = "android", target_os = "ios"))) && !crate::connection::is_client(app)
+/// Whether this device runs the agent's browser: any computer (Windows,
+/// Linux or macOS), a client too, never Android.
+pub(crate) fn is_available(_app: &AppHandle) -> bool {
+    cfg!(not(any(target_os = "android", target_os = "ios")))
 }
 
-fn unavailable(app: &AppHandle) -> BackendError {
-    let message = if crate::connection::is_client(app) {
-        "Este dispositivo es un cliente: el navegador corre solo en la PC host, cuando hay conexión."
-    } else {
-        "El navegador existe solo en la PC host de Notia, no en este dispositivo."
-    };
-    BackendError::new(BackendErrorCode::Unsupported, message, false)
+fn unavailable(_app: &AppHandle) -> BackendError {
+    BackendError::new(BackendErrorCode::Unsupported, "El navegador existe solo en las computadoras con Notia, no en Android.", false)
 }
 
 /// The confirmation of a click, a text, a key, an option or a drag: the
@@ -114,8 +114,8 @@ pub(crate) fn preview(app: &AppHandle, name: &str, arguments: &Value) -> Result<
     }
     let command = BrowserCommand::from_call(name, arguments)?;
     let last = app.state::<BrowserState>().remembered();
-    command.check_pointers(last.page.as_ref(), last.grid.as_ref())?;
-    Ok((command.summary(), command.detail(last.page.as_ref())))
+    command.check_pointers(&last.pages, last.grid.as_ref())?;
+    Ok((command.summary(), command.detail(&last.pages)))
 }
 
 /// Runs one browser step and returns what the model reads. A screenshot
@@ -134,14 +134,15 @@ pub(crate) fn execute_tool(
     let command = BrowserCommand::from_call(name, arguments)?;
     let state = app.state::<BrowserState>();
     let last = state.remembered();
-    command.check_pointers(last.page.as_ref(), last.grid.as_ref())?;
+    command.check_pointers(&last.pages, last.grid.as_ref())?;
+    let described = command.described_target(&last.pages);
     let mut session = state.session.lock().map_err(|_| BackendError::new(BackendErrorCode::Internal, "El navegador quedó bloqueado.", true))?;
     if command == BrowserCommand::Close {
         let was_open = session.as_mut().is_some_and(Session::is_running);
         if was_open {
             if let Some(running) = session.as_mut() {
                 // The process closes the window and ends; what it answers no longer matters.
-                let _ = exchange(running, &command, None, control);
+                let _ = exchange(running, &command, None, None, control);
             }
         }
         *session = None;
@@ -155,7 +156,7 @@ pub(crate) fn execute_tool(
         *session = Some(start(&folder, window_mode())?);
     }
     let running = session.as_mut().expect("the session was just started");
-    let answer = match exchange(running, &command, last.grid.as_ref(), control) {
+    let answer = match exchange(running, &command, last.grid.as_ref(), described.as_deref(), control) {
         Ok(answer) => answer,
         Err(error) => {
             // A browser that stopped answering or ended starts again on the next step.
@@ -173,7 +174,7 @@ pub(crate) fn execute_tool(
     let page = answer.page.clone().unwrap_or_default();
     state.update(|last| {
         if command.returns_whole_snapshot() {
-            last.page = Some(page.clone());
+            last.pages.remember(page.clone());
         }
         if answer.grid.is_some() {
             last.grid = answer.grid;
@@ -197,11 +198,23 @@ pub(crate) fn execute_tool(
 }
 
 /// Sends one step and waits for its answer, its time or a cancel. Answers
-/// of an earlier step that was cancelled are skipped.
-fn exchange(session: &mut Session, command: &BrowserCommand, grid: Option<&GridSpec>, control: &RequestControl) -> Result<AgentAnswer, BackendError> {
+/// of an earlier step that was cancelled are skipped. `described` is the
+/// element as a snapshot showed it, to find it again if the page drew it
+/// again.
+fn exchange(
+    session: &mut Session,
+    command: &BrowserCommand,
+    grid: Option<&GridSpec>,
+    described: Option<&str>,
+    control: &RequestControl,
+) -> Result<AgentAnswer, BackendError> {
     session.next_id += 1;
     let id = session.next_id;
-    let line = format!("{}\n", command.agent_request(id, grid)?);
+    let mut request = command.agent_request(id, grid)?;
+    if let (Some(described), Some(object)) = (described, request.as_object_mut()) {
+        object.insert("described".into(), serde_json::json!(described));
+    }
+    let line = format!("{request}\n");
     session
         .stdin
         .write_all(line.as_bytes())
@@ -247,7 +260,7 @@ fn window_mode() -> &'static str {
 fn start(folder: &Path, mode: &str) -> Result<Session, BackendError> {
     let mut command = Command::new("node");
     command
-        .arg(folder.join(AGENT_SCRIPT_NAME))
+        .arg(folder.join(AGENT_PACKAGE.script_name))
         .arg(folder.join("profile"))
         .arg(mode)
         .current_dir(folder)
@@ -255,7 +268,7 @@ fn start(folder: &Path, mode: &str) -> Result<Session, BackendError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     hide_console(&mut command);
-    let mut child = command.spawn().map_err(|_| node_missing())?;
+    let mut child = command.spawn().map_err(|_| AGENT_PACKAGE.node_missing())?;
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = child.kill();
         return Err(BackendError::new(BackendErrorCode::Internal, "No se pudo conectar con el proceso del navegador.", true));
@@ -276,14 +289,6 @@ fn start(folder: &Path, mode: &str) -> Result<Session, BackendError> {
     Ok(Session { child, stdin, answers, next_id: 0 })
 }
 
-fn node_missing() -> BackendError {
-    BackendError::new(
-        BackendErrorCode::Unsupported,
-        format!("El navegador necesita Node.js {MIN_NODE_MAJOR} o más nuevo instalado en la PC host (nodejs.org); después probá de nuevo."),
-        false,
-    )
-}
-
 /// The folder with the script and Playwright, installed with npm when it
 /// is missing or another version.
 fn install(app: &AppHandle) -> Result<PathBuf, BackendError> {
@@ -292,86 +297,8 @@ fn install(app: &AppHandle) -> Result<PathBuf, BackendError> {
         .app_data_dir()
         .map(|directory| directory.join("browser-agent"))
         .map_err(|_| BackendError::new(BackendErrorCode::Storage, "No se pudo resolver la carpeta del navegador.", true))?;
-    install_into(&folder)?;
+    AGENT_PACKAGE.install_into(&folder)?;
     Ok(folder)
-}
-
-fn install_into(folder: &Path) -> Result<(), BackendError> {
-    let storage = |_| BackendError::new(BackendErrorCode::Storage, "No se pudo preparar la carpeta del navegador.", true);
-    std::fs::create_dir_all(folder).map_err(storage)?;
-    let script = folder.join(AGENT_SCRIPT_NAME);
-    if std::fs::read_to_string(&script).ok().as_deref() != Some(AGENT_SCRIPT) {
-        std::fs::write(&script, AGENT_SCRIPT).map_err(storage)?;
-    }
-    let manifest = folder.join("package.json");
-    if !manifest.is_file() {
-        std::fs::write(&manifest, "{\n  \"name\": \"notia-browser-agent\",\n  \"private\": true\n}\n").map_err(storage)?;
-    }
-    if installed_version(folder).as_deref() == Some(PLAYWRIGHT_VERSION) {
-        return Ok(());
-    }
-    check_node()?;
-    run_npm_install(folder)?;
-    if installed_version(folder).as_deref() != Some(PLAYWRIGHT_VERSION) {
-        return Err(install_failed(folder, None));
-    }
-    Ok(())
-}
-
-fn installed_version(folder: &Path) -> Option<String> {
-    let manifest = std::fs::read_to_string(folder.join("node_modules").join("playwright-core").join("package.json")).ok()?;
-    serde_json::from_str::<Value>(&manifest).ok()?.get("version")?.as_str().map(str::to_string)
-}
-
-fn check_node() -> Result<(), BackendError> {
-    let mut command = Command::new("node");
-    command.arg("--version").stdin(Stdio::null()).stderr(Stdio::null());
-    hide_console(&mut command);
-    let output = command.output().map_err(|_| node_missing())?;
-    let version = String::from_utf8_lossy(&output.stdout);
-    let major = version.trim().trim_start_matches('v').split('.').next().and_then(|major| major.parse::<u32>().ok());
-    match major {
-        Some(major) if output.status.success() && major >= MIN_NODE_MAJOR => Ok(()),
-        _ => Err(node_missing()),
-    }
-}
-
-fn run_npm_install(folder: &Path) -> Result<(), BackendError> {
-    let mut command = Command::new(if cfg!(target_os = "windows") { "npm.cmd" } else { "npm" });
-    command
-        .args(["install", "--no-audit", "--no-fund", "--save-exact", &format!("playwright-core@{PLAYWRIGHT_VERSION}")])
-        .current_dir(folder)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    hide_console(&mut command);
-    let mut child = command.spawn().map_err(|_| node_missing())?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(install_failed(folder, status.code())),
-            Ok(None) if started.elapsed() >= INSTALL_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(install_failed(folder, None));
-            }
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(_) => return Err(install_failed(folder, None)),
-        }
-    }
-}
-
-fn install_failed(folder: &Path, code: Option<i32>) -> BackendError {
-    let code = code.map(|code| format!(" (código {code})")).unwrap_or_default();
-    BackendError::new(
-        BackendErrorCode::Unsupported,
-        format!(
-            "No se pudo instalar Playwright con npm{code}. Revisá la conexión, o instalalo a mano en la PC host con «npm install playwright-core@{PLAYWRIGHT_VERSION}» dentro de {}.",
-            folder.display()
-        ),
-        true,
-    )
 }
 
 /// The screenshot as the model reads it: JPEG, at most
@@ -390,18 +317,6 @@ fn scaled_screenshot(base64_jpeg: &str) -> Result<String, BackendError> {
         .encode_image(&image.to_rgb8())
         .map_err(|_| invalid())?;
     Ok(engine.encode(jpeg))
-}
-
-fn hide_console(command: &mut Command) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt as _;
-        // No console window over the app; the browser opens its own window.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = command;
 }
 
 #[cfg(test)]
@@ -441,13 +356,13 @@ mod tests {
     #[ignore = "needs Node.js, npm, the network and Chrome or Edge"]
     fn drives_a_real_browser_through_the_script() {
         let folder = std::env::temp_dir().join(format!("notia-browser-{}", std::process::id()));
-        install_into(&folder).expect("install");
+        AGENT_PACKAGE.install_into(&folder).expect("install");
         let mut session = start(&folder, "headless").expect("start");
         let control = RequestControl::new(None);
         let mut grid = None;
         let mut step = |session: &mut Session, name: &str, arguments: Value| {
             let command = BrowserCommand::from_call(name, &arguments).expect("command");
-            let answer = exchange(session, &command, grid.as_ref(), &control).expect("answer");
+            let answer = exchange(session, &command, grid.as_ref(), None, &control).expect("answer");
             assert!(answer.ok, "{name}: {:?}", answer.error);
             if answer.grid.is_some() {
                 grid = answer.grid;
@@ -483,14 +398,14 @@ mod tests {
         assert!((f64::from(decoded.height()) - low_grid.height).abs() <= 1.0, "{} vs {}", decoded.height(), low_grid.height);
         let missing = step_error(&mut session, &control);
         assert!(missing.contains("la referencia e9999 ya no está"), "{missing}");
-        let _ = exchange(&mut session, &BrowserCommand::Close, None, &control);
+        let _ = exchange(&mut session, &BrowserCommand::Close, None, None, &control);
         drop(session);
         let _ = std::fs::remove_dir_all(&folder);
     }
 
     fn step_error(session: &mut Session, control: &RequestControl) -> String {
         let command = BrowserCommand::from_call(browser::CLICK_TOOL, &serde_json::json!({ "ref": "e9999", "element": "nada" })).expect("command");
-        let answer = exchange(session, &command, None, control).expect("answer");
+        let answer = exchange(session, &command, None, None, control).expect("answer");
         assert!(!answer.ok);
         answer.failure().message
     }

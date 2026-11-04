@@ -9,12 +9,13 @@ use crate::prompt::{strip_frontmatter, DEFAULT_AGENT_RULES};
 pub const AGENT_DIRECTORY: &str = ".agent";
 pub const PROMPTS_DIRECTORY: &str = ".agent/promps";
 pub const MEMORY_DIRECTORY: &str = ".agent/memory";
-pub const AGENT_FOLDERS: [&str; 5] = [
+pub const AGENT_FOLDERS: [&str; 6] = [
     ".agent",
     ".agent/promps",
     ".agent/dynamics",
     ".agent/skills",
     ".agent/memory",
+    ".agent/scripts",
 ];
 pub const RULES_PATH: &str = ".agent/memory/rules.md";
 pub const MEMORY_PATH: &str = ".agent/memory/memory.md";
@@ -234,11 +235,14 @@ const THOUGHTS_VERSION_MARKER: &str = "<!-- NOTIA_AGENT_THOUGHTS_VERSION:1 -->";
 const CONFIDENTIAL_CONTEXT_LINE: &str = "contexto: \"#Confidencial\"";
 const SYSTEM_CONTEXT_LINE: &str = "contexto: \"#System\"";
 
-/// The files of `.agent/memory` only the AI writes (through its tools, the
-/// reflection after each turn and the organization of its files): their
-/// context is `#System` and the person reads them but never edits,
-/// renames, moves or deletes them by hand.
-pub const SYSTEM_FILES: [&str; 7] = [RULES_PATH, MEMORY_PATH, THOUGHTS_PATH, BIOGRAPHY_PATH, TALK_PATH, PEOPLE_PATH, IMPROVE_PATH];
+/// The files only the AI or Notia writes: those of `.agent/memory`
+/// (through the AI's tools, the reflection after each turn and the
+/// organization of its files) and the guide of `.agent/scripts`, which
+/// Notia keeps as it ships. Their context is `#System`: the person reads
+/// them but never edits, renames, moves or deletes them by hand, nor the
+/// folders that hold them.
+pub const SYSTEM_FILES: [&str; 8] =
+    [RULES_PATH, MEMORY_PATH, THOUGHTS_PATH, BIOGRAPHY_PATH, TALK_PATH, PEOPLE_PATH, IMPROVE_PATH, crate::agent_scripts::README_PATH];
 
 /// Whether `path` (a logical path of the library) is one of `SYSTEM_FILES`.
 pub fn is_system_file(path: &str) -> bool {
@@ -615,6 +619,22 @@ pub fn with_thought(thoughts: &[String], stamped: String) -> Vec<String> {
     next
 }
 
+/// Items within `budget`, without the oldest ones that do not fit; the
+/// last item always stays. Thoughts (working notes) and talk traits (a
+/// newer one wins a contradiction) are kept oldest first: when the model
+/// could not bring a full file back to its size, the oldest go, so a new
+/// item is never lost. Returns the items kept and how many were dropped.
+pub fn without_oldest(mut thoughts: Vec<String>, budget: ItemBudget) -> (Vec<String>, usize) {
+    let mut chars = total_chars(&thoughts);
+    let mut dropped = 0;
+    while thoughts.len() - dropped > 1 && (thoughts.len() - dropped > budget.items || chars > budget.chars) {
+        chars -= thoughts[dropped].chars().count();
+        dropped += 1;
+    }
+    thoughts.drain(..dropped);
+    (thoughts, dropped)
+}
+
 /// Share of words two thoughts must have in common to be the same note.
 const SAME_THOUGHT_SHARE: f64 = 0.8;
 
@@ -863,6 +883,15 @@ mod tests {
         let rendered = render_thoughts(&thoughts);
         assert!(rendered.starts_with(THOUGHTS_VERSION_MARKER));
         assert_eq!(parse_memory_items(&rendered), thoughts);
+
+        // A full file loses its oldest notes, never the new one.
+        let full = vec!["a".repeat(40), "b".repeat(40), "c".repeat(40), "d".repeat(10)];
+        let (kept, dropped) = without_oldest(full.clone(), ItemBudget { items: 10, chars: 60 });
+        assert_eq!((kept, dropped), (vec!["c".repeat(40), "d".repeat(10)], 2));
+        assert_eq!(without_oldest(full.clone(), ItemBudget { items: 2, chars: 1_000 }).1, 2);
+        assert_eq!(without_oldest(full.clone(), ItemBudget { items: 10, chars: 1_000 }), (full, 0));
+        let (kept, _) = without_oldest(vec!["x".repeat(100)], ItemBudget { items: 10, chars: 5 });
+        assert_eq!(kept.len(), 1, "the last note stays even when it alone passes the size");
     }
 
     #[test]
@@ -895,6 +924,9 @@ mod tests {
         assert!(!is_system_file(".agent/promps/default.md") && !is_system_file(".agent/skills/x.md") && !is_system_file("memory.md"));
         assert!(holds_system_files(".agent") && holds_system_files(".agent/memory/") && holds_system_files(".AGENT/memory"));
         assert!(!holds_system_files(".agent/promps") && !holds_system_files(".agen") && !holds_system_files(""));
+        // The scripts' guide is Notia's; the scripts next to it are not.
+        assert!(is_system_file(".agent/scripts/README.md") && holds_system_files(".agent/scripts"));
+        assert!(!is_system_file(".agent/scripts/csv_a_tabla.py") && !holds_system_files(".agent/scripts/csv_a_tabla.py"));
 
         let memory = with_agent_context(MEMORY_PATH, "---\ncontexto: \"#Confidencial\"\n---\n\n- Usa voseo.");
         assert_eq!(memory, "---\ncontexto: \"#System\"\n---\n\n- Usa voseo.");

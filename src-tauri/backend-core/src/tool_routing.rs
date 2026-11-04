@@ -64,10 +64,12 @@ pub enum ToolArea {
     Gym,
     Images,
     Browser,
+    WhatsApp,
+    Scripts,
 }
 
 impl ToolArea {
-    pub const ALL: [ToolArea; 13] = [
+    pub const ALL: [ToolArea; 15] = [
         ToolArea::Library,
         ToolArea::Meeting,
         ToolArea::Tasks,
@@ -81,6 +83,8 @@ impl ToolArea {
         ToolArea::Gym,
         ToolArea::Images,
         ToolArea::Browser,
+        ToolArea::WhatsApp,
+        ToolArea::Scripts,
     ];
 
     pub fn id(self) -> &'static str {
@@ -98,6 +102,8 @@ impl ToolArea {
             Self::Gym => "gimnasio",
             Self::Images => "imagenes",
             Self::Browser => "navegador",
+            Self::WhatsApp => "whatsapp",
+            Self::Scripts => "scripts",
         }
     }
 
@@ -116,6 +122,8 @@ impl ToolArea {
             Self::Gym => "Gimnasio: rutinas de entrenamiento (días, ejercicios, series, peso, descanso), entrenar ahora (empezar, marcar series, pausar, terminar), historial de entrenamientos, músculos trabajados, equipamiento disponible y las fichas de los ejercicios",
             Self::Images => "Imágenes: generar una imagen nueva a partir de una descripción (foto, ilustración, dibujo, logo, cartel, ícono) o editar una imagen de la conversación (cambiarle algo, agregarle o quitarle elementos o texto, sacarle el fondo)",
             Self::Browser => "Navegador web de la PC host: abrir y recorrer sitios, hacer clic, completar formularios y buscadores, usar una cuenta con la sesión iniciada, leer o capturar una página que necesita interacción (no para una búsqueda simple en la web)",
+            Self::WhatsApp => "WhatsApp del usuario: ver sus chats habilitados, leer los mensajes y las imágenes que le mandaron, escribirle a alguien o a un grupo y mandarle un archivo de la biblioteca",
+            Self::Scripts => "Scripts Python de soporte de .agent/scripts: correr uno como herramienta, o escribir uno nuevo para un trabajo difícil, largo o repetitivo sin herramienta propia (procesar muchos archivos, convertir formatos, cálculos, análisis de datos, informes)",
             Self::Actions => "Acciones IA: lo que la IA hace sola en un horario y te responde por Telegram (recordatorios, tareas a una hora o que se repiten, la revisión de cada hora): ver, crear, cambiar, pausar, borrar, ejecutar ahora o reintentar",
         }
     }
@@ -146,6 +154,8 @@ pub fn tool_area(name: &str) -> Option<ToolArea> {
         ToolPolicy::GymRead | ToolPolicy::GymWrite => Some(ToolArea::Gym),
         ToolPolicy::Images => Some(ToolArea::Images),
         ToolPolicy::Browser => Some(ToolArea::Browser),
+        ToolPolicy::WhatsApp => Some(ToolArea::WhatsApp),
+        ToolPolicy::Scripts => Some(ToolArea::Scripts),
         _ if matches!(name, "set_agent_execution_plan" | "create_agent_plan" | "update_agent_plan") => None,
         _ if name.contains("task") => Some(ToolArea::Tasks),
         _ => Some(ToolArea::Library),
@@ -495,6 +505,20 @@ fn is_browser_request(message: &str) -> bool {
     WORDS.iter().any(|word| lowered.contains(word))
 }
 
+/// Whether a message names a script.
+fn is_script_request(message: &str) -> bool {
+    const WORDS: [&str; 2] = ["script", "python"];
+    let lowered = message.to_lowercase();
+    WORDS.iter().any(|word| lowered.contains(word))
+}
+
+/// Whether a message names WhatsApp.
+fn is_whatsapp_request(message: &str) -> bool {
+    const WORDS: [&str; 3] = ["whatsapp", "wpp", "whatsap"];
+    let lowered = message.to_lowercase();
+    WORDS.iter().any(|word| lowered.contains(word))
+}
+
 /// Whether a message asks to draw or change an image.
 fn is_image_request(message: &str) -> bool {
     const WORDS: [&str; 9] = ["imagen", "imágen", "dibuj", "ilustr", "logo", "generá una foto", "generame una foto", "foto de un", "foto de una"];
@@ -515,6 +539,10 @@ pub fn fallback_areas(message: &str, offered: &[ToolArea], with_attachments: boo
         &[ToolArea::Images, ToolArea::Library]
     } else if is_browser_request(message) {
         &[ToolArea::Browser, ToolArea::Library]
+    } else if is_whatsapp_request(message) {
+        &[ToolArea::WhatsApp, ToolArea::Library]
+    } else if is_script_request(message) {
+        &[ToolArea::Scripts, ToolArea::Library]
     } else {
         &[ToolArea::Library, ToolArea::Tasks, ToolArea::Routine, ToolArea::Agenda, ToolArea::Mail, ToolArea::Actions, ToolArea::Health, ToolArea::Gym]
     };
@@ -566,6 +594,7 @@ mod tests {
         assert_eq!(tool_area("create_finance_transaction"), Some(ToolArea::Finance));
         assert_eq!(tool_area("trash_gmail_messages"), Some(ToolArea::Mail));
         assert_eq!(tool_area("browser_click"), Some(ToolArea::Browser));
+        assert_eq!(tool_area("whatsapp_send_message"), Some(ToolArea::WhatsApp));
     }
 
     #[test]
@@ -724,6 +753,8 @@ mod tests {
         assert_eq!(fallback_areas("pagué la cuenta de la luz", &all, false, None), vec![ToolArea::Finance, ToolArea::Routine]);
         assert_eq!(fallback_areas("dibujame un gato astronauta", &all, false, None), vec![ToolArea::Images, ToolArea::Library]);
         assert_eq!(fallback_areas("abrí el navegador y entrá a mi homebanking", &all, false, None), vec![ToolArea::Browser, ToolArea::Library]);
+        assert_eq!(fallback_areas("qué me escribió Juan por WhatsApp", &all, false, None), vec![ToolArea::WhatsApp, ToolArea::Library]);
+        assert_eq!(fallback_areas("corré el script de los CSV", &all, false, None), vec![ToolArea::Scripts, ToolArea::Library]);
         assert_eq!(
             fallback_areas("resumí la nota de ayer", &all, false, None),
             vec![ToolArea::Library, ToolArea::Tasks, ToolArea::Routine, ToolArea::Agenda, ToolArea::Mail, ToolArea::Actions, ToolArea::Health, ToolArea::Gym]

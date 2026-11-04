@@ -297,61 +297,6 @@ fn startup_plugin(hook: notia_app::host::plugin::TauriPlugin) -> tauri::plugin::
         .build()
 }
 
-/// Scheme of the files of the host's library on a client window
-/// (`convertFileSrc(path, 'notiahost')`): the backend fetches them from the
-/// host with the session of this device.
-const HOST_FILE_SCHEME: &str = "notiahost";
-
-fn host_file(
-    context: tauri::UriSchemeContext<'_, Wry>,
-    request: tauri::http::Request<Vec<u8>>,
-    responder: tauri::UriSchemeResponder,
-) {
-    let not_found = || {
-        tauri::http::Response::builder()
-            .status(404)
-            .body(Vec::new())
-            .unwrap_or_default()
-    };
-    let Some(app) = context.app_handle().try_state::<AppContext>().map(|state| state.inner().clone()) else {
-        responder.respond(not_found());
-        return;
-    };
-    let path = percent_decode(request.uri().path().trim_start_matches('/'));
-    tauri::async_runtime::spawn(async move {
-        let response = match path {
-            Some(path) => match notia_app::fetch_host_file(&app, &path).await {
-                Some((mime, bytes)) => tauri::http::Response::builder()
-                    .header("Content-Type", mime)
-                    // As on the host: an SVG or HTML file cannot run scripts.
-                    .header("Content-Security-Policy", "sandbox")
-                    .body(bytes)
-                    .unwrap_or_else(|_| not_found()),
-                None => not_found(),
-            },
-            None => not_found(),
-        };
-        responder.respond(response);
-    });
-}
-
-fn percent_decode(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
-            decoded.push(u8::from_str_radix(hex, 16).ok()?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).ok().filter(|path| !path.is_empty())
-}
-
 type Command = Box<dyn FnOnce() + Send>;
 
 /// Runs the commands of the interface on their own thread, in the order
@@ -410,7 +355,6 @@ pub fn run() {
 
     #[cfg(target_os = "windows")]
     let builder = crate::windows_tray::configure(builder);
-    let builder = builder.register_asynchronous_uri_scheme_protocol(HOST_FILE_SCHEME, host_file);
 
     let window_commands: fn(tauri::ipc::Invoke<Wry>) -> bool = tauri::generate_handler![
         notia_log,

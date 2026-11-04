@@ -10,10 +10,11 @@
 //! waits in the queue (see `backend_core::turn_interrupts`). Photos, images
 //! and PDFs go to the library chat like text: the model decides what kind of
 //! request they are (see `backend_core::tool_routing`), and the parts of an
-//! album become one request, as do the messages Telegram splits a long text
-//! into (see `backend_core::telegram_bot::may_continue`). Offsets,
-//! processed updates and the queue survive restarts; the text of queued
-//! requests is never stored.
+//! album become one request. A new request waits while the person may still
+//! be writing (see `backend_core::reply_wait`): what the chat sends within
+//! ten seconds of its last message joins it. Offsets, processed
+//! updates and the queue survive restarts; the text of queued requests is
+//! never stored.
 //!
 //! The autonomous agent (`agent_autonomy`) also runs here, as requests of
 //! the Owner's chat that Notia queues by itself: they only read, show no
@@ -59,12 +60,10 @@ const CANCEL_ATTEMPTS: u32 = 120;
 /// The parts of an album arrive as separate updates, usually within a
 /// second; the album is sent once no part arrived for this long.
 const ALBUM_WINDOW: Duration = Duration::from_millis(1500);
-/// Telegram delivers a long text as several messages sent one after
-/// another (see `bot::may_continue`); a text that may go on is sent once
-/// no part arrived for this long, with room for a slow mobile connection.
-const TEXT_CONTINUATION_WINDOW: Duration = Duration::from_secs(3);
 const PART_POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Telegram albums hold up to 10 photos or files.
+/// How often a batch that waits for more messages checks its time.
+const BATCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Telegram albums hold up to 10 photos or files, and so does a request.
 const MAX_ALBUM_PARTS: usize = 10;
 const OWNER: &str = "user-owner";
 /// Event emitted to the interface after a Telegram request changed data.
@@ -170,7 +169,7 @@ static DECISION: Mutex<Option<Decision>> = Mutex::new(None);
 fn desired_worker(app: &AppHandle) -> Option<(WorkerKey, CatalogLibrary)> {
     let generation = crate::library_config::config_generation();
     let library = crate::library_catalog::selected_library_id(app);
-    let client = crate::connection::is_client(app);
+    let client = !crate::device_role::runs_services(app);
     if let Ok(last) = DECISION.lock() {
         if let Some(last) = last.as_ref().filter(|last| {
             last.generation == generation && last.library == library && last.client == client && last.at.elapsed() < DECISION_TTL
@@ -186,7 +185,7 @@ fn desired_worker(app: &AppHandle) -> Option<(WorkerKey, CatalogLibrary)> {
 }
 
 fn read_desired_worker(app: &AppHandle, client: bool) -> Option<(WorkerKey, CatalogLibrary)> {
-    // A client never answers Telegram: its host does.
+    // Only the computer that runs the library's services answers Telegram.
     if client {
         return None;
     }
@@ -265,54 +264,70 @@ struct PendingAlbum {
     text: String,
     attachments: Vec<JobAttachment>,
     last_part: Instant,
+    /// The album joins the chat's batch (a new request) instead of going
+    /// on at once (a message for a running request or a question).
+    batched: bool,
 }
 
-/// Typed text of a chat that may go on in its next message.
-struct PendingText {
+/// What a chat sent while the person may still be writing: the messages
+/// that arrive meanwhile join it, and it goes on as one request once none
+/// arrived for the wait of the last one (see `backend_core::reply_wait`).
+struct PendingBatch {
+    /// The request it becomes, stored without its text (a restart reports
+    /// it as interrupted).
+    request_id: String,
     telegram_user_id: i64,
     library_user_id: String,
     parts: Vec<String>,
-    last_part: Instant,
+    attachments: Vec<JobAttachment>,
+    ready_at: Instant,
 }
 
-impl PendingText {
-    /// Telegram drops the space or line break where it cut the text, so a
-    /// line break joins the parts.
+impl PendingBatch {
+    /// One message per line, in the order they arrived.
     fn text(&self) -> String {
         self.parts.join("\n")
     }
+
+    fn stored(&self, chat_id: i64) -> StoredJob {
+        StoredJob {
+            request_id: self.request_id.clone(),
+            chat_id,
+            telegram_user_id: self.telegram_user_id,
+            library_user_id: self.library_user_id.clone(),
+            attachments: self.attachments.clone(),
+            attachment: None,
+        }
+    }
 }
 
-/// What a typed message does to the text of its chat.
-enum TextStep {
-    /// The text may go on; `opened` when this message started it.
-    Wait { opened: bool },
-    /// The text is whole.
-    Complete(PendingText),
-}
-
-/// Adds a typed message to the text of its chat: a part long enough to be
-/// followed by another keeps the text waiting (see `bot::may_continue`),
-/// and a shorter one completes it.
-fn add_text_part(
-    texts: &mut HashMap<i64, PendingText>,
+/// Adds a message to the batch of its chat, which then waits `wait` from
+/// now; `true` when the message opened the batch.
+fn add_to_batch(
+    batches: &mut HashMap<i64, PendingBatch>,
     chat_id: i64,
     telegram_user_id: i64,
     library_user_id: String,
     text: String,
-) -> TextStep {
-    let continues = bot::may_continue(&text);
-    let mut pending = texts
-        .remove(&chat_id)
-        .unwrap_or_else(|| PendingText { telegram_user_id, library_user_id, parts: Vec::new(), last_part: Instant::now() });
-    let opened = pending.parts.is_empty();
-    pending.parts.push(text);
-    pending.last_part = Instant::now();
-    if !continues {
-        return TextStep::Complete(pending);
+    attachments: Vec<JobAttachment>,
+    wait: Duration,
+) -> bool {
+    let opened = !batches.contains_key(&chat_id);
+    let batch = batches.entry(chat_id).or_insert_with(|| PendingBatch {
+        request_id: short_id(),
+        telegram_user_id,
+        library_user_id,
+        parts: Vec::new(),
+        attachments: Vec::new(),
+        ready_at: Instant::now(),
+    });
+    if !text.trim().is_empty() {
+        batch.parts.push(text);
     }
-    texts.insert(chat_id, pending);
-    TextStep::Wait { opened }
+    let room = MAX_ALBUM_PARTS.saturating_sub(batch.attachments.len());
+    batch.attachments.extend(attachments.into_iter().take(room));
+    batch.ready_at = Instant::now() + wait;
+    opened
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -334,12 +349,15 @@ struct Job {
     /// Set for the run of an AI action; never stored either: an action left
     /// in the queue by a restart is marked interrupted by `ai_actions`.
     action: Option<ActionJob>,
+    /// Set for the run of a webhook call; never stored: a program calls
+    /// again if Notia restarted.
+    webhook: Option<WebhookJob>,
 }
 
 impl Job {
     /// Only the requests people sent survive a restart.
     fn is_persisted(&self) -> bool {
-        self.autonomous.is_none() && self.action.is_none()
+        self.autonomous.is_none() && self.action.is_none() && self.webhook.is_none()
     }
 }
 
@@ -364,9 +382,38 @@ pub(crate) enum ActionEnqueue {
 /// `library_id`.
 pub(crate) fn enqueue_action(app: &AppHandle, library_id: &str, job: ActionJob) -> ActionEnqueue {
     match running_worker(app, library_id) {
-        Some(worker) => worker.enqueue_action(job),
+        Some(worker) => worker.enqueue_owner_run(job.request.clone(), Some(job), None),
         None => ActionEnqueue::Unavailable,
     }
+}
+
+/// The run of a webhook call (see `webhooks`): a turn of the Owner's chat
+/// whose request is the prompt another program sent.
+#[derive(Debug, Clone)]
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+pub(crate) struct WebhookJob {
+    pub(crate) call_id: String,
+    pub(crate) prompt: crate::backend::webhooks::WebhookCallPrompt,
+    pub(crate) request: String,
+}
+
+/// Queues the run of a webhook call in the Owner's Telegram chat of
+/// `library_id`.
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+pub(crate) fn enqueue_webhook(app: &AppHandle, library_id: &str, job: WebhookJob) -> ActionEnqueue {
+    match running_worker(app, library_id) {
+        Some(worker) => worker.enqueue_owner_run(job.request.clone(), None, Some(job)),
+        None => ActionEnqueue::Unavailable,
+    }
+}
+
+/// What a turn Notia started for the Owner answered, and the messages
+/// already sent for it (notes before a question, images it showed).
+struct UnattendedAnswer {
+    answer: String,
+    request_id: String,
+    notes: Vec<i64>,
+    shown: Vec<MessageAttachment>,
 }
 
 /// The request running now, so a message of its chat can stop it. Its text
@@ -445,7 +492,7 @@ struct Worker {
     history: Mutex<HashMap<i64, VecDeque<BackendMessage>>>,
     links: Mutex<HashMap<i64, LinkFlow>>,
     albums: Mutex<HashMap<(i64, String), PendingAlbum>>,
-    texts: Mutex<HashMap<i64, PendingText>>,
+    batches: Mutex<HashMap<i64, PendingBatch>>,
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -483,7 +530,7 @@ impl Worker {
             history: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
             albums: Mutex::new(HashMap::new()),
-            texts: Mutex::new(HashMap::new()),
+            batches: Mutex::new(HashMap::new()),
         });
         worker.persist();
         worker.notify_interrupted();
@@ -508,6 +555,12 @@ impl Worker {
             self.queue
                 .lock()
                 .map(|queue| queue.iter().filter(|job| job.is_persisted()).map(|job| job.stored.clone()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        jobs.extend(
+            self.batches
+                .lock()
+                .map(|batches| batches.iter().map(|(chat_id, batch)| batch.stored(*chat_id)).collect::<Vec<_>>())
                 .unwrap_or_default(),
         );
         persisted.jobs = jobs;
@@ -738,6 +791,14 @@ impl Worker {
             return;
         }
         let mut text = update.text.as_deref().map(str::trim).unwrap_or_default().to_string();
+        // A reply («Responder») to the message of an AI task's question or
+        // approval answers the task instead of starting a request.
+        if let (OWNER, Some(reply_to)) = (library_user_id.as_str(), update.reply_to_message_id) {
+            if crate::ai_task_runner::answer_reply_from_telegram(update.chat_id, reply_to, &text) {
+                self.send(update.chat_id, "Le pasé tu respuesta a la tarea.");
+                return;
+            }
+        }
         if text.is_empty() {
             if let Some(audio) = update.audio.as_ref() {
                 match transcribe(&self.app, &self.token, audio) {
@@ -750,7 +811,7 @@ impl Worker {
                         let acknowledgement = transcription.chars().take(3_000).collect::<String>();
                         self.send_html(
                             update.chat_id,
-                            &format!("Solicitud <b>{}</b> recibida y en proceso.", crate::backend::escape_telegram_html(&acknowledgement)),
+                            &format!("Audio recibido: <b>{}</b>", crate::backend::escape_telegram_html(&acknowledgement)),
                             Vec::new(),
                         );
                     }
@@ -776,77 +837,113 @@ impl Worker {
         // The Owner comes first: a run Notia started by itself gives way.
         self.stop_autonomous_run(update.chat_id);
         let (chat_id, telegram_user_id) = (update.chat_id, update.user.id);
-        // Typed text may be a part of a longer one; a command never is.
-        if attachment.is_none() && update.audio.is_none() && !text.starts_with('/') {
-            self.collect_text_part(chat_id, telegram_user_id, library_user_id, text);
+        // Stopping what is still being written needs no request.
+        if crate::backend::turn_interrupts::is_cancel_command(&text) && self.drop_batch(chat_id) {
+            self.send(chat_id, "Listo, descarté lo que me estabas escribiendo.");
             return;
         }
-        // Anything else goes after the text still waiting for its next part.
-        self.flush_text(chat_id);
+        // A new request waits for the rest of what the person writes; a
+        // command, an answer to the chat's question and a message for its
+        // running request go on at once, after what was waiting.
+        let batched = !text.starts_with('/') && self.waits_for_more(chat_id);
+        if !batched {
+            self.flush_batch(chat_id);
+        }
         match (attachment, update.media_group_id) {
             (Some(attachment), Some(group)) => {
-                self.collect_album_part(chat_id, group, telegram_user_id, library_user_id, text, attachment)
+                self.collect_album_part(chat_id, group, telegram_user_id, library_user_id, text, attachment, batched)
             }
+            (Some(attachment), None) if batched => self.collect_batch_part(chat_id, telegram_user_id, library_user_id, text, vec![attachment]),
             (Some(attachment), None) => self.enqueue(chat_id, telegram_user_id, library_user_id, text, vec![attachment], true),
+            (None, _) if batched => self.collect_batch_part(chat_id, telegram_user_id, library_user_id, text, Vec::new()),
             (None, _) => self.dispatch_text(chat_id, telegram_user_id, library_user_id, text),
         }
     }
 
-    /// Handles a typed message. One long enough to be a part of a longer
-    /// text waits for the next (see `bot::may_continue`): the parts that
-    /// arrive meanwhile join it in order, and the whole text goes on once a
-    /// shorter part ends it or none arrived for `TEXT_CONTINUATION_WINDOW`.
-    fn collect_text_part(self: &Arc<Self>, chat_id: i64, telegram_user_id: i64, library_user_id: String, text: String) {
-        let Ok(mut texts) = self.texts.lock() else {
-            self.dispatch_text(chat_id, telegram_user_id, library_user_id, text);
-            return;
+    /// Whether a message of `chat_id` starts or joins a new request: the
+    /// chat has no question waiting for its answer and no request of its
+    /// own running.
+    fn waits_for_more(&self, chat_id: i64) -> bool {
+        let asking = self.prompt.lock().map(|prompt| prompt.as_ref().is_some_and(|(prompt_chat, ..)| *prompt_chat == chat_id)).unwrap_or(false);
+        !asking && self.running_request(chat_id).is_none()
+    }
+
+    /// Adds a message to the batch of `chat_id`, which goes on
+    /// `TELEGRAM_WAIT` after its last message.
+    fn collect_batch_part(self: &Arc<Self>, chat_id: i64, telegram_user_id: i64, library_user_id: String, text: String, attachments: Vec<JobAttachment>) {
+        let wait = crate::backend::reply_wait::TELEGRAM_WAIT;
+        let opened = match self.batches.lock() {
+            Ok(mut batches) => add_to_batch(&mut batches, chat_id, telegram_user_id, library_user_id, text, attachments, wait),
+            Err(_) => {
+                if attachments.is_empty() {
+                    self.dispatch_text(chat_id, telegram_user_id, library_user_id, text);
+                } else {
+                    self.enqueue(chat_id, telegram_user_id, library_user_id, text, attachments, true);
+                }
+                return;
+            }
         };
-        let step = add_text_part(&mut texts, chat_id, telegram_user_id, library_user_id, text);
-        drop(texts);
-        match step {
-            TextStep::Wait { opened: true } => self.wait_for_text_parts(chat_id),
-            TextStep::Wait { opened: false } => {}
-            TextStep::Complete(pending) => self.dispatch_pending_text(chat_id, pending),
+        self.persist();
+        if opened {
+            self.wait_for_batch(chat_id);
         }
     }
 
-    /// Sends the text of `chat_id` on once no part arrived for
-    /// `TEXT_CONTINUATION_WINDOW`, unless another message sent it before.
-    fn wait_for_text_parts(self: &Arc<Self>, chat_id: i64) {
+    /// Sends the batch of `chat_id` on once its time came, unless another
+    /// message sent it before. A worker that stops keeps it on disk, as an
+    /// interrupted request.
+    fn wait_for_batch(self: &Arc<Self>, chat_id: i64) {
         let worker = Arc::clone(self);
-        let spawned = std::thread::Builder::new().name("notia-telegram-text".into()).spawn(move || loop {
-            std::thread::sleep(PART_POLL_INTERVAL);
+        let spawned = std::thread::Builder::new().name("notia-telegram-batch".into()).spawn(move || loop {
+            std::thread::sleep(BATCH_POLL_INTERVAL);
+            if worker.stopped() {
+                return;
+            }
             let complete = {
-                let Ok(mut texts) = worker.texts.lock() else {
+                let Ok(mut batches) = worker.batches.lock() else {
                     return;
                 };
-                match texts.get(&chat_id) {
-                    Some(pending) if pending.last_part.elapsed() >= TEXT_CONTINUATION_WINDOW => texts.remove(&chat_id),
+                match batches.get(&chat_id) {
+                    Some(batch) if batch.ready_at <= Instant::now() => batches.remove(&chat_id),
                     Some(_) => continue,
                     None => return,
                 }
             };
-            if let Some(pending) = complete {
-                worker.dispatch_pending_text(chat_id, pending);
+            if let Some(batch) = complete {
+                worker.dispatch_batch(chat_id, batch);
             }
             return;
         });
         if spawned.is_err() {
-            self.flush_text(chat_id);
+            self.flush_batch(chat_id);
         }
     }
 
-    /// Sends on at once the text of `chat_id` still waiting for its next part.
-    fn flush_text(self: &Arc<Self>, chat_id: i64) {
-        let pending = self.texts.lock().ok().and_then(|mut texts| texts.remove(&chat_id));
-        if let Some(pending) = pending {
-            self.dispatch_pending_text(chat_id, pending);
+    /// Sends on at once the batch of `chat_id`.
+    fn flush_batch(self: &Arc<Self>, chat_id: i64) {
+        let batch = self.batches.lock().ok().and_then(|mut batches| batches.remove(&chat_id));
+        if let Some(batch) = batch {
+            self.dispatch_batch(chat_id, batch);
         }
     }
 
-    fn dispatch_pending_text(self: &Arc<Self>, chat_id: i64, pending: PendingText) {
-        let text = pending.text();
-        self.dispatch_text(chat_id, pending.telegram_user_id, pending.library_user_id, text);
+    /// Drops the batch of `chat_id`; whether there was one.
+    fn drop_batch(&self, chat_id: i64) -> bool {
+        let dropped = self.batches.lock().ok().and_then(|mut batches| batches.remove(&chat_id)).is_some();
+        if dropped {
+            self.persist();
+        }
+        dropped
+    }
+
+    fn dispatch_batch(self: &Arc<Self>, chat_id: i64, batch: PendingBatch) {
+        let text = batch.text();
+        if batch.attachments.is_empty() {
+            self.dispatch_text(chat_id, batch.telegram_user_id, batch.library_user_id, text);
+        } else {
+            self.enqueue(chat_id, batch.telegram_user_id, batch.library_user_id, text, batch.attachments, true);
+        }
+        self.persist();
     }
 
     /// Sends on a whole typed or dictated text: the recovery command, the
@@ -873,8 +970,10 @@ impl Worker {
     }
 
     /// Adds a part of an album; the first part waits until no other part
-    /// arrived for `ALBUM_WINDOW` and queues the whole album as one request,
-    /// with the caption any of its parts carried.
+    /// arrived for `ALBUM_WINDOW` and sends the whole album on as one
+    /// message, with the caption any of its parts carried: into the chat's
+    /// batch when `batched`, else queued at once.
+    #[allow(clippy::too_many_arguments)]
     fn collect_album_part(
         self: &Arc<Self>,
         chat_id: i64,
@@ -883,6 +982,7 @@ impl Worker {
         library_user_id: String,
         text: String,
         attachment: JobAttachment,
+        batched: bool,
     ) {
         let key = (chat_id, group);
         let first = {
@@ -903,7 +1003,7 @@ impl Worker {
                 None => {
                     albums.insert(
                         key.clone(),
-                        PendingAlbum { telegram_user_id, library_user_id, text, attachments: vec![attachment], last_part: Instant::now() },
+                        PendingAlbum { telegram_user_id, library_user_id, text, attachments: vec![attachment], last_part: Instant::now(), batched },
                     );
                     true
                 }
@@ -926,7 +1026,11 @@ impl Worker {
                 }
             };
             if let Some(album) = complete {
-                worker.enqueue(chat_id, album.telegram_user_id, album.library_user_id, album.text, album.attachments, true);
+                if album.batched {
+                    worker.collect_batch_part(chat_id, album.telegram_user_id, album.library_user_id, album.text, album.attachments);
+                } else {
+                    worker.enqueue(chat_id, album.telegram_user_id, album.library_user_id, album.text, album.attachments, true);
+                }
             }
             return;
         });
@@ -989,15 +1093,17 @@ impl Worker {
             text: trigger,
             autonomous: Some(kind),
             action: None,
+            webhook: None,
         });
         drop(queue);
         self.queue_ready.notify_all();
         AutonomousEnqueue::Queued
     }
 
-    /// Queues the run of an AI action in the Owner's chat, after what is
-    /// already waiting; the Owner must have linked Telegram.
-    fn enqueue_action(&self, action: ActionJob) -> ActionEnqueue {
+    /// Queues the run of an AI action or a webhook call in the Owner's
+    /// chat, after what is already waiting; the Owner must have linked
+    /// Telegram.
+    fn enqueue_owner_run(&self, text: String, action: Option<ActionJob>, webhook: Option<WebhookJob>) -> ActionEnqueue {
         let Ok(Some((telegram_user_id, chat_id))) = crate::library_users::owner_telegram_link(&self.app, &self.database_context()) else {
             return ActionEnqueue::Unavailable;
         };
@@ -1013,9 +1119,10 @@ impl Worker {
                 attachments: Vec::new(),
                 attachment: None,
             },
-            text: action.request.clone(),
+            text,
             autonomous: None,
-            action: Some(action),
+            action,
+            webhook,
         });
         drop(queue);
         self.queue_ready.notify_all();
@@ -1178,7 +1285,7 @@ impl Worker {
         let (recoverable, resend): (Vec<_>, Vec<_>) = recovered.into_iter().partition(|job| !job.attachments.is_empty());
         let count = recoverable.len();
         if let Ok(mut queue) = self.queue.lock() {
-            queue.extend(recoverable.into_iter().map(|stored| Job { stored, text: String::new(), autonomous: None, action: None }));
+            queue.extend(recoverable.into_iter().map(|stored| Job { stored, text: String::new(), autonomous: None, action: None, webhook: None }));
         }
         self.persist();
         self.queue_ready.notify_all();
@@ -1229,6 +1336,7 @@ impl Worker {
                 text,
                 autonomous: None,
                 action: None,
+                webhook: None,
             });
             ahead
         };
@@ -1397,6 +1505,13 @@ impl Worker {
             // Runs Notia started by itself are never stored nor resumed.
             if let Some(action) = job.action.clone() {
                 self.run_action(&job, &action);
+                if let Ok(mut current) = self.current.lock() {
+                    *current = None;
+                }
+                continue;
+            }
+            if let Some(webhook) = job.webhook.clone() {
+                self.run_webhook(&job, &webhook);
                 if let Ok(mut current) = self.current.lock() {
                     *current = None;
                 }
@@ -1612,6 +1727,9 @@ impl Worker {
             self.remember_with_files(chat_id, text, files, reply.clone());
             return Err(reply);
         }
+        // A failure says whether anything was done before it, so the person
+        // knows if repeating the request is safe.
+        let outcome = outcome.map_err(|error| format!("{error}\n\n{}", failure_progress(&runtime, &run.context)));
         // A failed request stays in the chat's history too, so «seguí» or
         // «¿qué pasó?» has its context.
         if let Err(error) = &outcome {
@@ -1750,6 +1868,41 @@ impl Worker {
     /// The summary of the run, or the error the dashboard shows.
     fn drive_action(&self, job: &Job, action: &ActionJob) -> Result<String, String> {
         use crate::backend::ai_actions::prompts;
+        let run = self.drive_unattended(job)?;
+        if prompts::is_silent(action.prompt.kind, &run.answer) {
+            self.delete_messages(job.stored.chat_id, &run.notes);
+            return Ok(prompts::SILENT_SUMMARY.to_string());
+        }
+        let message = prompts::outgoing_message(&run.answer, action.prompt.test);
+        let thought = prompts::sent_thought(&action.prompt.name, &run.answer);
+        self.deliver_unattended(job, run, &message, &thought).map(|answer| prompts::output_summary(&answer))
+    }
+
+    /// Runs a webhook call as a turn of the Owner's chat and tells
+    /// `webhooks` how it went, as `run_action` does for an AI action.
+    fn run_webhook(&self, job: &Job, webhook: &WebhookJob) {
+        crate::webhooks::mark_running(&self.app, &webhook.call_id);
+        let outcome = self.drive_webhook(job, webhook);
+        crate::webhooks::finish_call(&self.app, &webhook.call_id, outcome);
+    }
+
+    /// The summary of the run, or the error the history of calls shows.
+    fn drive_webhook(&self, job: &Job, webhook: &WebhookJob) -> Result<String, String> {
+        use crate::backend::webhooks;
+        let run = self.drive_unattended(job)?;
+        if crate::backend::agent_autonomy::is_silent(&run.answer) {
+            self.delete_messages(job.stored.chat_id, &run.notes);
+            return Ok(webhooks::SILENT_SUMMARY.to_string());
+        }
+        let message = run.answer.trim().to_string();
+        let thought = webhooks::sent_thought(&webhook.prompt.action, &message);
+        self.deliver_unattended(job, run, &message, &thought).map(|answer| webhooks::output_summary(&answer))
+    }
+
+    /// Runs a turn Notia started for the Owner (an AI action, a webhook
+    /// call) until the agent answers. Confirmations and questions reach the
+    /// Owner as in any request.
+    fn drive_unattended(&self, job: &Job) -> Result<UnattendedAnswer, String> {
         let chat_id = job.stored.chat_id;
         let runtime = self.app.state::<crate::backend_runtime::BackendRuntimeState>().inner().clone();
         runtime.configure_from_library_config(&self.library_config()).map_err(|error| error.message)?;
@@ -1789,22 +1942,25 @@ impl Worker {
         if response.changed {
             let _ = self.app.emit(LIBRARY_CHANGED_EVENT, &self.library.id);
         }
-        let answer = response.response.markdown;
-        if prompts::is_silent(action.prompt.kind, &answer) {
-            self.delete_messages(chat_id, &notes);
-            return Ok(prompts::SILENT_SUMMARY.to_string());
-        }
-        let mut drawn = shown;
-        drawn.extend(self.send_generated_images(chat_id, &run.context.request_id));
-        if !self.send_markdown_checked(chat_id, &prompts::outgoing_message(&answer, action.prompt.test)) {
+        Ok(UnattendedAnswer { answer: response.response.markdown, request_id: run.context.request_id, notes, shown })
+    }
+
+    /// Sends `message` (the answer as the Owner reads it) and keeps the
+    /// turn in the chat's history and `thought` in the agent's thoughts;
+    /// the answer as the agent wrote it.
+    fn deliver_unattended(&self, job: &Job, run: UnattendedAnswer, message: &str, thought: &str) -> Result<String, String> {
+        let chat_id = job.stored.chat_id;
+        let mut drawn = run.shown;
+        drawn.extend(self.send_generated_images(chat_id, &run.request_id));
+        if !self.send_markdown_checked(chat_id, message) {
             return Err("No se pudo enviar por Telegram.".to_string());
         }
-        self.delete_messages(chat_id, &notes);
-        self.remember_turn(chat_id, job.text.clone(), Vec::new(), answer.clone(), drawn);
-        if let Err(error) = crate::agent_knowledge::keep_thought(&self.app, &self.library.id, &prompts::sent_thought(&action.prompt.name, &answer)) {
-            log::error!("[notia:ai-actions] no se pudo anotar el mensaje enviado: {:?}", error.code);
+        self.delete_messages(chat_id, &run.notes);
+        self.remember_turn(chat_id, job.text.clone(), Vec::new(), run.answer.clone(), drawn);
+        if let Err(error) = crate::agent_knowledge::keep_thought(&self.app, &self.library.id, thought) {
+            log::error!("[notia:telegram] no se pudo anotar el mensaje enviado: {:?}", error.code);
         }
-        Ok(prompts::output_summary(&answer))
+        Ok(run.answer)
     }
 
     /// Keeps a message Notia sent by itself in the chat's history and in
@@ -1864,6 +2020,7 @@ impl Worker {
             library_search: true,
             autonomous: job.autonomous.is_some(),
             scheduled_action: job.action.as_ref().map(|action| action.prompt.clone()),
+            webhook_call: job.webhook.as_ref().map(|webhook| webhook.prompt.clone()),
             tool_areas: None,
             thinking: None,
             conversational: false,
@@ -2443,6 +2600,21 @@ fn cancel_envelope(
     }
 }
 
+/// What a failed request did before failing: nothing (it can be sent
+/// again) or some actions (check them before repeating it).
+fn failure_progress(runtime: &crate::backend_runtime::BackendRuntimeState, context: &BackendRequestContext) -> &'static str {
+    let ran = runtime
+        .request_events(context, 0)
+        .unwrap_or_default()
+        .iter()
+        .any(|envelope| matches!(envelope.event, crate::backend::BackendEvent::ToolCompleted { .. }));
+    if ran {
+        "Algunas acciones se hicieron antes del error: preguntame «¿qué hiciste?» antes de repetir el pedido."
+    } else {
+        "No llegué a hacer ninguna acción: podés repetir el pedido."
+    }
+}
+
 fn strip_html(value: &str) -> String {
     let mut text = String::with_capacity(value.len());
     let mut in_tag = false;
@@ -2514,21 +2686,31 @@ mod tests {
     }
 
     #[test]
-    fn a_long_text_split_by_telegram_becomes_one_message() {
-        let mut texts = HashMap::new();
-        let part = |label: &str| format!("{label} {}", "x".repeat(4_000));
-        assert!(matches!(add_text_part(&mut texts, 1, 2, OWNER.into(), part("uno")), TextStep::Wait { opened: true }));
-        assert!(matches!(add_text_part(&mut texts, 1, 2, OWNER.into(), part("dos")), TextStep::Wait { opened: false }));
-        // Another chat is not held by it.
-        assert!(matches!(
-            add_text_part(&mut texts, 7, 8, OWNER.into(), "hola".into()),
-            TextStep::Complete(pending) if pending.text() == "hola"
-        ));
-        let TextStep::Complete(pending) = add_text_part(&mut texts, 1, 2, OWNER.into(), "contrastalo con el tablero".into()) else {
-            panic!("the short last part completes the text");
+    fn messages_written_line_by_line_become_one_request_after_the_last_wait() {
+        let mut batches = HashMap::new();
+        let wait = Duration::from_secs(150);
+        let photo = || {
+            JobAttachment::Document(TelegramDocument { file_id: "f".into(), file_name: Some("ticket.pdf".into()), mime_type: None, file_size: None })
         };
-        assert_eq!(pending.text(), format!("{}\n{}\ncontrastalo con el tablero", part("uno"), part("dos")));
-        assert!(texts.is_empty());
+        assert!(add_to_batch(&mut batches, 1, 2, OWNER.into(), "hola".into(), Vec::new(), wait));
+        let first_ready = batches[&1].ready_at;
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!add_to_batch(&mut batches, 1, 2, OWNER.into(), "fijate el ticket".into(), vec![photo()], wait));
+        assert!(!add_to_batch(&mut batches, 1, 2, OWNER.into(), "  ".into(), Vec::new(), Duration::from_secs(120)));
+        // Each message starts the wait again, from itself.
+        assert!(batches[&1].ready_at > first_ready - Duration::from_secs(30));
+        assert!(batches[&1].ready_at <= Instant::now() + Duration::from_secs(120));
+        // Another chat waits on its own.
+        assert!(add_to_batch(&mut batches, 7, 8, OWNER.into(), "otro".into(), Vec::new(), wait));
+        let batch = &batches[&1];
+        assert_eq!(batch.text(), "hola\nfijate el ticket");
+        assert_eq!(batch.attachments.len(), 1);
+        let stored = batch.stored(1);
+        assert_eq!((stored.chat_id, stored.request_id.as_str(), stored.attachments.len()), (1, batch.request_id.as_str(), 1));
+        for _ in 0..MAX_ALBUM_PARTS + 2 {
+            add_to_batch(&mut batches, 1, 2, OWNER.into(), String::new(), vec![photo()], wait);
+        }
+        assert_eq!(batches[&1].attachments.len(), MAX_ALBUM_PARTS);
     }
 
     #[test]

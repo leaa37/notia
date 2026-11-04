@@ -1012,6 +1012,10 @@ fn compose_request_system_prompt(
         system.push_str("\n\n");
         system.push_str(&notia_backend_core::ai_actions::prompts::action_guidance(action));
     }
+    if let Some(call) = &request.webhook_call {
+        system.push_str("\n\n");
+        system.push_str(&notia_backend_core::webhooks::webhook_guidance(call));
+    }
     if let Some(turn) = &request.ai_task {
         system.push_str("\n\n");
         system.push_str(&notia_backend_core::ai_tasks::prompts::phase_guidance(turn.phase));
@@ -1208,6 +1212,14 @@ impl TauriBackendToolExecutor {
             "browser_wait",
             "browser_close",
             "browser_drag",
+            "whatsapp_list_chats",
+            "whatsapp_read_messages",
+            "whatsapp_send_message",
+            "whatsapp_send_file",
+            "whatsapp_get_image",
+            "list_agent_scripts",
+            "run_agent_script",
+            "save_agent_script",
             "read_library_documents",
             "search_library_documents",
             "search_library_context",
@@ -2112,8 +2124,67 @@ impl TauriBackendToolExecutor {
             "save_finance_savings_movement" => ("movement", "El movimiento de ahorro no es válido"),
             _ => return Err(BackendError::invalid_input("La herramienta financiera no guarda un registro.")),
         };
-        let payload = json!({ "context": self.finance_context(context)?, key: Self::finance_record(&call.arguments) });
-        serde_json::from_value::<T>(payload).map_err(|error| BackendError::invalid_input(format!("{invalid}: {error}.")))
+        let finance_context = self.finance_context(context)?;
+        let mut record = Self::finance_record(&call.arguments);
+        if call.name == "save_finance_transaction" {
+            record = self.with_stored_transaction(&finance_context, record);
+        }
+        let payload = json!({ "context": finance_context, key: record });
+        serde_json::from_value::<T>(payload.clone()).map_err(|error| {
+            let missing = Self::missing_fields::<T>(&payload, key);
+            if missing.is_empty() {
+                BackendError::invalid_input(format!("{invalid}: {error}."))
+            } else {
+                BackendError::invalid_input(format!("{invalid}: faltan los campos {}.", missing.join(", ")))
+            }
+        })
+    }
+
+    /// A movement edit over the movement already saved with that id: the
+    /// fields sent replace the stored ones, so changing only the description
+    /// does not need the whole record.
+    fn with_stored_transaction(&self, finance_context: &crate::finance::FinanceContext, record: Value) -> Value {
+        let Some(id) = record.get("id").and_then(Value::as_str).map(str::to_string) else {
+            return record;
+        };
+        let stored = crate::finance::finance_get_transaction(
+            self.app.clone(),
+            crate::finance::GetFinanceRecordPayload { context: finance_context.clone(), id },
+        );
+        let (Ok(stored), Some(changes)) = (stored, record.as_object()) else {
+            return record;
+        };
+        let mut merged = serde_json::to_value(stored).unwrap_or_default();
+        if let Some(object) = merged.as_object_mut() {
+            for (field, value) in changes.iter().filter(|(_, value)| !value.is_null()) {
+                object.insert(field.clone(), value.clone());
+            }
+        }
+        merged
+    }
+
+    /// Every field a record lacks: serde names one per try, so each is filled
+    /// with a placeholder and the record is tried again.
+    fn missing_fields<T: serde::de::DeserializeOwned>(payload: &Value, key: &str) -> Vec<String> {
+        const MAX_TRIES: usize = 40;
+        let mut candidate = payload.clone();
+        let mut missing = Vec::new();
+        for _ in 0..MAX_TRIES {
+            let Err(error) = serde_json::from_value::<T>(candidate.clone()) else { break };
+            let message = error.to_string();
+            let Some(field) = message.strip_prefix("missing field `").and_then(|rest| rest.split('`').next()).map(str::to_string) else {
+                break;
+            };
+            if missing.contains(&field) {
+                break;
+            }
+            match candidate.get_mut(key).and_then(Value::as_object_mut) {
+                Some(record) => record.insert(field.clone(), Value::String(String::new())),
+                None => break,
+            };
+            missing.push(field);
+        }
+        missing
     }
 
     /// Checks the record of a `save_finance_*` call without saving it, so an
@@ -2210,6 +2281,53 @@ impl TauriBackendToolExecutor {
 
     /// Accounts and categories of the current month used to resolve agent
     /// references by name before any finance write.
+    /// `get_finance_record` of an entity other than a movement: found by its
+    /// id in the entity's list; a purchase also brings its lines.
+    fn finance_record_by_id(&self, context: &BackendRequestContext, entity: &str, id: &str) -> Result<Value, BackendError> {
+        let finance_context = self.finance_context(context)?;
+        let all_periods = || crate::finance_records::ListPeriodPayload {
+            context: finance_context.clone(),
+            from: None,
+            to: None,
+            merchant_id: None,
+            product_id: None,
+        };
+        let app = || self.app.clone();
+        let records = match entity {
+            "purchases" => serde_json::to_value(crate::finance_records::finance_list_purchases(app(), all_periods()).map_err(Self::finance_error)?),
+            "salaries" => serde_json::to_value(crate::finance_records::finance_list_salaries(app(), all_periods()).map_err(Self::finance_error)?),
+            "credit_card_statements" => serde_json::to_value(
+                crate::finance_records::finance_list_credit_card_statements(app(), all_periods()).map_err(Self::finance_error)?,
+            ),
+            "installment_plans" => serde_json::to_value(
+                crate::finance_records::finance_list_installment_plans(app(), finance_context.clone()).map_err(Self::finance_error)?,
+            ),
+            "services" => serde_json::to_value(crate::finance::finance_list_services(app(), finance_context.clone()).map_err(Self::finance_error)?),
+            "service_occurrences" => serde_json::to_value(
+                crate::finance::finance_list_all_service_occurrences(app(), finance_context.clone()).map_err(Self::finance_error)?,
+            ),
+            "service_invoices" => serde_json::to_value(
+                crate::finance::finance_list_service_invoices(app(), finance_context.clone(), None).map_err(Self::finance_error)?,
+            ),
+            "accounts" => serde_json::to_value(crate::finance::finance_list_accounts(app(), finance_context.clone()).map_err(Self::finance_error)?),
+            "categories" => serde_json::to_value(self.finance_dashboard(&finance_context)?.categories),
+            "artifacts" => serde_json::to_value(
+                crate::services::finance_extraction::list_finance_artifacts(app(), finance_context.clone()).map_err(Self::finance_error)?,
+            ),
+            _ => return Err(BackendError::invalid_input(format!("get_finance_record no lee registros de tipo {entity}."))),
+        }
+        .map_err(|_| invalid_result())?;
+        let mut record = records
+            .as_array()
+            .and_then(|records| records.iter().find(|record| record.get("id").and_then(Value::as_str) == Some(id)))
+            .cloned()
+            .ok_or_else(|| BackendError::new(BackendErrorCode::NotFound, format!("No hay un registro de {entity} con id {id}."), false))?;
+        if entity == "purchases" {
+            record["items"] = Value::Array(crate::finance_records::purchase_items(&self.app, &finance_context, id).map_err(Self::finance_error)?);
+        }
+        Ok(json!({ "ok": true, "entity": entity, "record": record }))
+    }
+
     fn finance_dashboard(
         &self,
         finance_context: &crate::finance::FinanceContext,
@@ -2307,6 +2425,20 @@ impl TauriBackendToolExecutor {
                         serde_json::to_value(service),
                     ),
                 }
+            }
+            "create_finance_transaction" if call.arguments.get("splits").is_some_and(|splits| !splits.is_null()) => {
+                let parts = Self::split_calls(call).map_err(rejected)?.unwrap_or_default();
+                let mut drafts = Vec::new();
+                for part in &parts {
+                    drafts.push(self.transaction_draft(context, part, &finance_context, &dashboard)?.map_err(rejected)?.transaction);
+                }
+                let lines = drafts
+                    .iter()
+                    .map(|transaction| format!("{} {} · {}", transaction.amount, transaction.currency, transaction.description))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let account = drafts.first().map(|transaction| account_name(&transaction.account_id)).unwrap_or_default();
+                (format!("Registrar {} movimientos, uno por categoría, en {account}: {lines}.", drafts.len()), serde_json::to_value(&drafts))
             }
             "create_finance_transaction" => {
                 let draft = self.transaction_draft(context, call, &finance_context, &dashboard)?.map_err(rejected)?;
@@ -2488,7 +2620,31 @@ impl TauriBackendToolExecutor {
 
     /// Records a transaction requested by the agent, once per evidence
     /// reference, and marks the paid service month.
+    /// The calls of a movement split into categories, one per part, each
+    /// with its own id so each part gets its own source reference.
+    fn split_calls(call: &ToolCall) -> Result<Option<Vec<ToolCall>>, finance_agent_inputs::AgentInputError> {
+        Ok(finance_agent_inputs::split_parts(&call.arguments)?.map(|parts| {
+            parts
+                .into_iter()
+                .enumerate()
+                .map(|(index, arguments)| ToolCall { id: format!("{}-{}", call.id, index + 1), arguments, ..call.clone() })
+                .collect()
+        }))
+    }
+
     fn create_finance_transaction(&self, context: &BackendRequestContext, call: &ToolCall) -> Result<Value, BackendError> {
+        match Self::split_calls(call) {
+            Err(error) => return Ok(error.to_value()),
+            Ok(Some(parts)) => {
+                let saved = parts.iter().map(|part| self.create_finance_transaction(context, part)).collect::<Result<Vec<_>, _>>()?;
+                return Ok(json!({
+                    "ok": saved.iter().all(|part| part["ok"] == true),
+                    "changed": saved.iter().any(|part| part["changed"] == true),
+                    "parts": saved,
+                }));
+            }
+            Ok(None) => {}
+        }
         let finance_context = self.finance_context(context)?;
         let dashboard = self.finance_dashboard(&finance_context)?;
         let draft = match self.transaction_draft(context, call, &finance_context, &dashboard)? {
@@ -2723,12 +2879,8 @@ impl TauriBackendToolExecutor {
             }
             "replace_library_document" => {
                 let document = current?;
-                Ok(Some((
-                    locator,
-                    document.content,
-                    Self::text(&call.arguments, "content"),
-                    document.revision,
-                )))
+                let (next, _) = notia_backend_core::library_tools::replacement_content(&document.content, &Self::text(&call.arguments, "content"));
+                Ok(Some((locator, document.content, next, document.revision)))
             }
             "delete_library_document" => {
                 let document = current?;
@@ -2930,6 +3082,73 @@ impl ToolExecutor for TauriBackendToolExecutor {
                 hunks: vec![PreviewHunk {
                     id: call.id.clone(),
                     document_path: "browser".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    old_text: String::new(),
+                    new_text: detail,
+                }],
+                allowed_actions: vec![
+                    MutationPreviewAction::ApplyAll,
+                    MutationPreviewAction::Reject,
+                    MutationPreviewAction::Cancel,
+                ],
+            }));
+        }
+        if call.name == notia_backend_core::agent_scripts::SAVE_TOOL {
+            // Where the script goes and its whole code.
+            let (summary, detail) = crate::agent_scripts::preview(&self.app, context, &call.arguments)?;
+            return Ok(Some(MutationPreview {
+                operation_id: call.id.clone(),
+                summary,
+                documents: Vec::new(),
+                hunks: vec![PreviewHunk {
+                    id: call.id.clone(),
+                    document_path: notia_backend_core::agent_scripts::SCRIPTS_DIRECTORY.to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    old_text: String::new(),
+                    new_text: detail,
+                }],
+                allowed_actions: vec![
+                    MutationPreviewAction::ApplyAll,
+                    MutationPreviewAction::Reject,
+                    MutationPreviewAction::Cancel,
+                ],
+            }));
+        }
+        if notia_backend_core::meeting_tools::is_meeting_write_tool(&call.name) {
+            // Each correction with how many times it changes the transcript;
+            // without this the chat got a confirmation with nothing to show.
+            let detail = crate::meeting::preview_agent_tool(&self.app, &call.name, &call.arguments)?;
+            return Ok(Some(MutationPreview {
+                operation_id: call.id.clone(),
+                summary: detail.lines().next().unwrap_or("Cambiar la reunión").to_string(),
+                documents: Vec::new(),
+                hunks: vec![PreviewHunk {
+                    id: call.id.clone(),
+                    document_path: format!("meeting:{}", context.library_id),
+                    start_line: 1,
+                    end_line: 1,
+                    old_text: String::new(),
+                    new_text: detail,
+                }],
+                allowed_actions: vec![
+                    MutationPreviewAction::ApplyAll,
+                    MutationPreviewAction::Reject,
+                    MutationPreviewAction::Cancel,
+                ],
+            }));
+        }
+        if notia_backend_core::whatsapp::is_whatsapp_send_tool(&call.name) {
+            // The chat and exactly what reaches it.
+            let (summary, detail) = crate::whatsapp::preview(&self.app, context, &call.name, &call.arguments)?;
+            return Ok(Some(MutationPreview {
+                operation_id: call.id.clone(),
+                summary,
+                documents: Vec::new(),
+                hunks: vec![PreviewHunk {
+                    id: call.id.clone(),
+                    document_path: "whatsapp".to_string(),
                     start_line: 1,
                     end_line: 1,
                     old_text: String::new(),
@@ -3796,13 +4015,10 @@ impl ToolExecutor for TauriBackendToolExecutor {
                 let text = Self::first_text(&call.arguments, "improvement", "content");
                 json!({ "changed": crate::agent_workspace::append_improvement(&self.app, &context.library_id, kind, &text)? })
             }
+            "get_finance_record" if !matches!(Self::text(&call.arguments, "entity").as_str(), "" | "movements") => {
+                self.finance_record_by_id(context, &Self::text(&call.arguments, "entity"), &Self::finance_id(&call.arguments, "id")?)?
+            }
             "get_finance_record" => {
-                let entity = Self::text(&call.arguments, "entity");
-                if !entity.is_empty() && entity != "movements" {
-                    return Err(BackendError::invalid_input(
-                        "El runtime Tauri solo admite registros financieros de tipo movements.",
-                    ));
-                }
                 let result = crate::finance::finance_get_transaction(
                     self.app.clone(),
                     crate::finance::GetFinanceRecordPayload {
@@ -4475,17 +4691,27 @@ impl ToolExecutor for TauriBackendToolExecutor {
             "read_active_markdown_document" => {
                 // The active document comes from the request snapshot; an
                 // explicit path is only accepted when it is that document.
-                let active_path = self
+                let active = self
                     .snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.active_document.as_ref())
-                    .map(|document| document.path.clone())
                     .ok_or_else(|| {
                         BackendError::invalid_input("No hay un documento activo en esta vista.")
                     })?;
-                if Self::explicit_path(&call.arguments)
-                    .is_some_and(|requested| requested != active_path)
-                {
+                // The tab may name it with backslashes or its whole folder.
+                let root = self.library_location(context).ok().map(|(root, _)| root).filter(|root| !root.is_empty());
+                let active_path = notia_backend_core::library_tools::workspace_logical_path(&active.path, root.as_deref())
+                    .ok_or_else(|| {
+                        BackendError::invalid_input(format!(
+                            "El documento activo «{}» no está en la biblioteca con una ruta que Notia pueda leer: buscalo por su nombre con las herramientas de la biblioteca y leelo con read_library_documents.",
+                            active.name
+                        ))
+                    })?
+                    .as_str()
+                    .to_string();
+                let requested = Self::explicit_path(&call.arguments)
+                    .map(|requested| notia_backend_core::library_tools::workspace_logical_path(&requested, root.as_deref()).map_or(requested, |path| path.as_str().to_string()));
+                if requested.is_some_and(|requested| requested != active_path) {
                     return Err(BackendError::new(
                         BackendErrorCode::Forbidden,
                         "Solo se puede leer el documento activo con esta herramienta.",
@@ -4519,8 +4745,11 @@ impl ToolExecutor for TauriBackendToolExecutor {
             "replace_library_document" => {
                 let locator = self.existing_document_locator(context, &call.arguments)?;
                 Self::ensure_agent_writable(&locator)?;
-                let content = self.with_message_images(Self::text(&call.arguments, "content"))?;
+                let previous = self.reader(&context.library_id)?.read_document(&locator)?.content;
+                let (content, frontmatter) =
+                    notia_backend_core::library_tools::replacement_content(&previous, &self.with_message_images(Self::text(&call.arguments, "content"))?);
                 let content = crate::folder_contexts::enforce(&self.app, &context.library_id, locator.logical_path.as_str(), content);
+                let sizes = (previous.chars().count(), content.chars().count());
                 // Tools report backend-core revisions (numbers); the editor
                 // may still send the platform `sha256:` form.
                 let expected = call.arguments.get("expectedRevision");
@@ -4543,7 +4772,19 @@ impl ToolExecutor for TauriBackendToolExecutor {
                     Some(revision) => adapter.write_locator_at_revision(&locator, &content, revision)?,
                     None => adapter.write_locator(&locator, &content, platform_revision)?,
                 }
-                json!({ "path": locator.logical_path.as_str(), "updated": true })
+                let kept = match frontmatter {
+                    "kept" => "Se conservó el encabezado (frontmatter) que tenía el documento y se reemplazó el cuerpo.",
+                    "replaced" => "El encabezado (frontmatter) del documento es el del contenido nuevo.",
+                    _ => "El documento no tenía encabezado (frontmatter).",
+                };
+                json!({
+                    "path": locator.logical_path.as_str(),
+                    "updated": true,
+                    "frontmatter": frontmatter,
+                    "charactersBefore": sizes.0,
+                    "charactersAfter": sizes.1,
+                    "note": format!("{kept} El contenido quedó tal cual lo mandaste, sin otra conversión de formato. Para cambiar solo una parte usá preview_markdown_edit y apply_markdown_edit."),
+                })
             }
             "delete_library_document" => {
                 let locator = self.existing_document_locator(context, &call.arguments)?;
@@ -4623,6 +4864,8 @@ impl ToolExecutor for TauriBackendToolExecutor {
             }
             name if notia_backend_core::image_generation::is_image_tool(name) => self.image_tool(context, call)?,
             name if notia_backend_core::browser::is_browser_tool(name) => crate::browser::execute_tool(&self.app, &self.control, context, name, &call.arguments)?,
+            name if notia_backend_core::whatsapp::is_whatsapp_tool(name) => crate::whatsapp::execute_tool(&self.app, context, name, &call.arguments)?,
+            name if notia_backend_core::agent_scripts::is_script_tool(name) => crate::agent_scripts::execute_tool(&self.app, &self.control, context, name, &call.arguments)?,
             name if notia_backend_core::terminal::is_terminal_tool(name) => crate::terminal::execute_tool(
                 &self.app,
                 &self.control,
@@ -4871,10 +5114,14 @@ pub(crate) fn execute_backend_request(
     // account, and the image tools when this device has the image model.
     let mail_connected = crate::mail_tools::has_connected_account(app, &request.context.library_id);
     let images_available = crate::image_generation::is_available(app);
-    // The terminal and the browser only on the host PC (never Android nor
-    // a client device).
+    // The terminal and the browser only on a computer (never Android).
     let terminal_available = crate::terminal::is_available(app);
     let browser_available = crate::browser::is_available(app);
+    // An AI task runs and reports by Telegram on the computer that runs the
+    // library's services: elsewhere it is only read.
+    let runs_services = crate::device_role::runs_services(app);
+    // WhatsApp while the library's link is connected on this host.
+    let whatsapp_connected = crate::whatsapp::is_connected(app, &request.context.library_id);
     let available_tool_names = TauriBackendToolExecutor::supported_tool_names()
         .iter()
         .copied()
@@ -4882,6 +5129,9 @@ pub(crate) fn execute_backend_request(
         .filter(|name| images_available || !notia_backend_core::image_generation::is_image_tool(name))
         .filter(|name| terminal_available || !notia_backend_core::terminal::is_terminal_tool(name))
         .filter(|name| browser_available || !notia_backend_core::browser::is_browser_tool(name))
+        .filter(|name| whatsapp_connected || !notia_backend_core::whatsapp::is_whatsapp_tool(name))
+        .filter(|name| crate::agent_scripts::is_available(app) || !notia_backend_core::agent_scripts::is_script_tool(name))
+        .filter(|name| runs_services || !crate::ai_task_runner::is_ai_task_write_tool(name))
         .collect::<Vec<_>>();
     let requested_tool_names = if requested_tool_names.is_empty() {
         available_tool_names
@@ -4908,16 +5158,17 @@ pub(crate) fn execute_backend_request(
         request.tool_access,
         request.library_search,
     );
-    // An AI action runs for the Owner, in their Telegram chat, with their
-    // memory, rules and thoughts; nothing else may claim to be one.
-    if request.scheduled_action.is_some()
+    // An AI action or a webhook call runs for the Owner, in their Telegram
+    // chat, with their memory, rules and thoughts; nothing else may claim
+    // to be one.
+    if (request.scheduled_action.is_some() || request.webhook_call.is_some())
         && !(request.context.actor.is_library_owner()
             && request.context.persistence_policy.allows_memory()
             && request.context.channel == notia_backend_core::BackendChannel::Telegram)
     {
         return Err(BackendError::new(
             BackendErrorCode::Forbidden,
-            "Las acciones de IA solo corren para el Owner, por Telegram.",
+            "Las acciones de IA y los webhooks solo corren para el Owner, por Telegram.",
             false,
         ));
     }
@@ -4957,6 +5208,9 @@ pub(crate) fn execute_backend_request(
         request.thinking = routed.as_ref().and_then(|routed| routed.thinking);
         request.conversational = routed.as_ref().is_some_and(|routed| routed.conversational);
         request.tool_areas = routed.map(|routed| routed.areas);
+        // The support scripts reach the model in the description of the tool
+        // that runs them, like tools of their own.
+        crate::agent_scripts::describe_scripts(app, &request.context.library_id, &mut request.tools);
     }
     state.journal.store_request(&request)?;
     let provider_settings = provider_settings_for_library(app, state, &request.context.library_id)?;
@@ -5173,7 +5427,8 @@ fn route_turn_areas(app: &AppHandle, state: &BackendRuntimeState, request: &Agen
     // Only a message the person wrote on Telegram may get the conversational prompt.
     let offers_conversation = request.context.channel == notia_backend_core::BackendChannel::Telegram
         && !request.autonomous
-        && request.scheduled_action.is_none();
+        && request.scheduled_action.is_none()
+        && request.webhook_call.is_none();
     let system = if offers_conversation { with_prompt_choice(system) } else { system };
     let decision = provider_settings_for_library(app, state, &request.context.library_id)
         .and_then(|settings| complete_with(app, settings, request.context.clone(), &system, &user, last_images, ROUTING_TIMEOUT))
@@ -5717,6 +5972,7 @@ mod tests {
             library_search: true,
             autonomous: false,
             scheduled_action: None,
+            webhook_call: None,
             tool_areas: None,
             thinking: None,
             conversational: false,

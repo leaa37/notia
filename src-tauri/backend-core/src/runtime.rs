@@ -337,6 +337,10 @@ impl<'a> InteractionRuntime<'a> {
                 None => None,
             },
         };
+        // A confirmation always shows something: without a preview the
+        // clients got a waiting operation with nothing to ask and ended the
+        // turn with «no devolvió una respuesta final».
+        let preview = preview.or_else(|| Some(call_preview(&operation, call)));
         self.begin_waiting(
             context,
             idempotency_key,
@@ -651,6 +655,26 @@ impl<'a> InteractionRuntime<'a> {
 
 fn has_text(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.trim().is_empty())
+}
+
+/// The tool and its arguments, for a confirmation whose tool has no preview
+/// of its own.
+fn call_preview(operation: &OperationToken, call: &super::ToolCall) -> super::protocol::MutationPreview {
+    use super::protocol::{MutationPreview, MutationPreviewAction, PreviewHunk};
+    MutationPreview {
+        operation_id: operation.operation_id.clone(),
+        summary: format!("Ejecutar {}", call.name),
+        documents: Vec::new(),
+        hunks: vec![PreviewHunk {
+            id: operation.operation_id.clone(),
+            document_path: call.name.clone(),
+            start_line: 1,
+            end_line: 1,
+            old_text: String::new(),
+            new_text: serde_json::to_string_pretty(&call.arguments).unwrap_or_default(),
+        }],
+        allowed_actions: vec![MutationPreviewAction::ApplyAll, MutationPreviewAction::Reject, MutationPreviewAction::Cancel],
+    }
 }
 
 fn status_from_review(

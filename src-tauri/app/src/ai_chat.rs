@@ -636,7 +636,9 @@ fn run_agent(
             _ => break,
         }
     }
-    Err(internal("El runtime backend no devolvió una respuesta final."))
+    let error = internal("El runtime backend no devolvió una respuesta final.");
+    crate::backend_runtime::log_request_failure(runtime, "chat", &identity.context, &error);
+    Err(error)
 }
 
 /// Remembers the changes of a finished request so a later turn can undo
@@ -838,6 +840,7 @@ impl TurnSetup {
             library_search: self.library_search,
             autonomous: false,
             scheduled_action: None,
+            webhook_call: None,
             tool_areas: None,
             thinking: None,
             conversational: false,

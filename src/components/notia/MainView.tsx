@@ -25,7 +25,6 @@ interface MainViewProps {
   activeDocument: OpenFileDocument | null
   saveStatus: NotiaDocumentSaveStatus
   onTextDocumentChange: (nextSource: string, documentPath?: string) => void
-  onSharedTextDocumentChange?: (path: string, nextSource: string) => void
   markdownWikiLinkTargets: MarkdownWikiLinkTarget[]
   onOpenLinkedFile: (filePath: string) => void
   /** Creates a note next to the open one from a link property; resolves to an error message or `null`. */
@@ -110,7 +109,6 @@ function MainViewComponent({
   activeDocument,
   saveStatus,
   onTextDocumentChange,
-  onSharedTextDocumentChange,
   markdownWikiLinkTargets,
   onOpenLinkedFile,
   onCreateLinkedNote,
@@ -276,7 +274,6 @@ function MainViewComponent({
         <FileViewHost
           document={activeDocument}
           onTextSourceChange={onTextDocumentChange}
-          onSharedTextSourceChange={onSharedTextDocumentChange}
           wikiLinkTargets={markdownWikiLinkTargets}
           onOpenLinkedFile={onOpenLinkedFile}
           onCreateLinkedNote={onCreateLinkedNote}

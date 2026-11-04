@@ -33,12 +33,30 @@ pub(crate) struct AgentInputError {
     pub instruction: String,
 }
 
+/// What a field asks for, so the model knows what to fix or ask.
+const FIELD_HINTS: [(&str, &str); 7] = [
+    ("name", "el nombre (por ejemplo «Internet Fibertel»)"),
+    ("expectedAmount", "el importe esperado por período, un número positivo como 15000 o 15.000,50"),
+    ("amount", "el importe, un número positivo como 15000 o 15.000,50"),
+    ("currency", "la moneda: ARS o USD"),
+    ("categoryId", "el ID o el nombre exacto de una categoría existente (list_finance_categories)"),
+    ("accountId", "el ID o el nombre exacto de una cuenta (list_finance_accounts)"),
+    ("effectiveDate", "la fecha, AAAA-MM-DD"),
+];
+
 impl AgentInputError {
     fn fields(error: &'static str, invalid_fields: Vec<&str>) -> Self {
+        let described = invalid_fields
+            .iter()
+            .map(|field| match FIELD_HINTS.iter().find(|(name, _)| name == field) {
+                Some((_, hint)) => format!("{field} ({hint})"),
+                None => field.to_string(),
+            })
+            .collect::<Vec<_>>();
         let invalid_fields = invalid_fields.into_iter().map(str::to_string).collect::<Vec<_>>();
         let instruction = format!(
-            "Corrige solamente estos campos y reintenta: {}.",
-            invalid_fields.join(", ")
+            "Faltan o no son válidos estos campos: {}. Si la persona no te dio esos datos, preguntáselos antes de reintentar; no los inventes.",
+            described.join("; ")
         );
         Self {
             error,
@@ -144,6 +162,52 @@ fn canonical_decimal(whole: &str, fraction: &str) -> String {
         whole.to_string()
     } else {
         format!("{whole}.{fraction}")
+    }
+}
+
+const MAX_SPLITS: usize = 10;
+
+/// Los argumentos de cada movimiento de un alta dividida en categorías
+/// (`splits`: importe, categoría y descripción opcional de cada parte), o
+/// `None` si no se divide. Las partes suman exactamente `amount`; cada una
+/// conserva el resto de los datos del alta.
+pub(crate) fn split_parts(args: &Value) -> Result<Option<Vec<Value>>, AgentInputError> {
+    let Some(splits) = args.get("splits").filter(|splits| !splits.is_null()) else {
+        return Ok(None);
+    };
+    let splits = splits.as_array().filter(|splits| (2..=MAX_SPLITS).contains(&splits.len())).ok_or_else(|| {
+        AgentInputError::with_instruction("invalid-finance-splits", "splits", "Dividí en entre 2 y 10 partes, cada una con amount y categoryId.")
+    })?;
+    let total = args.get("amount").and_then(|value| normalize_decimal(value, 2));
+    let mut parts = Vec::new();
+    let mut amounts = Vec::new();
+    for split in splits {
+        let amount = split.get("amount").and_then(|value| normalize_decimal(value, 2));
+        let category = text(split, "categoryId");
+        let (Some(amount), false) = (amount, category.is_empty()) else {
+            return Err(AgentInputError::with_instruction("invalid-finance-splits", "splits", "Cada parte necesita amount (positivo) y categoryId."));
+        };
+        let mut part = args.clone();
+        if let Some(object) = part.as_object_mut() {
+            object.remove("splits");
+            object.insert("amount".into(), json!(amount));
+            object.insert("categoryId".into(), json!(category));
+            if let Some(description) = optional_text(split, "description") {
+                object.insert("description".into(), json!(description));
+            }
+        }
+        amounts.push(amount);
+        parts.push(part);
+    }
+    let sum = sum_amounts(amounts.iter().map(String::as_str));
+    match (total, sum) {
+        (Some(total), Some(sum)) if crate::finance::parse_cents(&total).ok() == crate::finance::parse_cents(&sum).ok() => Ok(Some(parts)),
+        (Some(total), Some(sum)) => Err(AgentInputError::with_instruction(
+            "finance-splits-do-not-add-up",
+            "splits",
+            &format!("Las partes suman {sum} y el total (amount) es {total}: tienen que sumar exactamente el total."),
+        )),
+        _ => Err(AgentInputError::fields("invalid-finance-splits", vec!["amount"])),
     }
 }
 
@@ -1246,5 +1310,24 @@ mod tests {
         assert_eq!(build(negative, false), Err("invalid-finance-transaction"));
         let adjustment = json!({ "transactionType": "adjustment", "amount": "-10", "accountId": "a1", "description": "x" });
         assert_eq!(build(adjustment, false), Ok(()));
+    }
+
+    #[test]
+    fn a_movement_splits_into_categories_that_add_up_to_its_total() {
+        let order = json!({
+            "transactionType": "expense", "amount": "12.500,50", "accountId": "a1", "description": "Pedido Rappi",
+            "splits": [{ "amount": "10000", "categoryId": "Supermercado" }, { "amount": "2500.50", "categoryId": "Tabaco", "description": "Cigarrillos" }],
+        });
+        let parts = split_parts(&order).expect("valid").expect("split");
+        assert_eq!(parts.len(), 2);
+        assert_eq!((parts[0]["amount"].as_str(), parts[0]["categoryId"].as_str(), parts[0]["description"].as_str()), (Some("10000"), Some("Supermercado"), Some("Pedido Rappi")));
+        assert_eq!((parts[1]["amount"].as_str(), parts[1]["description"].as_str()), (Some("2500.5"), Some("Cigarrillos")));
+        assert!(parts.iter().all(|part| part.get("splits").is_none() && part["accountId"] == "a1"));
+        assert_eq!(split_parts(&json!({ "amount": "10" })), Ok(None));
+        let off = json!({ "amount": "100", "splits": [{ "amount": "60", "categoryId": "A" }, { "amount": "30", "categoryId": "B" }] });
+        let error = split_parts(&off).expect_err("does not add up");
+        assert!(error.instruction.contains("suman 90") && error.instruction.contains("100"), "{}", error.instruction);
+        assert!(split_parts(&json!({ "amount": "10", "splits": [{ "amount": "10", "categoryId": "A" }] })).is_err(), "one part is no split");
+        assert!(split_parts(&json!({ "amount": "10", "splits": [{ "amount": "5" }, { "amount": "5", "categoryId": "B" }] })).is_err());
     }
 }

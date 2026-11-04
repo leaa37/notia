@@ -9,8 +9,7 @@ export const FOLLOW_RETRY_MS = 2_000
  * backend reports it running and the hook is idle: after the view opens
  * again, after a dismissed error, or when the first try failed. A failed try
  * reads the meeting again (the backend settles a meeting whose session is
- * gone) and is repeated a little later. Resolves `ensure` to whether the
- * session is followed, for actions that need it right away.
+ * gone) and is repeated a little later.
  */
 export function useFollowMeetingSession(
   attach: (sessionId: string) => Promise<boolean>,
@@ -45,10 +44,4 @@ export function useFollowMeetingSession(
   useEffect(() => () => {
     if (timerRef.current !== null) window.clearTimeout(timerRef.current)
   }, [])
-
-  const ensure = useCallback(
-    async () => status !== 'idle' || (sessionId !== null && follow(sessionId)),
-    [follow, sessionId, status],
-  )
-  return ensure
 }

@@ -15,7 +15,6 @@ use notia_backend_core::meeting::{
 };
 use notia_backend_core::meeting_ai::MeetingAiContext;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::backend::{BackendError, BackendErrorCode};
 use crate::host::AppHandle;
@@ -72,9 +71,6 @@ pub(crate) struct MeetingHistoryItemDto {
 /// first, that mention `query`.
 pub(crate) async fn meeting_history(app: AppHandle, payload: MeetingHistoryPayload) -> Result<Vec<MeetingHistoryItemDto>, BackendError> {
     crate::host::async_runtime::spawn_blocking(move || {
-        if crate::meeting::uses_host(&app) {
-            return crate::host_client::call_host_blocking(&app, "meeting_history", json!({ "payload": payload }));
-        }
         let query = payload.query.trim().chars().take(MAX_QUERY_CHARS).collect::<String>().to_lowercase();
         let mut archives = saved_archives(&app, &payload.library_id)?;
         archives.retain(|archive| archive.record.mentions(&query));
@@ -89,22 +85,11 @@ pub(crate) async fn meeting_history(app: AppHandle, payload: MeetingHistoryPaylo
 /// Opens the saved meeting `meetingId` as the current one.
 pub(crate) async fn meeting_open_saved(app: AppHandle, payload: MeetingSavedPayload) -> Result<(), BackendError> {
     crate::host::async_runtime::spawn_blocking(move || {
-        let archive = if crate::meeting::uses_host(&app) {
-            crate::host_client::call_host_blocking::<MeetingArchive>(&app, "meeting_saved_archive", json!({ "payload": payload }))?
-        } else {
-            read_archive(&app, &payload.library_id, &payload.meeting_id)?
-        };
+        let archive = read_archive(&app, &payload.library_id, &payload.meeting_id)?;
         crate::meeting::open_saved(&app, archive)
     })
     .await
     .map_err(|_| BackendError::new(BackendErrorCode::Internal, "No se pudo abrir la reunión.", true))?
-}
-
-/// The archive of a saved meeting of this device's library, for a client.
-pub(crate) async fn meeting_saved_archive(app: AppHandle, payload: MeetingSavedPayload) -> Result<MeetingArchive, BackendError> {
-    crate::host::async_runtime::spawn_blocking(move || read_archive(&app, &payload.library_id, &payload.meeting_id))
-        .await
-        .map_err(|_| BackendError::new(BackendErrorCode::Internal, "No se pudo abrir la reunión.", true))?
 }
 
 fn read_archive(app: &AppHandle, library_id: &str, meeting_id: &str) -> Result<MeetingArchive, BackendError> {

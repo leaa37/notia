@@ -11,17 +11,15 @@
 //! memory until the person discards it, starts another recording or saves
 //! it as a library note.
 //!
-//! On a client in Host mode the meeting is the device's own: it records,
-//! recognizes and keeps the meeting here (a tablet in the room works even
-//! without the network). Only what touches the host goes there: the note
-//! and its export (`meeting_store_note`), the tasks (`meeting_store_tasks`)
-//! and the AI (`meeting_ai_complete`), because the AI settings of the
-//! library point to the host's provider.
+//! The meeting is the device's own on every device: it records, recognizes
+//! and saves the meeting, its tasks and its AI in the library this device
+//! works on (on a client, its copy, which syncs with the host later), so a
+//! tablet in the room works even without the network.
 //!
 //! The AI of a recording (live answers and Notas IA) may consult the part
 //! of the library the person chose when starting it: the passages that
-//! match each request travel in its prompt. They are read where the library
-//! is (this device, or the host for a client), once every
+//! match each request travel in its prompt. They are read from the library
+//! of this device once every
 //! [`CORPUS_TTL`]. Notas IA rewrites its notes every
 //! [`meeting_ai::NOTES_PASS_INTERVAL_MS`] while recording, once more when
 //! the recording stops, and whenever the person calls the agent.
@@ -124,8 +122,7 @@ struct NotesJob {
 }
 
 /// What a request may read of the library and what to look up in it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub(crate) struct LibraryLookup {
     context: MeetingAiContext,
     query: String,
@@ -148,12 +145,6 @@ fn lock(app: &AppHandle) -> Result<std::sync::MutexGuard<'_, MeetingInner>, Back
 
 fn announce(app: &AppHandle, meeting_id: &str) {
     let _ = app.emit(CHANGED_EVENT, json!({ "meetingId": meeting_id }));
-}
-
-/// Whether this device is a client working on its host: the library and
-/// the AI provider are the host's.
-pub(crate) fn uses_host(app: &AppHandle) -> bool {
-    crate::host_client::uses_host(app)
 }
 
 /// Which AI request of a meeting; the system prompt follows from it.
@@ -250,20 +241,8 @@ fn warm_library_corpus(app: AppHandle, context: MeetingAiContext) {
     }
 }
 
-/// The provider preferences as they travel to the host.
-fn settings_input(settings: &AiSettings) -> AiSettingsInput {
-    AiSettingsInput {
-        ollama_url: settings.ollama_url.clone(),
-        api_key: settings.api_key.clone(),
-        selected_model: settings.selected_model.clone(),
-        thinking_enabled: settings.thinking_enabled,
-        thinking_level: settings.thinking_level,
-    }
-}
-
 /// Completes an AI request of a meeting, with the library passages of
-/// `library`: on this device, or on the host for a client (its library and
-/// provider are the host's).
+/// `library`.
 fn complete_text(
     app: &AppHandle,
     settings: &AiSettings,
@@ -271,18 +250,6 @@ fn complete_text(
     prompt: &str,
     library: Option<&LibraryLookup>,
 ) -> Result<String, BackendError> {
-    if uses_host(app) {
-        return crate::host_client::call_host_blocking(
-            app,
-            "meeting_ai_complete",
-            json!({ "payload": {
-                "settings": settings_input(settings),
-                "kind": kind,
-                "prompt": prompt,
-                "library": library,
-            } }),
-        );
-    }
     let prompt = with_library_passages(app, kind, prompt, library);
     crate::ai_tasks::complete(app, settings, kind.system_prompt(), &prompt, Vec::new())
 }
@@ -333,7 +300,7 @@ pub(crate) fn begin(app: &AppHandle, session_id: &str, sources: CaptureSources, 
     inner.ai_context = options.ai_context.clone();
     drop(inner);
     announce(app, session_id);
-    if let Some(context) = options.ai_context.clone().filter(|_| !uses_host(app)) {
+    if let Some(context) = options.ai_context.clone() {
         warm_library_corpus(app.clone(), context);
     }
     spawn_notes_schedule(app.clone(), session_id.to_string());
@@ -536,14 +503,36 @@ pub(crate) fn open_saved(app: &AppHandle, archive: MeetingArchive) -> Result<(),
 }
 
 /// The session was cancelled or could not start: its record goes away.
-pub(crate) fn discard_session(app: &AppHandle, session_id: &str) {
-    let Ok(mut inner) = lock(app) else { return };
-    if inner.record.as_ref().is_some_and(|record| record.id == session_id) {
-        inner.live.cancel();
-        inner.record = None;
-        drop(inner);
-        announce(app, session_id);
+pub(crate) fn discard_session(app: &AppHandle, session_id: &str) -> bool {
+    let Ok(mut inner) = lock(app) else { return false };
+    if !inner.record.as_ref().is_some_and(|record| record.id == session_id) {
+        return false;
     }
+    inner.live.cancel();
+    inner.record = None;
+    drop(inner);
+    announce(app, session_id);
+    true
+}
+
+/// Finishes the meeting of `session_id` with the lines it has when its
+/// speech session is gone and the person asks to finish it. Whether it was
+/// still recording or processing.
+pub(crate) fn finish_lost_session(app: &AppHandle, session_id: &str) -> bool {
+    let Ok(mut inner) = lock(app) else { return false };
+    let Some(record) = inner
+        .record
+        .as_mut()
+        .filter(|record| record.id == session_id && record.status != MeetingStatus::Completed)
+    else {
+        return false;
+    };
+    let duration_ms = record.duration_ms;
+    record.complete(Vec::new(), duration_ms);
+    inner.live.cancel();
+    drop(inner);
+    announce(app, session_id);
+    true
 }
 
 // --- Live answers -----------------------------------------------------------
@@ -597,26 +586,20 @@ fn run_answer(app: &AppHandle, job: AnswerJob) -> Option<AnswerJob> {
         });
         let _ = app.emit(ANSWER_EVENT, json!({ "meetingId": job.meeting_id, "answerId": job.answer_id, "text": text }));
     };
-    // A client asks its host, which answers at once instead of streaming.
-    let result = if uses_host(app) {
-        complete_text(app, &job.settings, MeetingAiKind::LiveAnswer, &job.prompt, job.library.as_ref())
-            .inspect(|text| show(text))
-    } else {
-        let prompt = with_library_passages(app, MeetingAiKind::LiveAnswer, &job.prompt, job.library.as_ref());
-        crate::ai_tasks::stream_complete(
-            app,
-            &job.settings,
-            meeting::LIVE_ANSWER_SYSTEM_PROMPT,
-            &prompt,
-            &job.control,
-            &mut |text| {
-                if last_event.elapsed() >= ANSWER_EVENT_INTERVAL {
-                    last_event = Instant::now();
-                    show(text);
-                }
-            },
-        )
-    };
+    let prompt = with_library_passages(app, MeetingAiKind::LiveAnswer, &job.prompt, job.library.as_ref());
+    let result = crate::ai_tasks::stream_complete(
+        app,
+        &job.settings,
+        meeting::LIVE_ANSWER_SYSTEM_PROMPT,
+        &prompt,
+        &job.control,
+        &mut |text| {
+            if last_event.elapsed() >= ANSWER_EVENT_INTERVAL {
+                last_event = Instant::now();
+                show(text);
+            }
+        },
+    );
     let next = {
         let Ok(mut guard) = lock(app) else { return None };
         let inner = &mut *guard;
@@ -1118,6 +1101,13 @@ pub(crate) fn execute_agent_tool(
     }
 }
 
+/// The confirmation text of an agent change to the open meeting of this
+/// device; invalid input goes back to the model before asking the person.
+pub(crate) fn preview_agent_tool(app: &AppHandle, name: &str, arguments: &serde_json::Value) -> Result<String, BackendError> {
+    let inner = lock(app)?;
+    notia_backend_core::meeting_tools::preview_text(name, arguments, inner.record.as_ref())
+}
+
 fn no_open_meeting() -> serde_json::Value {
     json!({ "open": false, "message": "No hay una reunión abierta en Meeting." })
 }
@@ -1434,8 +1424,7 @@ pub(crate) struct StoredNote {
 /// Writes `content` as the meeting note in `folder` of the library, over
 /// `previous` when it is still there and unchanged, or under a free name
 /// from `file_name`, and exports it to `export` when asked. The meeting
-/// itself (`archive`) is kept next to it for «Reuniones anteriores». Runs
-/// where the library is: this device, or the host for a client.
+/// itself (`archive`) is kept next to it for «Reuniones anteriores».
 #[allow(clippy::too_many_arguments)]
 fn write_note_here(
     app: &AppHandle,
@@ -1547,23 +1536,7 @@ fn save_note(
         .filter(|saved| saved.logical_path.rsplit_once('/').map_or("", |(parent, _)| parent) == folder)
         .map(|saved| PreviousNote { logical_path: saved.logical_path, revision: saved.revision });
     let file_name = record.note_file_name();
-    let stored = if uses_host(app) {
-        crate::host_client::call_host_blocking::<StoredNote>(
-            app,
-            "meeting_store_note",
-            json!({ "payload": {
-                "libraryId": library_id,
-                "folder": folder,
-                "fileName": file_name,
-                "content": content,
-                "previous": previous,
-                "export": export,
-                "archive": archive,
-            } }),
-        )?
-    } else {
-        write_note_here(app, library_id, &folder, &file_name, &content, previous.as_ref(), export, Some(archive))?
-    };
+    let stored = write_note_here(app, library_id, &folder, &file_name, &content, previous.as_ref(), export, Some(archive))?;
     with_record(app, meeting_id, |record| {
         record.saved_note = Some(SavedMeetingNote {
             logical_path: stored.logical_path.clone(),
@@ -1626,75 +1599,6 @@ pub(crate) async fn meeting_export(app: AppHandle, payload: MeetingExportPayload
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MeetingStoreNotePayload {
-    library_id: String,
-    folder: String,
-    file_name: String,
-    content: String,
-    #[serde(default)]
-    previous: Option<PreviousNote>,
-    #[serde(default)]
-    export: Option<ExportFormat>,
-    /// The meeting, kept next to its note for «Reuniones anteriores».
-    #[serde(default)]
-    archive: Option<MeetingArchive>,
-}
-
-/// Writes in this host's library the note of a meeting a client recorded
-/// and keeps on its device (and exports it when asked).
-pub(crate) async fn meeting_store_note(app: AppHandle, payload: MeetingStoreNotePayload) -> Result<StoredNote, BackendError> {
-    let folder = note_folder(&payload.folder)?;
-    let file_name = payload.file_name.trim().to_string();
-    if file_name.is_empty() || file_name.contains(['/', '\\']) || !file_name.to_ascii_lowercase().ends_with(".md") {
-        return Err(BackendError::invalid_input("El nombre de la nota de la reunión no es válido."));
-    }
-    crate::host::async_runtime::spawn_blocking(move || {
-        write_note_here(
-            &app,
-            &payload.library_id,
-            &folder,
-            &file_name,
-            &payload.content,
-            payload.previous.as_ref(),
-            payload.export,
-            payload.archive,
-        )
-    })
-    .await
-    .map_err(|_| BackendError::new(BackendErrorCode::Internal, "No se pudo guardar la reunión.", true))?
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct MeetingAiCompletePayload {
-    settings: AiSettingsInput,
-    kind: MeetingAiKind,
-    prompt: String,
-    /// The library passages to add, read here.
-    #[serde(default)]
-    library: Option<LibraryLookup>,
-}
-
-/// Completes on this host an AI request of a meeting a client keeps on its
-/// device: the library's AI settings point to this host's provider, and
-/// the library context is read here.
-pub(crate) async fn meeting_ai_complete(app: AppHandle, payload: MeetingAiCompletePayload) -> Result<String, BackendError> {
-    let library = payload
-        .library
-        .map(|lookup| {
-            Ok::<_, BackendError>(LibraryLookup { context: lookup.context.normalized()?, query: lookup.query })
-        })
-        .transpose()?;
-    crate::host::async_runtime::spawn_blocking(move || {
-        let prompt = with_library_passages(&app, payload.kind, &payload.prompt, library.as_ref());
-        crate::ai_tasks::complete(&app, &payload.settings.normalize(), payload.kind.system_prompt(), &prompt, Vec::new())
-    })
-    .await
-    .map_err(|_| BackendError::new(BackendErrorCode::Internal, "La operación de IA se interrumpió.", true))?
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingBoardsPayload {
     library_id: String,
 }
@@ -1734,15 +1638,7 @@ pub(crate) async fn meeting_send_tasks(app: AppHandle, payload: MeetingSendTasks
             return Err(BackendError::invalid_input("No hay tareas nuevas para enviar."));
         }
         let tasks = pending.iter().map(|task| (task.title.clone(), task.detail.clone())).collect::<Vec<_>>();
-        let created = if uses_host(&app) {
-            crate::host_client::call_host_blocking::<usize>(
-                &app,
-                "meeting_store_tasks",
-                json!({ "payload": { "libraryId": payload.library_id, "board": payload.board, "tasks": tasks } }),
-            )?
-        } else {
-            crate::task_manager_commands::create_owner_tasks(&app, &payload.library_id, &payload.board, &tasks)?
-        };
+        let created = crate::task_manager_commands::create_owner_tasks(&app, &payload.library_id, &payload.board, &tasks)?;
         let sent = pending.into_iter().map(|task| task.id).collect::<Vec<_>>();
         with_record(&app, &payload.meeting_id, |record| {
             record.mark_tasks_sent(&sent);
@@ -1750,28 +1646,6 @@ pub(crate) async fn meeting_send_tasks(app: AppHandle, payload: MeetingSendTasks
         })?;
         announce(&app, &payload.meeting_id);
         Ok(MeetingSentTasksDto { created })
-    })
-    .await
-    .map_err(|_| BackendError::new(BackendErrorCode::Internal, "No se pudieron crear las tareas.", true))?
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct MeetingStoreTasksPayload {
-    library_id: String,
-    board: String,
-    /// Title and detail of each task.
-    tasks: Vec<(String, String)>,
-}
-
-/// Creates in this host's Task Manager the tasks of a meeting a client
-/// keeps on its device. Returns how many it created.
-pub(crate) async fn meeting_store_tasks(app: AppHandle, payload: MeetingStoreTasksPayload) -> Result<usize, BackendError> {
-    if payload.board.trim().is_empty() || payload.tasks.is_empty() {
-        return Err(BackendError::invalid_input("Elegí un tablero y al menos una tarea."));
-    }
-    crate::host::async_runtime::spawn_blocking(move || {
-        crate::task_manager_commands::create_owner_tasks(&app, &payload.library_id, &payload.board, &payload.tasks)
     })
     .await
     .map_err(|_| BackendError::new(BackendErrorCode::Internal, "No se pudieron crear las tareas.", true))?
@@ -1793,6 +1667,37 @@ mod tests {
         // A clock a little ahead counts as now; an inverted span as a moment.
         assert_eq!(recording_span(60_000, 1_000_000, 999_000, 1_002_000), Some((59_000, 60_000)));
         assert_eq!(recording_span(60_000, 1_000_000, 999_000, 990_000), Some((59_000, 59_000)));
+    }
+
+    /// The view could not finish a meeting whose speech session was gone
+    /// while the phase still said recording: finishing it now keeps its
+    /// lines, and another recording can start.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn a_meeting_whose_session_is_gone_finishes_with_its_lines() {
+        use crate::services::speech_service::{release_lost_session, SpeechPhase, SpeechRuntimeState};
+        use crate::host::Manager;
+        let root = std::env::temp_dir().join(format!("notia-lost-meeting-{}", uuid::Uuid::new_v4()));
+        let app = crate::create_app(crate::host::AppPaths::new(Some(root.join("data")), None), crate::host::HostPorts::default());
+        let speech = app.state::<SpeechRuntimeState>();
+        *speech.phase.lock().expect("phase") = SpeechPhase::Recording;
+        let meeting_id = super::probe::begin(&app);
+        super::on_line(&app, &meeting_id, Some((0, 1_000)), "Bueno, muchas gracias.");
+
+        assert!(release_lost_session(&speech, &meeting_id));
+        assert_eq!(*speech.phase.lock().expect("phase"), SpeechPhase::Idle);
+        assert!(super::finish_lost_session(&app, &meeting_id));
+        {
+            let inner = super::lock(&app).expect("meeting");
+            let record = inner.record.as_ref().expect("record");
+            assert_eq!(record.status, super::MeetingStatus::Completed);
+            assert_eq!(record.lines.len(), 1);
+        }
+        // Finished already: nothing left to finish, and dropping it works.
+        assert!(!super::finish_lost_session(&app, &meeting_id));
+        assert!(super::discard_session(&app, &meeting_id));
+        assert!(!super::discard_session(&app, &meeting_id));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

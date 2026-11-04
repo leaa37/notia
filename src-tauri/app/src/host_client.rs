@@ -1,24 +1,23 @@
-//! The link of a client with its host (Client mode).
+//! The link of a client with its host (Client mode), used only to sync
+//! the copy: the window always works on the copy, as a library of this
+//! device (`host_mirror`).
 //!
 //! - **HTTPS with a pinned certificate.** The host signs its own
 //!   certificate; the client trusts the one it sees on the first connection
 //!   (its SHA-256 goes to the connection settings) and refuses any other
 //!   until the person saves the address again.
-//! - **Sign-in with the library's Owner** (`/api/auth/*`): the sign-in
-//!   window of the app sends the Owner's user name and password to the
-//!   host. The session lives in memory; «Recordar sesión» keeps the
-//!   password sealed on this device to sign in again at start.
-//! - **Commands** go to `/api/invoke` (`forward`); library files to
-//!   `/api/file` (`fetch_file`, the `notiahost` scheme of the window).
-//! - **Events** of the host arrive over its WebSocket and are emitted here,
-//!   so the interface listens to them as if they were local.
-//! - **The monitor** checks `/api/health` and emits `notia:host-link` when
-//!   the host stops or starts answering. A «Con copia» client syncs its copy
-//!   in the background as soon as a session opens and then on every check.
+//! - **The Owner's session with the host** (`/api/auth/*`): the sign-in of
+//!   the copy hands the Owner's user name and password over
+//!   (`use_credentials`), and the first copy signs in with the host itself
+//!   (`auth_login`). The session lives in memory; «Recordar sesión» keeps
+//!   the password sealed on this device to sign in again at start.
+//! - **The sync** calls `/api/invoke` with the `host_sync_*` commands
+//!   (`call_host`) and reads the files with `/api/file` (`fetch_file`).
+//! - **The monitor** checks `/api/health`, emits `notia:host-link` when the
+//!   host stops or starts answering, and syncs the copy on every check
+//!   while the host answers and accepts the session.
 
-use std::io::ErrorKind;
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,42 +25,27 @@ use reqwest::Method;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tungstenite::client::IntoClientRequest;
-use tungstenite::Message;
 
-use crate::backend::connection::{HostAddress, HOST_PROTOCOL_VERSION};
+use crate::backend::connection::{DevicePower, HostAddress, HOST_PROTOCOL_VERSION};
 use crate::backend::{BackendError, BackendErrorCode};
 use crate::host::{AppHandle, Emitter, Manager};
-use crate::registry::{Dispatch, Reply};
 
 const SESSION_COOKIE: &str = "notia_session";
 /// Event of the interface when the host starts or stops answering, or the
 /// session ends.
 pub(crate) const LINK_EVENT: &str = "notia:host-link";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the monitor, and a client with a ready copy at start, wait for
-/// `/api/health`: the same for both, so a host the monitor sees answering
-/// also answers at start.
-pub(crate) const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the monitor waits for `/api/health`.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 const SHORT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Commands such as preparing a speech model or exporting run long.
-const INVOKE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// A large file or a snapshot of the database takes a while on a weak signal.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MONITOR_ONLINE_INTERVAL: Duration = Duration::from_secs(10);
 const MONITOR_OFFLINE_INTERVAL: Duration = Duration::from_secs(4);
-/// How long the host stays without answering before a window on it moves
-/// to the copy: a short drop (a weak signal) does not reload the window.
-const MOVE_TO_COPY_AFTER: Duration = Duration::from_secs(10);
-/// How long the host must keep answering before a window on the copy goes
-/// back to it: with a weak signal the host answers now and then, and each
-/// return would fail again.
-const RETURN_TO_HOST_AFTER: Duration = Duration::from_secs(30);
-const EVENTS_READ_TIMEOUT: Duration = Duration::from_secs(1);
-const EVENTS_RETRY: Duration = Duration::from_secs(2);
-const MAX_EVENT_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 // ---------- State ----------
 
@@ -84,50 +68,10 @@ struct Link {
     platform: Option<String>,
     message: Option<String>,
     session: Option<String>,
-    /// The Owner's user name and password of this run, to open a new
-    /// session when the host restarts. Only in memory.
+    /// The Owner's user name and password, handed over by the sign-in of
+    /// the copy or of the first copy, to open a session again when the
+    /// host restarts. Only in memory.
     credentials: Option<(String, String)>,
-    /// Since when the host does not answer.
-    offline_since: Option<Instant>,
-    /// Since when the host answers.
-    online_since: Option<Instant>,
-    /// A command of the window could not reach the host, and none has since
-    /// (`forward`). The person saw it fail: the window goes to the copy at
-    /// once, and a reload opens the copy without asking the host again.
-    command_failed: bool,
-    /// Where the window was last told to move.
-    announced_move: Option<WindowMove>,
-}
-
-/// How the link is, for deciding where the window goes.
-#[derive(Debug, Clone, Copy, Default)]
-struct LinkTiming {
-    offline_for: Option<Duration>,
-    online_for: Option<Duration>,
-    command_failed: bool,
-}
-
-/// Where a client's window should go now (`LinkView::move_to`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum WindowMove {
-    /// The host stopped answering a while ago and the copy is ready.
-    Copy,
-    /// The window works on the copy and the host answers again.
-    Host,
-}
-
-/// Where the window should go, from the link and the copy. On the host, a
-/// command that failed moves it to the copy at once; without one, only a
-/// host away for a while does (a short drop does not reload the window).
-/// On the copy, the host must answer for a while before the window returns.
-fn window_move(state: LinkState, timing: LinkTiming, on_copy: bool, copy_ready: impl FnOnce() -> bool) -> Option<WindowMove> {
-    if on_copy {
-        let stable = timing.online_for.is_some_and(|elapsed| elapsed >= RETURN_TO_HOST_AFTER);
-        return (state == LinkState::Online && stable).then_some(WindowMove::Host);
-    }
-    let away = state == LinkState::Offline && timing.offline_for.is_some_and(|elapsed| elapsed >= MOVE_TO_COPY_AFTER);
-    ((timing.command_failed || away) && copy_ready()).then_some(WindowMove::Copy)
 }
 
 #[derive(Clone)]
@@ -146,7 +90,6 @@ pub(crate) struct HostClientState {
     http: Mutex<Option<HttpClient>>,
     /// Changes with the settings; the threads of an older link stop.
     generation: AtomicU64,
-    events_running: AtomicBool,
 }
 
 fn state(app: &AppHandle) -> Option<crate::host::State<'static, HostClientState>> {
@@ -169,7 +112,7 @@ pub(crate) fn reconfigure(app: &AppHandle) {
     let Some(state) = state(app) else {
         return;
     };
-    let target = crate::connection::client_host(app).map(|(address, _, _)| address);
+    let target = crate::connection::client_host(app).map(|(address, _)| address);
     {
         let mut current = state.target.lock().unwrap_or_else(|error| error.into_inner());
         if *current == target {
@@ -210,68 +153,22 @@ pub(crate) struct LinkView {
     platform: Option<String>,
     pub(crate) signed_in: bool,
     pub(crate) message: Option<String>,
-    /// Where the window should go now: to the copy when the host stopped
-    /// answering, back to the host when it answers again.
-    pub(crate) move_to: Option<WindowMove>,
 }
 
 pub(crate) fn link_view(app: &AppHandle) -> LinkView {
-    let view = with_link(app, |link| {
-        let view = LinkView {
-            state: link.state,
-            library: link.library.clone(),
-            platform: link.platform.clone(),
-            signed_in: link.session.is_some(),
-            message: link.message.clone(),
-            move_to: None,
-        };
-        let timing = LinkTiming {
-            offline_for: link.offline_since.map(|since| since.elapsed()),
-            online_for: link.online_since.map(|since| since.elapsed()),
-            command_failed: link.command_failed,
-        };
-        (view, timing)
-    });
-    let Some((mut view, timing)) = view else {
-        return LinkView { state: LinkState::Unknown, library: None, platform: None, signed_in: false, message: None, move_to: None };
-    };
-    let on_copy = crate::host_mirror::is_offline(app);
-    view.move_to = window_move(view.state, timing, on_copy, || crate::host_mirror::copy_ready(app));
-    view
-}
-
-/// Whether a command of the window failed to reach the host and none has
-/// reached it since: the window prefers its copy until it leaves it.
-pub(crate) fn copy_preferred(app: &AppHandle) -> bool {
-    with_link(app, |link| link.command_failed).unwrap_or(false)
-}
-
-/// The window left the copy: the next failure counts anew.
-pub(crate) fn forget_failed_command(app: &AppHandle) {
-    with_link(app, |link| link.command_failed = false);
+    with_link(app, |link| LinkView {
+        state: link.state,
+        library: link.library.clone(),
+        platform: link.platform.clone(),
+        signed_in: link.session.is_some(),
+        message: link.message.clone(),
+    })
+    .unwrap_or(LinkView { state: LinkState::Unknown, library: None, platform: None, signed_in: false, message: None })
 }
 
 fn emit_link(app: &AppHandle) {
-    let view = link_view(app);
-    with_link(app, |link| link.announced_move = view.move_to);
-    let _ = app.emit(LINK_EVENT, view);
+    let _ = app.emit(LINK_EVENT, link_view(app));
     crate::client_status::refresh(app);
-}
-
-/// Tells the window when where it should go changed without the link
-/// changing (the host has been away long enough, or the window entered or
-/// left the copy).
-pub(crate) fn announce_move(app: &AppHandle) {
-    let next = link_view(app).move_to;
-    if with_link(app, |link| link.announced_move != next).unwrap_or(false) {
-        emit_link(app);
-    }
-}
-
-/// Whether the commands of this device run on its host: a client does,
-/// except while it works offline on its copy.
-pub(crate) fn uses_host(app: &AppHandle) -> bool {
-    crate::connection::is_client(app) && !crate::host_mirror::is_offline(app)
 }
 
 /// Id and name of the library the host serves, once known.
@@ -293,16 +190,6 @@ fn remember_library(app: &AppHandle, body: &Value, id_key: &str, name_key: &str)
 fn set_state(app: &AppHandle, next: LinkState, library: Option<Option<String>>, message: Option<String>) {
     let changed = with_link(app, |link| {
         let changed = link.state != next || link.message != message;
-        if next != LinkState::Offline {
-            link.offline_since = None;
-        } else if link.offline_since.is_none() {
-            link.offline_since = Some(Instant::now());
-        }
-        if next != LinkState::Online {
-            link.online_since = None;
-        } else if link.online_since.is_none() {
-            link.online_since = Some(Instant::now());
-        }
         link.state = next;
         link.message = message;
         if let Some(library) = library {
@@ -395,7 +282,7 @@ fn build_http(address: HostAddress, pin: Option<String>) -> Result<HttpClient, B
 }
 
 fn http(app: &AppHandle) -> Result<HttpClient, BackendError> {
-    let (address, _, pin) = crate::connection::client_host(app).ok_or_else(not_client)?;
+    let (address, pin) = crate::connection::client_host(app).ok_or_else(not_client)?;
     let state = state(app).ok_or_else(not_client)?;
     let mut cached = state.http.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(http) = cached.as_ref().filter(|http| http.address == address && http.pin == pin) {
@@ -457,10 +344,6 @@ fn host_error(body: &Value, fallback: &str) -> BackendError {
         }
         _ => BackendError::new(BackendErrorCode::Internal, fallback, true),
     }
-}
-
-fn error_value(error: BackendError) -> Value {
-    serde_json::to_value(error).unwrap_or_else(|_| Value::String("No se pudo contactar al host de Notia.".into()))
 }
 
 // ---------- Requests ----------
@@ -558,7 +441,7 @@ async fn request_json(
 /// (it restarted, or the session expired while the device slept) is opened
 /// again with the credentials this device keeps. The session ends only when
 /// the host refuses them; a host that cannot be asked keeps it for the next
-/// try, so a lost signal never sends the person back to the sign-in window.
+/// try, so a lost signal never stops the sync for good.
 async fn authenticated(app: &AppHandle, method: Method, path: &str, body: Option<&Value>, timeout: Duration) -> Result<HostReply, BackendError> {
     let reply = request_json(app, method.clone(), path, body, timeout).await?;
     if reply.status != 401 {
@@ -597,11 +480,18 @@ fn host_refused(error: &BackendError) -> bool {
     matches!(error.code, BackendErrorCode::Unauthorized | BackendErrorCode::Forbidden)
 }
 
+/// The host library this device copies: the one the host says it serves,
+/// or before it answers, the one the copy follows.
+fn host_library_id(app: &AppHandle) -> Option<String> {
+    with_link(app, |link| link.library_id.clone())
+        .flatten()
+        .or_else(|| crate::host_mirror::copied_library(app).map(|(id, _)| id))
+}
+
 /// The Owner's credentials «Recordar sesión» kept on this device for the
 /// library the host serves.
 fn remembered_session_credentials(app: &AppHandle) -> Option<(String, String)> {
-    let library_id = with_link(app, |link| link.library_id.clone()).flatten()?;
-    crate::config_vault::remembered_credentials(app, &session_key(&library_id))
+    crate::config_vault::remembered_credentials(app, &session_key(&host_library_id(app)?))
 }
 
 /// Opens a session again with the credentials of this run or, after this
@@ -629,7 +519,7 @@ async fn ensure_session(app: &AppHandle) -> Result<bool, BackendError> {
     match renew_session(app).await {
         Ok(()) => Ok(true),
         Err(error) if host_refused(&error) => {
-            if let Some(library_id) = with_link(app, |link| link.library_id.clone()).flatten() {
+            if let Some(library_id) = host_library_id(app) {
                 crate::config_vault::forget_credentials(app, &session_key(&library_id));
             }
             end_session(app);
@@ -656,72 +546,76 @@ async fn open_session(app: &AppHandle, username: &str, password: &str) -> Result
         link.credentials = Some((username.to_string(), password.to_string()));
     });
     emit_link(app);
-    start_events(app);
     // The copy takes what changed meanwhile without holding the window.
     crate::host_mirror::sync_in_background(app);
     Ok(())
 }
 
-// ---------- Commands of the interface ----------
-
-/// Runs `command` on the host.
-pub(crate) fn forward(app: &AppHandle, command: &str, args: Value) -> Dispatch {
-    let app = app.clone();
-    let command = command.to_string();
-    Dispatch::Pending(Box::pin(async move {
-        let reply = invoke(&app, &command, args).await;
-        // The person saw this command fail for lack of connection: the
-        // window may go to the copy now, without waiting for the monitor.
-        let unreachable = matches!(&reply, Err(error) if *error == error_value(unreachable_error()));
-        let changed = with_link(&app, |link| std::mem::replace(&mut link.command_failed, unreachable) != unreachable);
-        if changed == Some(true) {
-            announce_move(&app);
-        }
-        reply
-    }))
+/// The Owner signed in on the copy: the same user name and password open
+/// the session of the sync with the host, now and when it restarts.
+/// «Recordar sesión» keeps them sealed on this device for the next start.
+pub(crate) fn use_credentials(app: &AppHandle, username: &str, password: &str, remember: bool) {
+    with_link(app, |link| link.credentials = Some((username.trim().to_string(), password.to_string())));
+    let Some(library_id) = host_library_id(app) else {
+        return;
+    };
+    let key = session_key(&library_id);
+    let kept = if remember {
+        crate::config_vault::remember_credentials(app, &key, username.trim(), password)
+    } else {
+        crate::config_vault::forget_credentials(app, &key);
+        Ok(())
+    };
+    if let Err(error) = kept {
+        log::error!("[notia:client] the session with the host was not remembered: {}", error.message);
+    }
 }
 
-/// Runs `command` on the host and reads its result.
+/// The Owner's credentials of this run with the host, and whether they are
+/// remembered on this device: the first copy signs in on the copy with them.
+pub(crate) fn session_credentials(app: &AppHandle) -> Option<(String, String, bool)> {
+    let (username, password) = with_link(app, |link| link.credentials.clone()).flatten()?;
+    let remembered = remembered_session_credentials(app).is_some();
+    Some((username, password, remembered))
+}
+
+/// The Owner signed out of the copy: the sync stops until the next sign-in.
+pub(crate) fn sign_out(app: &AppHandle) {
+    if let Some(library_id) = host_library_id(app) {
+        crate::config_vault::forget_credentials(app, &session_key(&library_id));
+    }
+    end_session(app);
+}
+
+/// Whether the host accepts `username` and `password` now. The sign-in of
+/// the copy asks when its own check fails: the password may have changed
+/// on another device, and the copy learns it on the next sync.
+pub(crate) async fn host_accepts(app: &AppHandle, username: &str, password: &str) -> bool {
+    open_session(app, username.trim(), password).await.is_ok()
+}
+
+// ---------- The sync's calls ----------
+
+/// Runs the sync command `command` on the host and reads its result.
 pub(crate) async fn call_host<T: serde::de::DeserializeOwned>(app: &AppHandle, command: &str, args: Value) -> Result<T, BackendError> {
-    match invoke(app, command, args).await {
-        Ok(value) => serde_json::from_value(value).map_err(|_| internal("El host respondió algo inesperado.")),
-        Err(error) => Err(serde_json::from_value(error).unwrap_or_else(|_| internal("El host no pudo completar la operación."))),
-    }
-}
-
-/// [`call_host`] for synchronous code. Runs on its own thread, so it also
-/// works from a blocking task of the async runtime.
-pub(crate) fn call_host_blocking<T: serde::de::DeserializeOwned + Send + 'static>(
-    app: &AppHandle,
-    command: &str,
-    args: Value,
-) -> Result<T, BackendError> {
-    let app = app.clone();
-    let command = command.to_string();
-    std::thread::spawn(move || crate::host::async_runtime::block_on(call_host::<T>(&app, &command, args)))
-        .join()
-        .map_err(|_| internal("El host no pudo completar la operación."))?
-}
-
-async fn invoke(app: &AppHandle, command: &str, args: Value) -> Reply {
     let body = json!({ "command": command, "args": args });
-    let reply = authenticated(app, Method::POST, "/api/invoke", Some(&body), INVOKE_TIMEOUT)
-        .await
-        .map_err(error_value)?;
+    let reply = authenticated(app, Method::POST, "/api/invoke", Some(&body), TRANSFER_TIMEOUT).await?;
+    let failed = || internal("El host no pudo completar la operación.");
     match reply.status {
-        200 => Ok(reply.body.get("result").cloned().unwrap_or(Value::Null)),
+        200 => serde_json::from_value(reply.body.get("result").cloned().unwrap_or(Value::Null))
+            .map_err(|_| internal("El host respondió algo inesperado.")),
         // The backend error of the host, as is.
-        400 => Err(reply.body.get("error").cloned().unwrap_or(Value::Null)),
-        _ => Err(error_value(host_error(&reply.body, "El host no pudo completar la operación."))),
+        400 => Err(reply.body.get("error").cloned().and_then(|error| serde_json::from_value(error).ok()).unwrap_or_else(failed)),
+        _ => Err(host_error(&reply.body, "El host no pudo completar la operación.")),
     }
 }
 
-/// A file of the host's library, for the `notiahost` scheme of the window.
+/// A file of the host's library, for the sync.
 pub(crate) async fn fetch_file(app: &AppHandle, path: &str) -> Option<(String, Vec<u8>)> {
     let http = http(app).ok()?;
     let session = with_link(app, |link| link.session.clone()).flatten()?;
     let path = format!("/api/file?path={}", encode_query(path));
-    let response = send(&http, Method::GET, &path, None, Some(&session), INVOKE_TIMEOUT).await.ok()?;
+    let response = send(&http, Method::GET, &path, None, Some(&session), TRANSFER_TIMEOUT).await.ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -745,8 +639,8 @@ fn session_key(library_id: &str) -> String {
     format!("host-session-{library_id}")
 }
 
-/// What the sign-in window shows for the library the host serves: open
-/// when this device has a session, with what this device remembers.
+/// What the sign-in of the first copy shows for the library the host
+/// serves: open when this device has a session, with what it remembers.
 pub(crate) async fn auth_status(app: &AppHandle) -> Result<Value, BackendError> {
     let reply = request_json(app, Method::GET, "/api/auth/status", None, SHORT_TIMEOUT).await?;
     if reply.status != 200 {
@@ -762,17 +656,20 @@ pub(crate) async fn auth_status(app: &AppHandle) -> Result<Value, BackendError> 
             true,
         ));
     };
+    if host_state == "setup" {
+        return Err(BackendError::new(
+            BackendErrorCode::Unauthorized,
+            "El Owner de la biblioteca todavía no tiene contraseña: creala en el host y volvé a intentar.",
+            true,
+        ));
+    }
     remember_library(app, &status, "libraryId", "libraryName");
     set_state(app, LinkState::Online, None, None);
 
     // A host that stops answering here is an error, never «locked»: the
     // window keeps waiting for it instead of asking for the password again.
-    let signed_in = if host_state == "setup" { false } else { ensure_session(app).await? };
-    status["state"] = json!(match (signed_in, host_state.as_str()) {
-        (true, _) => "unlocked",
-        (false, "setup") => "setup",
-        _ => "locked",
-    });
+    let signed_in = ensure_session(app).await?;
+    status["state"] = json!(if signed_in { "unlocked" } else { "locked" });
     status["remembered"] = crate::config_vault::remembered_credentials(app, &data_key(&library_id))
         .map(|(username, password)| json!({ "username": username, "password": password }))
         .unwrap_or(Value::Null);
@@ -805,51 +702,26 @@ fn remember(app: &AppHandle, key: &str, credentials: Option<(&str, &str)>) -> Re
     }
 }
 
-async fn password_flow(app: &AppHandle, path: &str, body: Value) -> Result<(), BackendError> {
-    let reply = request_json(app, Method::POST, path, Some(&body), SHORT_TIMEOUT).await?;
-    match reply.status {
-        200 => Ok(()),
-        _ => Err(host_error(&reply.body, "El host no pudo guardar la contraseña.")),
-    }
-}
-
-pub(crate) async fn auth_first_login(app: &AppHandle, username: &str) -> Result<(), BackendError> {
-    password_flow(app, "/api/auth/first-login", json!({ "username": username })).await
-}
-
-pub(crate) async fn auth_create_password(app: &AppHandle, username: &str, password: &str) -> Result<Value, BackendError> {
-    password_flow(app, "/api/auth/create-password", json!({ "username": username, "password": password })).await?;
-    auth_status(app).await
-}
-
-/// The host ends every session when the password changes; this device
-/// opens a new one with the new password.
-pub(crate) async fn auth_change_password(
-    app: &AppHandle,
-    library_id: &str,
-    username: &str,
-    current: &str,
-    new: &str,
-) -> Result<Value, BackendError> {
+/// «Cambiar contraseña» on a client: the host's Owner changes first (it
+/// checks the current password and ends every session), so the copy and
+/// the host never disagree on it; this device opens a new session with the
+/// new password and keeps remembering it where it did.
+pub(crate) async fn change_password(app: &AppHandle, username: &str, current: &str, new: &str) -> Result<(), BackendError> {
     let body = json!({ "username": username, "current": current, "new": new });
-    password_flow(app, "/api/auth/change-password", body).await?;
-    for key in [session_key(library_id), data_key(library_id)] {
-        if let Some((remembered, _)) = crate::config_vault::remembered_credentials(app, &key) {
-            let _ = crate::config_vault::remember_credentials(app, &key, &remembered, new);
+    let reply = request_json(app, Method::POST, "/api/auth/change-password", Some(&body), SHORT_TIMEOUT).await?;
+    if reply.status != 200 {
+        return Err(host_error(&reply.body, "El host no pudo guardar la contraseña."));
+    }
+    if let Some(library_id) = host_library_id(app) {
+        for key in [session_key(&library_id), data_key(&library_id)] {
+            if let Some((remembered, _)) = crate::config_vault::remembered_credentials(app, &key) {
+                let _ = crate::config_vault::remember_credentials(app, &key, &remembered, new);
+            }
         }
     }
     end_session(app);
     let _ = open_session(app, username.trim(), new).await;
-    auth_status(app).await
-}
-
-pub(crate) async fn auth_logout(app: &AppHandle, library_id: Option<&str>) -> Result<Value, BackendError> {
-    let _ = request_json(app, Method::POST, "/api/auth/logout", Some(&json!({})), SHORT_TIMEOUT).await;
-    if let Some(library_id) = library_id {
-        crate::config_vault::forget_credentials(app, &session_key(library_id));
-    }
-    end_session(app);
-    auth_status(app).await
+    Ok(())
 }
 
 // ---------- «Probar conexión» ----------
@@ -890,9 +762,8 @@ pub(crate) async fn probe_within(app: &AppHandle, address: &HostAddress, pin: Op
     }
     pin_seen(app, &http);
     let library = body.get("library").and_then(Value::as_str).map(str::to_owned);
-    if crate::connection::client_host(app).is_some_and(|(saved, _, _)| saved == *address) {
-        let platform = body.get("platform").and_then(Value::as_str).map(str::to_owned);
-        with_link(app, |link| link.platform = platform);
+    if crate::connection::client_host(app).is_some_and(|(saved, _)| saved == *address) {
+        note_host(app, &body);
         set_state(app, LinkState::Online, Some(library.clone()), None);
     }
     HostProbe { ok: true, library, latency_ms, message: None }
@@ -903,11 +774,10 @@ pub(crate) async fn probe_within(app: &AppHandle, address: &HostAddress, pin: Op
 fn monitor(app: AppHandle, generation: u64) {
     while current_generation(&app) == generation {
         let online = crate::host::async_runtime::block_on(check_health(&app));
-        announce_move(&app);
-        if online && with_link(&app, |link| link.session.is_some()).unwrap_or(false) {
-            start_events(&app);
-            // The copy follows the host while there is connection, on its
-            // own thread: the checks go on during a long sync.
+        crate::device_role::host_checked(&app);
+        // The copy follows the host while there is connection, on its own
+        // thread: the checks go on during a long sync.
+        if online && crate::host::async_runtime::block_on(ensure_session(&app)).unwrap_or(false) {
             crate::host_mirror::sync_in_background(&app);
         }
         let wait = if online { MONITOR_ONLINE_INTERVAL } else { MONITOR_OFFLINE_INTERVAL };
@@ -918,11 +788,20 @@ fn monitor(app: AppHandle, generation: u64) {
     }
 }
 
+/// What the host says about itself: its system and how much it processes,
+/// for deciding which computer runs the library's services.
+fn note_host(app: &AppHandle, body: &Value) {
+    let platform = body.get("platform").and_then(Value::as_str).map(str::to_owned);
+    with_link(app, |link| link.platform = platform);
+    if let Some(power) = body.get("device").and_then(|device| serde_json::from_value::<DevicePower>(device.clone()).ok()) {
+        crate::device_role::note_host(app, power);
+    }
+}
+
 async fn check_health(app: &AppHandle) -> bool {
     match request_json(app, Method::GET, "/api/health", None, HEALTH_TIMEOUT).await {
         Ok(reply) if reply.status == 200 => {
-            let platform = reply.body.get("platform").and_then(Value::as_str).map(str::to_owned);
-            with_link(app, |link| link.platform = platform);
+            note_host(app, &reply.body);
             remember_library(app, &reply.body, "libraryId", "library");
             set_state(app, LinkState::Online, None, None);
             true
@@ -932,125 +811,6 @@ async fn check_health(app: &AppHandle) -> bool {
             false
         }
         Err(_) => false,
-    }
-}
-
-// ---------- Events of the host ----------
-
-type EventSocket = tungstenite::WebSocket<StreamOwned<ClientConnection, TcpStream>>;
-
-fn start_events(app: &AppHandle) {
-    let Some(state) = state(app) else {
-        return;
-    };
-    if state.events_running.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let generation = current_generation(app);
-    let app = app.clone();
-    let spawned = std::thread::Builder::new().name("notia-host-events".into()).spawn(move || {
-        relay_events(&app, generation);
-        if let Some(state) = self::state(&app) {
-            state.events_running.store(false, Ordering::SeqCst);
-        }
-    });
-    if spawned.is_err() {
-        state.events_running.store(false, Ordering::SeqCst);
-    }
-}
-
-/// Emits here every event of the host while this device has a session.
-/// A reconnection asks for what it missed (`since`).
-fn relay_events(app: &AppHandle, generation: u64) {
-    let mut since = 0_u64;
-    while current_generation(app) == generation {
-        let Some(session) = with_link(app, |link| link.session.clone()).flatten() else {
-            return;
-        };
-        let Some((address, _, pin)) = crate::connection::client_host(app) else {
-            return;
-        };
-        match open_events(&address, pin, &session, since) {
-            Ok(mut socket) => read_events(app, generation, &session, &mut socket, &mut since),
-            Err(EventsError::SignedOut) => match crate::host::async_runtime::block_on(renew_session(app)) {
-                Ok(()) => {}
-                Err(error) if host_refused(&error) => {
-                    end_session(app);
-                    return;
-                }
-                // The host went away between the two requests: try again later.
-                Err(_) => std::thread::sleep(EVENTS_RETRY),
-            },
-            Err(EventsError::Failed) => std::thread::sleep(EVENTS_RETRY),
-        }
-    }
-}
-
-enum EventsError {
-    SignedOut,
-    Failed,
-}
-
-fn open_events(address: &HostAddress, pin: Option<String>, session: &str, since: u64) -> Result<EventSocket, EventsError> {
-    let socket_address = (address.host.as_str(), address.port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addresses| addresses.next())
-        .ok_or(EventsError::Failed)?;
-    let stream = TcpStream::connect_timeout(&socket_address, CONNECT_TIMEOUT).map_err(|_| EventsError::Failed)?;
-    let _ = stream.set_read_timeout(Some(SHORT_TIMEOUT));
-    let config = tls_config(pin, Arc::new(Mutex::new(None))).map_err(|_| EventsError::Failed)?;
-    let server_name = ServerName::try_from(address.host.clone()).map_err(|_| EventsError::Failed)?;
-    let connection = ClientConnection::new(Arc::new(config), server_name).map_err(|_| EventsError::Failed)?;
-    let query = if since > 0 { format!("?since={since}") } else { String::new() };
-    let mut request = format!("wss://{}/api/events{query}", address.display())
-        .into_client_request()
-        .map_err(|_| EventsError::Failed)?;
-    let headers = request.headers_mut();
-    headers.insert("Cookie", format!("{SESSION_COOKIE}={session}").parse().map_err(|_| EventsError::Failed)?);
-    headers.insert("Origin", address.base_url().parse().map_err(|_| EventsError::Failed)?);
-    let config = tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(MAX_EVENT_MESSAGE_BYTES),
-        max_frame_size: Some(MAX_EVENT_MESSAGE_BYTES),
-        ..Default::default()
-    };
-    match tungstenite::client::client_with_config(request, StreamOwned::new(connection, stream), Some(config)) {
-        Ok((socket, _)) => {
-            let _ = socket.get_ref().sock.set_read_timeout(Some(EVENTS_READ_TIMEOUT));
-            Ok(socket)
-        }
-        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) if response.status() == 401 => {
-            Err(EventsError::SignedOut)
-        }
-        Err(_) => Err(EventsError::Failed),
-    }
-}
-
-fn read_events(app: &AppHandle, generation: u64, session: &str, socket: &mut EventSocket, since: &mut u64) {
-    loop {
-        let same_session = with_link(app, |link| link.session.as_deref() == Some(session)).unwrap_or(false);
-        if current_generation(app) != generation || !same_session {
-            let _ = socket.close(None);
-            return;
-        }
-        match socket.read() {
-            Ok(Message::Text(text)) => {
-                let Ok(message) = serde_json::from_str::<Value>(&text) else {
-                    continue;
-                };
-                if let Some(seq) = message.get("seq").and_then(Value::as_u64) {
-                    *since = (*since).max(seq);
-                }
-                if let Some(event) = message.get("event").and_then(Value::as_str) {
-                    let payload = message.get("payload").cloned().unwrap_or(Value::Null);
-                    let _ = app.emit(event, payload);
-                }
-            }
-            Ok(Message::Close(_)) => return,
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(error)) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(_) => return,
-        }
     }
 }
 
@@ -1085,31 +845,7 @@ mod tests {
         crate::services::telegram_service::set_client_device(true);
         let refused = crate::host::async_runtime::block_on(crate::services::telegram_service::check_bot("1:abc"));
         crate::services::telegram_service::set_client_device(false);
-        assert!(refused.is_err_and(|message| message.contains("modo cliente")));
-    }
-
-    #[test]
-    fn the_window_moves_to_the_copy_after_a_while_or_a_failed_command_and_back_once_the_host_is_stable() {
-        let ready = || true;
-        let offline = |seconds: u64| LinkTiming { offline_for: Some(Duration::from_secs(seconds)), ..LinkTiming::default() };
-        let online = |seconds: u64| LinkTiming { online_for: Some(Duration::from_secs(seconds)), ..LinkTiming::default() };
-        let away = offline(MOVE_TO_COPY_AFTER.as_secs());
-        assert_eq!(window_move(LinkState::Offline, offline(3), false, ready), None, "a short drop");
-        assert_eq!(window_move(LinkState::Offline, away, false, ready), Some(WindowMove::Copy));
-        assert_eq!(window_move(LinkState::Offline, away, false, || false), None, "no copy to open");
-        assert_eq!(window_move(LinkState::Offline, away, true, ready), None, "already on the copy");
-        // A command the person saw fail: to the copy now, even if the
-        // health checks still pass now and then.
-        let failed = LinkTiming { command_failed: true, ..online(60) };
-        assert_eq!(window_move(LinkState::Online, failed, false, ready), Some(WindowMove::Copy));
-        assert_eq!(window_move(LinkState::Offline, LinkTiming { command_failed: true, ..offline(1) }, false, ready), Some(WindowMove::Copy));
-        assert_eq!(window_move(LinkState::Online, failed, false, || false), None, "no copy to open");
-        // Back only after the host answers for a while.
-        assert_eq!(window_move(LinkState::Online, online(3), true, ready), None, "the host just came back");
-        assert_eq!(window_move(LinkState::Online, online(RETURN_TO_HOST_AFTER.as_secs()), true, ready), Some(WindowMove::Host));
-        assert_eq!(window_move(LinkState::Online, LinkTiming { command_failed: true, ..online(60) }, true, ready), Some(WindowMove::Host));
-        assert_eq!(window_move(LinkState::Online, online(60), false, ready), None);
-        assert_eq!(window_move(LinkState::Unknown, LinkTiming::default(), false, ready), None);
+        assert!(refused.is_err_and(|message| message.contains("no atiende Telegram")));
     }
 
     #[test]
@@ -1128,34 +864,18 @@ mod tests {
         assert!(pinned.verify_server_cert(&other, &[], &name, &[], UnixTime::now()).is_err());
     }
 
-    /// Records what the application of the client emits.
-    #[derive(Default)]
-    struct Recorder(Mutex<Vec<(String, Value)>>);
-
-    impl crate::host::EventSink for Recorder {
-        fn emit(&self, event: &str, payload: Value) -> Result<(), String> {
-            self.0.lock().expect("events").push((event.to_string(), payload));
-            Ok(())
-        }
-    }
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     #[test]
-    fn a_client_signs_in_runs_commands_and_receives_the_events_of_its_host() {
-        use crate::backend::connection::{ClientKind, ConnectionSettings, RunMode};
+    fn a_client_signs_in_with_its_host_and_cannot_change_what_only_the_host_decides() {
+        use crate::backend::connection::{ConnectionSettings, RunMode};
         use crate::host::{AppPaths, HostPorts};
 
         let root = std::env::temp_dir().join(format!("notia-host-link-{}", uuid::Uuid::new_v4()));
         let (host, port, stop, library_id) = test_host::start(&root);
 
-        let recorder = Arc::new(Recorder::default());
-        let client = crate::create_app(
-            AppPaths::new(Some(root.join("client")), None),
-            HostPorts { events: Some(recorder.clone()), ..HostPorts::default() },
-        );
+        let client = crate::create_app(AppPaths::new(Some(root.join("client")), None), HostPorts::default());
         let settings = ConnectionSettings {
             mode: RunMode::Client,
-            client_kind: ClientKind::Remote,
             host_address: format!("127.0.0.1:{port}"),
             ..ConnectionSettings::default()
         };
@@ -1166,21 +886,22 @@ mod tests {
             assert_eq!((status["state"].as_str(), status["libraryName"].as_str()), (Some("locked"), Some("Biblioteca")));
             // The certificate seen first is pinned.
             assert!(crate::connection::settings(&client).host_certificate.is_some());
-            assert!(invoke(&client, "backend_library_catalog", json!({})).await.is_err());
+            assert!(call_host::<Value>(&client, "backend_library_catalog", json!({})).await.is_err());
 
             assert!(auth_login(&client, &library_id, "Owner", "otra", false, false).await.is_err());
             let status = auth_login(&client, &library_id, "Owner", "contraseña-1", false, false).await.expect("login");
             assert_eq!(served_library(&client), Some((library_id.clone(), "Biblioteca".to_string())));
             assert_eq!(status["state"], "unlocked");
-            let catalog = invoke(&client, "backend_library_catalog", json!({})).await.expect("catalog");
+            assert_eq!(session_credentials(&client).map(|(username, _, remembered)| (username, remembered)), Some(("Owner".to_string(), false)));
+            let catalog: Value = call_host(&client, "backend_library_catalog", json!({})).await.expect("catalog");
             assert_eq!(catalog["libraries"][0]["id"], library_id.as_str());
             // The host's libraries stay: a client cannot empty its catalog
             // nor drop the binding of its library.
             let empty = json!({ "catalog": { "libraries": [], "selectedLibraryId": null } });
-            let refused = invoke(&client, "backend_save_library_catalog", empty).await.expect_err("catalog");
-            assert_eq!(refused["code"], "forbidden");
-            assert!(invoke(&client, "revoke_library_binding", json!({ "libraryId": library_id })).await.is_err());
-            let kept = invoke(&client, "backend_library_catalog", json!({})).await.expect("catalog kept");
+            let refused = call_host::<Value>(&client, "backend_save_library_catalog", empty).await.expect_err("catalog");
+            assert_eq!(refused.code, BackendErrorCode::Forbidden);
+            assert!(call_host::<Value>(&client, "revoke_library_binding", json!({ "libraryId": library_id })).await.is_err());
+            let kept: Value = call_host(&client, "backend_library_catalog", json!({})).await.expect("catalog kept");
             assert_eq!(kept["libraries"][0]["id"], library_id.as_str());
             assert!(crate::library_catalog::selected_library(&host).is_some());
 
@@ -1189,51 +910,18 @@ mod tests {
                 "telegram": { "enabled": true, "botToken": "1:abc" },
                 "panelDesplegable": { "refreshIntervalMs": 45_000 },
             } } });
-            let written = invoke(&client, "backend_write_library_config", telegram_on).await.expect("write");
+            let written: Value = call_host(&client, "backend_write_library_config", telegram_on).await.expect("write");
             assert_eq!(written["ok"], true);
             let stored = crate::library_config::read_library_config(&host, &library_id).expect("read").expect("config");
             assert_eq!(stored["panelDesplegable"]["refreshIntervalMs"], 45_000);
             assert_ne!(stored["telegram"]["enabled"], true);
 
-            // A client keeps its meeting on its device: the host never shows
-            // one, but stores the note of a meeting the client recorded.
-            assert!(invoke(&client, "meeting_snapshot", json!({ "payload": {} })).await.is_err());
-            let note = json!({ "payload": {
-                "libraryId": library_id,
-                "folder": "",
-                "fileName": "Reunión de equipo.md",
-                "content": "# Reunión de equipo\n\nBuen día a todos.\n",
-            } });
-            let stored = invoke(&client, "meeting_store_note", note.clone()).await.expect("note");
-            assert_eq!(stored["logicalPath"], "Reunión de equipo.md");
-            // Over the note saved before while it did not change.
-            let mut again = note.clone();
-            again["payload"]["previous"] = json!({ "logicalPath": stored["logicalPath"], "revision": stored["revision"] });
-            again["payload"]["content"] = json!("# Reunión de equipo\n\nBuen día.\n");
-            let rewritten = invoke(&client, "meeting_store_note", again).await.expect("rewrite");
-            assert_eq!(rewritten["logicalPath"], stored["logicalPath"]);
-            // Without it, a second note gets a free name.
-            let second = invoke(&client, "meeting_store_note", note).await.expect("second");
-            assert_ne!(second["logicalPath"], stored["logicalPath"]);
-            let bad = json!({ "payload": { "libraryId": library_id, "folder": "../x", "fileName": "a.md", "content": "x" } });
-            assert!(invoke(&client, "meeting_store_note", bad).await.is_err());
+            // The sign-in of the copy asks the host when its own check fails.
+            assert!(!host_accepts(&client, "Owner", "otra").await);
+            assert!(host_accepts(&client, "Owner", "contraseña-1").await);
+            sign_out(&client);
+            assert!(!link_view(&client).signed_in && session_credentials(&client).is_none());
         });
-
-        // What only works on the device running Notia is not offered.
-        let refused = crate::registry::dispatch_app_invoke(&client, "main", &json!({ "command": "library_pick_directory" }));
-        assert!(matches!(refused, Dispatch::Ready(Err(error)) if error["code"] == "unsupported"));
-
-        // Events of the host reach the client's interface.
-        let _ = host.emit("notia:prueba", json!({ "ok": true }));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let received = loop {
-            let received = recorder.0.lock().expect("events").iter().any(|(event, payload)| event == "notia:prueba" && payload["ok"] == true);
-            if received || Instant::now() > deadline {
-                break received;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        assert!(received, "the event of the host did not arrive");
 
         stop.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&root);

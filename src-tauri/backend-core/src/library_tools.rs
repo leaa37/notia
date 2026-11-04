@@ -81,6 +81,47 @@ impl LogicalPathDto {
     }
 }
 
+/// The logical path of a document the workspace names by another form of
+/// its path: with backslashes, a leading slash or the library's folder in
+/// front (`C:\…\gaia\Notas\x.md`, also as `\\?\C:\…`). `None` when it is
+/// not a path inside the library.
+pub fn workspace_logical_path(path: &str, library_root: Option<&str>) -> Option<LogicalPathDto> {
+    if let Ok(logical) = LogicalPathDto::new(path) {
+        return Some(logical);
+    }
+    let without_verbatim = |value: &str| value.trim().replace('\\', "/").trim_start_matches("//?/").to_string();
+    let slashed = without_verbatim(path);
+    let root = library_root.map(|root| without_verbatim(root).trim_end_matches('/').to_string()).filter(|root| !root.is_empty());
+    let relative = match root {
+        Some(root) => {
+            let prefix = format!("{root}/");
+            match slashed.get(..prefix.len()) {
+                Some(start) if start.eq_ignore_ascii_case(&prefix) => slashed[prefix.len()..].to_string(),
+                _ => slashed,
+            }
+        }
+        None => slashed,
+    };
+    LogicalPathDto::new(relative.trim_start_matches("./").trim_start_matches('/')).ok()
+}
+
+/// The content a whole-document replacement writes, and what happened to
+/// the document's frontmatter: `kept` when the new content brings none
+/// (its context, tags and links stay, only the body changes), `replaced`
+/// when it brings its own, `none` when the document had none.
+pub fn replacement_content(previous: &str, next: &str) -> (String, &'static str) {
+    let next_body = crate::prompt::strip_frontmatter(next);
+    if next_body.len() != next.trim_start_matches('\u{feff}').len() {
+        return (next.to_string(), "replaced");
+    }
+    let previous_body = crate::prompt::strip_frontmatter(previous);
+    let frontmatter = previous[..previous.len() - previous_body.len()].trim_start_matches('\u{feff}');
+    if frontmatter.is_empty() {
+        return (next.to_string(), "none");
+    }
+    (format!("{frontmatter}{}", next.trim_start_matches(['\r', '\n'])), "kept")
+}
+
 /// Names Windows refuses for a file or folder, even with an extension.
 const RESERVED_DEVICE_NAMES: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -1941,6 +1982,31 @@ fn revision_conflict(operation_id: &str, expected: u64, current: u64) -> Backend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workspace_path_in_another_form_becomes_the_logical_path() {
+        let root = Some(r"C:\Users\gabmi\Documents\notia\gaia");
+        let logical = |path: &str| workspace_logical_path(path, root).map(|path| path.as_str().to_string());
+        assert_eq!(logical("Notas/Plan.md").as_deref(), Some("Notas/Plan.md"));
+        assert_eq!(logical(r"Notas\Plan.md").as_deref(), Some("Notas/Plan.md"));
+        assert_eq!(logical("/Notas/Plan.md").as_deref(), Some("Notas/Plan.md"));
+        assert_eq!(logical(r"C:\Users\gabmi\Documents\notia\gaia\Notas\Plan.md").as_deref(), Some("Notas/Plan.md"));
+        assert_eq!(logical(r"c:\users\gabmi\documents\notia\gaia\Notas\Plan.md").as_deref(), Some("Notas/Plan.md"));
+        assert_eq!(workspace_logical_path(r"Notas\Plan.md", Some(r"\\?\C:\Users\gabmi\Documents\notia\gaia")).map(|path| path.as_str().to_string()).as_deref(), Some("Notas/Plan.md"));
+        assert_eq!(logical(r"D:\Otra\Plan.md"), None, "outside the library");
+        assert_eq!(logical("content://com.android.externalstorage.documents/tree/x"), None);
+    }
+
+    #[test]
+    fn a_whole_replacement_keeps_the_frontmatter_unless_it_brings_one() {
+        let previous = "---\ncontexto: \"#Confidencial\"\ntags: [plan]\n---\n# Viejo\n";
+        assert_eq!(
+            replacement_content(previous, "# Nuevo\n"),
+            ("---\ncontexto: \"#Confidencial\"\ntags: [plan]\n---\n# Nuevo\n".to_string(), "kept")
+        );
+        assert_eq!(replacement_content(previous, "---\ntags: []\n---\n# Nuevo\n"), ("---\ntags: []\n---\n# Nuevo\n".to_string(), "replaced"));
+        assert_eq!(replacement_content("# Viejo\n", "# Nuevo\n"), ("# Nuevo\n".to_string(), "none"));
+    }
 
     #[test]
     fn revisions_survive_a_float_round_trip() {

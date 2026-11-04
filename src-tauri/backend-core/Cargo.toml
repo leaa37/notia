@@ -21,6 +21,8 @@ png = "0.18"
 # AI actions: schedules in the library's IANA time zone (bundled tzdb on
 # Windows, the system's on Android and Linux).
 jiff = "0.2"
+# Webhook: the tokens of its actions are stored as SHA-256.
+sha2 = "0.10"
 
 [dev-dependencies]
 lopdf = "0.45"

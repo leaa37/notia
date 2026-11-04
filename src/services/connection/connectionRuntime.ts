@@ -2,12 +2,13 @@ import { callBackend } from '../transport'
 
 /**
  * «Modo de ejecución» of this device (`connection.rs`): Host serves its
- * library to clients; Client uses the library of a host. The backend
- * stores and applies the mode, starts the server or the link with the
- * host, and reports how they are. The interface only shows it.
+ * library to the devices that sync with it; Client works on its copy of a
+ * host's library and syncs it whenever the host answers. The backend
+ * stores and applies the mode, decides where the window opens and which
+ * computer runs the library's services, and reports how the sync is. The
+ * interface only shows it.
  */
 export type RunMode = 'host' | 'client'
-export type ClientKind = 'copy' | 'remote'
 export type HostLinkState = 'unknown' | 'online' | 'offline'
 
 export interface HostServerStatus {
@@ -22,16 +23,12 @@ export interface HostLink {
   library: string | null
   /** Operating system of the host. */
   platform: string | null
+  /** The host accepts the Owner's session: the copy syncs. */
   signedIn: boolean
   message: string | null
-  /**
-   * Where the backend says the window should go now: to the copy when the
-   * host stopped answering a while ago, back to the host when it answers.
-   */
-  moveTo: 'copy' | 'host' | null
 }
 
-/** Last sync of the copy a «Con copia» client keeps. */
+/** Last sync of the copy. */
 export interface CopyStatus {
   downloaded: number
   uploaded: number
@@ -45,50 +42,45 @@ export interface CopyStatus {
   error: string | null
 }
 
+/** How far the running sync went. */
+export interface CopyProgress {
+  done: number
+  total: number
+}
+
 export interface ConnectionView {
   mode: RunMode
-  clientKind: ClientKind
   hostAddress: string
-  /** Android has no server: it can only use its own library or a host's. */
+  /** Android has no server: it can only use its own library or sync with a host. */
   canHost: boolean
   server: HostServerStatus
   link: HostLink
-  /** Commands a client does not offer (they only work on the host). */
-  hostOnlyCommands: string[]
-  /** Whether this device can keep a copy to work offline. */
-  canKeepCopy: boolean
   /** Android: the copy lives in a folder the person chooses. */
   copyNeedsFolder: boolean
   /** Name of the chosen folder of the copy (Android). */
   copyFolder: string | null
-  /** The window works on the copy, without the host. */
-  offlineCopy: boolean
+  /** The copy is ready: the window opens on it. */
+  copyReady: boolean
   copy: CopyStatus | null
-  /** Notes are edited together with the other windows of the host. */
-  collaboration: boolean
-  /** Name of this device, shown to the others in a shared note. */
-  deviceName: string
-  /** The state of the link goes in a system notification (Android): the window shows no notice. */
+  progress: CopyProgress | null
+  /** This device runs Telegram, WhatsApp, the webhook and the other services of the library. */
+  runsServices: boolean
+  /** The state of the sync goes in a system notification (Android): the window shows no notice. */
   statusInNotification: boolean
-}
-
-export interface OfflineCopy {
-  libraryId: string
-  libraryName: string
 }
 
 export interface SavedConnection {
   connection: ConnectionView
-  /** The interface reloads: it reaches the backend another way now. */
+  /** The interface reloads: it opens another library. */
   reload: boolean
 }
 
 /** Where the window of a client opens (`client_open`). */
-export type ClientOpening = 'host' | 'copy' | 'offline'
+export type ClientOpening = 'copy' | 'first-sync'
 
 export interface OpenedClient {
   opening: ClientOpening
-  /** Why the host is not used, when it is not. */
+  /** Why the copy did not open, when it is ready but failed. */
   message: string | null
   connection: ConnectionView
 }
@@ -100,9 +92,6 @@ export interface HostProbe {
   message: string | null
 }
 
-/** Event of the backend when the host starts or stops answering, or the session ends. */
-export const HOST_LINK_EVENT = 'notia:host-link'
-
 /** Event of the backend after each sync of the copy. */
 export const COPY_SYNC_EVENT = 'notia:copy-sync'
 
@@ -112,7 +101,6 @@ export function fetchConnection(): Promise<ConnectionView> {
 
 export function saveConnection(input: {
   mode: RunMode
-  clientKind: ClientKind
   hostAddress: string
   trustNewCertificate?: boolean
 }): Promise<SavedConnection> {
@@ -125,8 +113,8 @@ export function testHostConnection(hostAddress?: string): Promise<HostProbe> {
 }
 
 /**
- * Opens the window of a client: the host when it answers; otherwise its
- * copy, at once when the copy is ready. The copy syncs in the background.
+ * Opens the window of a client: on its copy, at once, with or without the
+ * host. Without a copy yet, the window signs in with the host first.
  */
 export function openClient(): Promise<OpenedClient> {
   return callBackend<OpenedClient>('client_open')
@@ -135,16 +123,6 @@ export function openClient(): Promise<OpenedClient> {
 /** Android: picks the folder of the copy (empty, or an earlier copy). */
 export function pickCopyFolder(): Promise<ConnectionView> {
   return callBackend<ConnectionView>('pick_copy_folder')
-}
-
-/** Opens the copy as a library of this device while the host does not answer. */
-export function enterOfflineCopy(): Promise<OfflineCopy> {
-  return callBackend<OfflineCopy>('enter_offline_copy')
-}
-
-/** Back to the host; the next sync reconciles what changed meanwhile. */
-export function leaveOfflineCopy(): Promise<void> {
-  return callBackend<void>('leave_offline_copy')
 }
 
 /** Syncs the copy now (the last change of each file and each row wins). */

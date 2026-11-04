@@ -1,4 +1,4 @@
-use super::prompts::{executor_request, parse_plan, parse_review, phase_guidance, review_request, step_unfinished};
+use super::prompts::{executor_request, parse_plan, parse_review, phase_guidance, review_request, step_unfinished, step_without_report};
 use super::tools::{list_view, new_task, resolve_task};
 use super::workflow::workflow_mermaid;
 use super::*;
@@ -14,16 +14,21 @@ fn done(task: &mut AiTask, index: usize, report: &str) {
 
 #[test]
 fn the_plan_is_read_from_numbered_lines_or_bullets() {
-    let steps = parse_plan("PASOS:\n1. Leer el índice — abrir Cursos/Indice.md\n2) **Reordenar** las etapas: mover la etapa 4\n3. Encadenar\n\nListo.").expect("plan");
+    let steps = parse_plan("PASOS:\n1. Leer el índice — abrir Cursos/Indice.md\n2) **Reordenar** las etapas: mover la etapa 4\n3. Encadenar\n\nListo.", "");
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0], PlannedStep { title: "Leer el índice".into(), detail: "abrir Cursos/Indice.md".into() });
     assert_eq!(steps[1], PlannedStep { title: "Reordenar las etapas".into(), detail: "mover la etapa 4".into() });
     assert_eq!(steps[2].detail, "");
-    let bullets = parse_plan("- Buscar - en la biblioteca\n- Escribir").expect("bullets");
+    let bullets = parse_plan("- Buscar - en la biblioteca\n- Escribir", "");
     assert_eq!(bullets.len(), 2);
-    assert!(parse_plan("No sé cómo hacerlo.").is_err());
+    // A planner without steps does not fail the task: the goal's own steps,
+    // or the whole goal as one step.
+    let written = parse_plan("No sé cómo hacerlo.", "Trámite:\n1. Pedir la clave\n2. Avisar");
+    assert_eq!(written.iter().map(|step| step.title.as_str()).collect::<Vec<_>>(), ["Pedir la clave", "Avisar"]);
+    let whole = parse_plan("", "Recuperar la contraseña de Swiss Medical.");
+    assert_eq!(whole, vec![PlannedStep { title: "Cumplir el objetivo".into(), detail: "Recuperar la contraseña de Swiss Medical.".into() }]);
     let many = (1..=40).map(|index| format!("{index}. Paso {index}")).collect::<Vec<_>>().join("\n");
-    assert_eq!(parse_plan(&many).expect("many").len(), MAX_STEPS);
+    assert_eq!(parse_plan(&many, "").len(), MAX_STEPS);
 }
 
 #[test]
@@ -48,7 +53,7 @@ fn the_review_verdict_steps_and_result_are_read() {
 fn the_task_plans_runs_each_step_and_reviews_until_approved() {
     let mut task = task();
     assert_eq!(task.next_work(), NextWork::Plan);
-    task.set_plan(parse_plan("1. A\n2. B").expect("plan"));
+    task.set_plan(parse_plan("1. A\n2. B", ""));
     assert_eq!(task.steps.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), ["s1", "s2"]);
     assert_eq!(task.next_work(), NextWork::Execute(0));
     done(&mut task, 0, "Hice A.");
@@ -75,6 +80,31 @@ fn the_task_plans_runs_each_step_and_reviews_until_approved() {
 }
 
 #[test]
+fn a_corrected_goal_keeps_the_steps_done_and_plans_what_is_missing() {
+    let mut task = task();
+    task.set_plan(parse_plan("1. A\n2. B\n3. C", ""));
+    done(&mut task, 0, "Hice A.");
+    task.steps[1].status = StepStatus::Waiting;
+    task.status = AiTaskStatus::Waiting;
+    task.apply_review(parse_review("VEREDICTO: aprobada"), 1);
+    task.replan(Some("Nuevo objetivo con la URL."), false);
+    assert_eq!((task.goal.as_str(), task.status, task.steps.len()), ("Nuevo objetivo con la URL.", AiTaskStatus::Planning, 1));
+    assert_eq!(task.next_work(), NextWork::Plan);
+    let request = super::prompts::planner_request(&task);
+    assert!(request.contains("Nuevo objetivo con la URL.") && request.contains("Hice A.") && request.contains("solo los pasos que faltan"), "{request}");
+    task.set_plan(parse_plan("1. D", ""));
+    assert_eq!(task.steps.iter().map(|step| (step.id.as_str(), step.round)).collect::<Vec<_>>(), [("s1", 0), ("s2", 1)]);
+    assert_eq!(task.next_work(), NextWork::Execute(1));
+    done(&mut task, 1, "Hice D.");
+    assert_eq!(task.next_work(), NextWork::Review, "the old approval does not cover the new steps");
+
+    task.replan(None, true);
+    assert!(task.steps.is_empty() && task.reviews.is_empty() && !task.replan);
+    assert_eq!(task.goal, "Nuevo objetivo con la URL.");
+    assert!(super::prompts::planner_request(&task).contains("Armá el plan de pasos"));
+}
+
+#[test]
 fn a_rework_without_steps_adds_one_and_too_many_reworks_stop() {
     let mut task = task();
     task.set_plan(vec![PlannedStep { title: "A".into(), detail: String::new() }]);
@@ -94,7 +124,7 @@ fn a_rework_without_steps_adds_one_and_too_many_reworks_stop() {
 fn the_workflow_draws_every_phase_with_its_state() {
     let mut task = task();
     assert!(workflow_mermaid(&task).contains("class plan running"));
-    task.set_plan(parse_plan("1. Leer \"índice\"\n2. B").expect("plan"));
+    task.set_plan(parse_plan("1. Leer \"índice\"\n2. B", ""));
     task.status = AiTaskStatus::Running;
     task.phase = Some(AiTaskPhase::Executor);
     done(&mut task, 0, "ok");
@@ -135,6 +165,8 @@ fn each_phase_gets_its_format_and_reports_are_read() {
     assert!(phase_guidance(AiTaskPhase::Executor).contains("NO TERMINADO:"));
     assert!(step_unfinished("**NO TERMINADO:** falta el permiso"));
     assert!(!step_unfinished("Terminé el paso."));
+    assert!(step_without_report("El modelo no redactó la respuesta final, pero trabajé en el pedido: 2 acciones con herramientas."));
+    assert!(!step_without_report("Informe: concilié 14 movimientos."));
     assert_eq!(AiTaskStatus::from_id("awaiting-approval"), Some(AiTaskStatus::AwaitingApproval));
     assert!(AiTaskPhase::ALL.iter().all(|phase| phase.default_prompt().starts_with('#')));
 }
@@ -186,6 +218,17 @@ fn a_wait_is_read_from_the_tool_and_refuses_what_cannot_wait() {
     let mail = wait_request(&json!({ "reason": "Respuesta de soporte", "kind": "mail", "threadId": "t-9" }), "s2", &accounts, &zone(), now).expect("mail");
     assert_eq!(mail.wait_for, WaitFor::Mail { account: "yo@gmail.com".into(), thread_id: Some("t-9".into()), query: None });
     assert_eq!((mail.wake_at_ms, mail.deadline_ms), (now + MAIL_POLL_MS, now + 72 * 3_600_000));
+    let whatsapp = wait_request(&serde_json::json!({ "reason": "Respuesta de Movistar", "kind": "whatsapp", "chat": "Movistar" }), "s1", &[], &zone(), now).expect("whatsapp");
+    assert_eq!(whatsapp.wait_for, WaitFor::WhatsApp { chat: "Movistar".into(), name: String::new(), since_ms: now });
+    assert_eq!(whatsapp.wake_at_ms, now + super::waits::WHATSAPP_POLL_MS);
+    assert_eq!(super::waits::poll_ms(&whatsapp.wait_for), 60_000);
+    // A message that arrives makes the adapter look before the next poll.
+    assert_eq!(super::waits::due(&whatsapp, &zone(), now + 1), super::waits::Due::LookAtWhatsApp);
+    assert_eq!(super::waits::due(&mail, &zone(), now + 1), super::waits::Due::NotYet);
+    assert!(wait_request(&serde_json::json!({ "reason": "x", "kind": "whatsapp" }), "s1", &[], &zone(), now).is_err());
+    let saved = serde_json::to_value(&whatsapp.wait_for).expect("json");
+    assert_eq!(saved["kind"], "whatsapp");
+    assert_eq!(saved["sinceMs"], now);
     let error = |arguments: serde_json::Value, accounts: &[String]| wait_request(&arguments, "s2", accounts, &zone(), now).expect_err("refused").message;
     assert!(error(json!({ "reason": "x", "kind": "mail" }), &accounts).contains("threadId"));
     assert!(error(json!({ "reason": "x", "kind": "mail", "query": "from:a" }), &[]).contains("No hay cuentas"));
@@ -211,7 +254,7 @@ fn a_waiting_step_wakes_with_what_happened_and_the_executor_reads_it() {
     use super::waits::{begin_wait, due, mail_note, new_messages, wait_request, wake, Due};
     use serde_json::json;
     let mut task = task();
-    task.set_plan(parse_plan("1. Pedir acceso a soporte\n2. Avisar").expect("plan"));
+    task.set_plan(parse_plan("1. Pedir acceso a soporte\n2. Avisar", ""));
     let now: i64 = 5_000_000;
     let wait = wait_request(&json!({ "reason": "Respuesta de soporte", "kind": "mail", "threadId": "t-9" }), "s1", &["yo@gmail.com".to_string()], &zone(), now).expect("wait");
     task.wait = Some(wait.clone());
@@ -278,7 +321,7 @@ fn the_panel_says_what_a_waiting_task_waits_for() {
     use super::waits::{begin_wait, wait_request};
     use serde_json::json;
     let mut task = task();
-    task.set_plan(parse_plan("1. Pedir acceso\n2. Avisar").expect("plan"));
+    task.set_plan(parse_plan("1. Pedir acceso\n2. Avisar", ""));
     let now = 1_000_000;
     task.wait = Some(wait_request(&json!({ "reason": "Respuesta de soporte", "kind": "check", "checkEveryMinutes": 120 }), "s1", &[], &zone(), now).expect("wait"));
     begin_wait(&mut task, 0, "Pedí el acceso.");

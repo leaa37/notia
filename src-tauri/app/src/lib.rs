@@ -33,10 +33,10 @@ mod routine_tools;
 mod agenda_tools;
 mod coldpass;
 mod secret_clipboard;
-mod collab;
 mod config_crypto;
 mod client_status;
 mod connection;
+mod device_role;
 mod host_client;
 mod host_mirror;
 mod host_sync;
@@ -55,6 +55,7 @@ mod app_auth;
 mod agent_history;
 mod agent_knowledge;
 mod agent_pending;
+mod agent_scripts;
 mod agent_workspace;
 mod ai_chat;
 mod ai_tasks;
@@ -89,6 +90,9 @@ mod meeting_media;
 mod home;
 mod terminal;
 mod browser;
+mod node_packages;
+mod webhooks;
+mod whatsapp;
 mod weather;
 mod image_generation;
 mod recent_documents;
@@ -174,6 +178,8 @@ pub fn create_app(paths: AppPaths, ports: HostPorts) -> AppContext {
     app.manage(task_manager_commands::TaskManagerBackendState::default());
     app.manage(backend_runtime::BackendRuntimeState::default());
     app.manage(browser::BrowserState::default());
+    app.manage(whatsapp::WhatsAppState::default());
+    app.manage(webhooks::WebhookState::default());
     app.manage(library_registry::LibraryBindingRegistry::default());
     app.manage(library_session::LibrarySessionState::default());
     app.manage(ai_chat::AiChatState::default());
@@ -192,9 +198,9 @@ pub fn create_app(paths: AppPaths, ports: HostPorts) -> AppContext {
     app.manage(backup::service::BackupState::default());
     app.manage(commands::remote_speech::RemoteSpeechState::default());
     app.manage(connection::ConnectionState::default());
+    app.manage(device_role::DeviceRoleState::default());
     app.manage(host_client::HostClientState::default());
     app.manage(host_mirror::MirrorState::default());
-    app.manage(collab::CollabState::default());
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     app.manage(host_server::HostServerState::default());
     app.manage(public_spaces::PublicSpacesState::default());
@@ -208,13 +214,6 @@ pub fn start_device_services(app: &AppContext) {
     connection::start(app);
 }
 
-/// A file of the host's library for the window of a client (the
-/// `notiahost` scheme): its type and bytes, or `None` when the host does
-/// not give it.
-pub async fn fetch_host_file(app: &AppContext, path: &str) -> Option<(String, Vec<u8>)> {
-    host_client::fetch_file(app, path).await
-}
-
 /// Startup hooks, in the order they must run. Each hook keeps the name of
 /// its native plugin so the host registers the Kotlin side under it.
 pub fn startup_hooks() -> Vec<TauriPlugin> {
@@ -222,6 +221,8 @@ pub fn startup_hooks() -> Vec<TauriPlugin> {
         library_registry::init(),
         backup::service::init(),
         telegram_worker::init(),
+        whatsapp::init(),
+        webhooks::init(),
         agent_autonomy::init(),
         ai_actions::init(),
         ai_task_runner::init(),

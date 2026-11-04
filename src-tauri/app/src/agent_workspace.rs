@@ -332,6 +332,9 @@ fn write_missing_lists(documents: &Documents<'_>) -> Result<Vec<&'static str>, B
             written.push(path);
         }
     }
+    if crate::agent_scripts::ensure_readme(documents)? {
+        written.push(crate::backend::agent_scripts::README_PATH);
+    }
     Ok(written)
 }
 
@@ -382,10 +385,10 @@ pub(crate) fn improvements(app: &AppHandle, library_id: &str) -> Result<Vec<Stri
     with_documents(app, library_id, |documents| read_improvements(documents).map(|(_, entries)| entries))
 }
 
-/// Creates `thoughts.md`, `biography.md`, `talk.md`, `people.md` and
-/// `improve.md` again when they are missing (deleted or never made). Unlike the session
-/// preparation, it looks at the files every time. Returns the paths it
-/// wrote.
+/// Creates `thoughts.md`, `biography.md`, `talk.md`, `people.md`,
+/// `improve.md` and the guide of `.agent/scripts` again when they are
+/// missing (deleted or never made). Unlike the session preparation, it
+/// looks at the files every time. Returns the paths it wrote.
 pub(crate) fn ensure_agent_list_files(app: &AppHandle, library_id: &str) -> Result<Vec<&'static str>, BackendError> {
     with_workspace_lock(app, || with_documents(app, library_id, write_missing_lists))
 }
@@ -572,19 +575,24 @@ fn append_memory_locked(app: &AppHandle, library_id: &str, value: &str) -> Resul
     })
 }
 
-fn append_thought_locked(app: &AppHandle, library_id: &str, stamped: &str) -> Result<Appended, BackendError> {
+/// Adds a dated thought. A full file drops its oldest thoughts down to the
+/// target size, so the new note is always kept; the organization after the
+/// save still merges and discards what no longer matters.
+fn append_thought_locked(app: &AppHandle, library_id: &str, stamped: &str) -> Result<bool, BackendError> {
     with_documents(app, library_id, |documents| {
         let (current, thoughts) = read_items(documents, workspace::THOUGHTS_PATH)?;
-        let next = workspace::with_thought(&thoughts, stamped.to_string());
+        let mut next = workspace::with_thought(&thoughts, stamped.to_string());
         if !workspace::THOUGHTS_LIMIT.fits(&next) {
-            return Ok(Appended::Full);
+            let (kept, dropped) = workspace::without_oldest(next, workspace::THOUGHTS_TARGET);
+            log::info!("[notia:memory] pensamientos llenos: se quitaron los {dropped} más antiguos");
+            next = kept;
         }
         documents.write(
             workspace::THOUGHTS_PATH,
             current.as_deref(),
             &workspace::with_system_context(&workspace::render_thoughts(&next)),
         )?;
-        Ok(Appended::Changed(true))
+        Ok(true)
     })
 }
 
@@ -675,12 +683,7 @@ pub(crate) fn append_agent_item(app: &AppHandle, library_id: &str, kind: AgentIt
                     workspace::MAX_THOUGHT_CHARS
                 ))
             })?;
-            append_bounded(
-                app,
-                || append_thought_locked(app, library_id, &stamped),
-                || crate::agent_knowledge::organize_now(app, library_id),
-                "Tus pensamientos están llenos y no se pudieron reorganizar. Probá de nuevo más tarde.",
-            )
+            with_workspace_lock(app, || append_thought_locked(app, library_id, &stamped))
         }
         AgentItem::Biography => {
             if value.chars().count() > workspace::MAX_BIOGRAPHY_NOTE_CHARS {

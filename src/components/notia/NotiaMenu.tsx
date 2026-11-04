@@ -403,11 +403,6 @@ function NotiaMenuComponent() {
     handleExternalTextDocumentChange,
   } = tabManager
 
-  // Another editor of a shared note saves it: this one only follows.
-  const handleSharedTextDocumentChange = useCallback((documentPath: string, source: string) => {
-    handleExternalTextDocumentChange(documentPath, source)
-  }, [handleExternalTextDocumentChange])
-
   const handleActiveMarkdownDocumentChanged = useCallback((documentPath: string, source: string, revision?: string) => {
     // The note already shows it (the agent's write was reloaded as it happened).
     const open = store.getState().documents.openTabs.find((tab) => tab.document.path === documentPath)
@@ -552,7 +547,6 @@ function NotiaMenuComponent() {
     libraryAdded: handleLibraryAdded,
     libraryRemoved: handleLibraryRemoved,
     textDocumentChange: handleTextDocumentChange,
-    sharedTextDocumentChange: handleSharedTextDocumentChange,
     chatWorkspaceTreeChanged: handleChatWorkspaceTreeChanged,
     windowAction: handleWindowAction,
     coldPassOpenCredentialModal: handleOpenColdPassCredentialModal,
@@ -586,7 +580,6 @@ function NotiaMenuComponent() {
     handleLibraryAdded,
     handleLibraryRemoved,
     handleTextDocumentChange,
-    handleSharedTextDocumentChange,
     handleChatWorkspaceTreeChanged,
     handleWindowAction,
     handleOpenColdPassCredentialModal,

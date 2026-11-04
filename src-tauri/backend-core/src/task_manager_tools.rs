@@ -322,6 +322,9 @@ pub struct TaskTicketListRequest {
     pub priorities: Vec<TaskPriority>,
     #[serde(default)]
     pub query: String,
+    /// Only tickets whose title starts with it (without case or accents).
+    #[serde(default)]
+    pub title_prefix: String,
     #[serde(default)]
     pub include_archived: bool,
     #[serde(default)]
@@ -1699,7 +1702,7 @@ impl TaskManagerReadPort for InMemoryTaskManager {
                 request.board_id.as_deref(),
             )?;
         }
-        let query = request.query.trim().to_lowercase();
+        let prefix = crate::text_search::fold(request.title_prefix.trim());
         let mut tickets = library
             .tickets
             .values()
@@ -1725,17 +1728,20 @@ impl TaskManagerReadPort for InMemoryTaskManager {
             })
             .filter(|ticket| request.include_archived || !ticket.summary.state.is_archived())
             .filter(|ticket| {
-                query.is_empty()
-                    || ticket.summary.title.to_lowercase().contains(&query)
-                    || ticket.content.to_lowercase().contains(&query)
+                prefix.is_empty()
+                    || crate::text_search::fold(ticket.summary.title.trim()).starts_with(&prefix)
             })
-            .map(|ticket| ticket.summary.clone())
             .collect::<Vec<_>>();
         tickets.sort_by(|left, right| {
-            left.summary_order_key()
-                .cmp(&right.summary_order_key())
-                .then_with(|| left.ticket_id.cmp(&right.ticket_id))
+            left.summary
+                .summary_order_key()
+                .cmp(&right.summary.summary_order_key())
+                .then_with(|| left.summary.ticket_id.cmp(&right.summary.ticket_id))
         });
+        let tickets = matching_tickets(tickets, &request.query)
+            .into_iter()
+            .map(|ticket| ticket.summary.clone())
+            .collect::<Vec<_>>();
         Ok(task_page(tickets, request.offset, request.limit))
     }
 
@@ -3775,6 +3781,20 @@ fn entity_revision(entity_type: &str, entity_id: &str, revision: u64) -> TaskEnt
         revision,
     }
 }
+/// The tickets that match `query` word by word (`text_search`), in their
+/// title, body or tags, without accents, connectors or plurals; a word also
+/// matches written together or apart («ApiSearch» finds «API Search»).
+/// When none has every word, the ones with the most come first.
+fn matching_tickets<'a>(tickets: Vec<&'a TaskTicketDto>, query: &str) -> Vec<&'a TaskTicketDto> {
+    let terms = crate::text_search::query_terms(query);
+    crate::text_search::rank(tickets, &terms, |ticket| {
+        let folded = crate::text_search::fold(&format!("{} {} {}", ticket.summary.title, ticket.content, ticket.tags.join(" ")));
+        let joined = folded.chars().filter(|character| character.is_alphanumeric()).collect::<String>();
+        format!("{folded} {joined}")
+    })
+    .items
+}
+
 fn task_page<T>(items: Vec<T>, offset: usize, requested_limit: usize) -> BoundedPage<T> {
     let total = items.len();
     let limit = requested_limit.clamp(1, MAX_TASK_RESULTS);
@@ -4955,6 +4975,45 @@ segundo");
     }
 
     #[test]
+    fn tickets_are_found_word_by_word_and_by_title_prefix() {
+        let (manager, context) = setup();
+        let mut cards = ticket("ticket-1", "Seguimiento: pagos de tarjetas", None);
+        cards.content = "Apagaron el circuito de cobro con tarjeta.".into();
+        manager.seed_ticket(cards).unwrap();
+        manager.seed_ticket(ticket("ticket-2", "Integrar ApiSearch", None)).unwrap();
+        manager.seed_ticket(ticket("ticket-3", "Revisar el seguimiento", None)).unwrap();
+        let find = |query: &str, title_prefix: &str| {
+            manager
+                .list_tickets(&TaskTicketListRequest {
+                    context: context.clone(),
+                    board_id: None,
+                    group_id: None,
+                    states: vec![],
+                    priorities: vec![],
+                    query: query.into(),
+                    title_prefix: title_prefix.into(),
+                    include_archived: false,
+                    offset: 0,
+                    limit: 10,
+                })
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|ticket| ticket.ticket_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find("pago de tarjetas apagado circuito", ""), ["ticket-1"]);
+        assert_eq!(find("API search", ""), ["ticket-2"]);
+        assert_eq!(find("apisearch", ""), ["ticket-2"]);
+        // No ticket has every word: the ones with the most come first.
+        assert_eq!(find("tarjeta circuito Remity", ""), ["ticket-1"]);
+        assert_eq!(find("", "seguimiento"), ["ticket-1"]);
+        let mut anywhere = find("seguimiento", "");
+        anywhere.sort();
+        assert_eq!(anywhere, ["ticket-1", "ticket-3"]);
+    }
+
+    #[test]
     fn list_and_search_results_are_bounded() {
         let (manager, context) = setup();
         for index in 0..(MAX_TASK_RESULTS + 5) {
@@ -4974,6 +5033,7 @@ segundo");
                 states: vec![],
                 priorities: vec![],
                 query: String::new(),
+                title_prefix: String::new(),
                 include_archived: true,
                 offset: 0,
                 limit: usize::MAX,

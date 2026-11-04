@@ -69,6 +69,24 @@ pub fn new_task(arguments: &Value) -> Result<NewTask, BackendError> {
     Ok(NewTask { title, goal })
 }
 
+/// A correction of `resume_ai_task`: a new goal and/or starting over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replan {
+    pub goal: Option<String>,
+    pub restart: bool,
+}
+
+/// The correction a `resume_ai_task` call asks for, or `None` when it only
+/// resumes.
+pub fn replan_request(arguments: &Value) -> Result<Option<Replan>, BackendError> {
+    let goal = text(arguments, "goal");
+    if goal.as_ref().is_some_and(|goal| goal.chars().count() > MAX_GOAL_CHARS) {
+        return Err(BackendError::invalid_input(format!("goal tiene más de {MAX_GOAL_CHARS} caracteres.")));
+    }
+    let restart = arguments.get("restart").and_then(Value::as_bool).unwrap_or(false);
+    Ok((goal.is_some() || restart).then_some(Replan { goal, restart }))
+}
+
 /// The extra instructions of `review_ai_task`.
 pub fn review_instructions(arguments: &Value) -> Option<String> {
     text(arguments, "instructions")
@@ -171,7 +189,22 @@ pub fn cancel_summary(task: &AiTask) -> String {
     format!("Cancelar la Tarea IA «{}» ({}).", task.title, task.status.label().to_lowercase())
 }
 
-pub fn resume_summary(task: &AiTask) -> String {
+pub fn resume_summary(task: &AiTask, replan: Option<&Replan>) -> String {
+    if let Some(replan) = replan {
+        let (done, _) = task.progress();
+        let title = &task.title;
+        let what = match (replan.restart, replan.goal.is_some()) {
+            (true, true) => format!("Reiniciar desde cero la Tarea IA «{title}» con el objetivo nuevo"),
+            (true, false) => format!("Reiniciar desde cero la Tarea IA «{title}» con el mismo objetivo"),
+            (false, _) if done > 0 => format!("Corregir el objetivo de la Tarea IA «{title}» y planificar lo que falta, conservando los {done} pasos hechos"),
+            (false, _) => format!("Corregir el objetivo de la Tarea IA «{title}» y volver a planificarla"),
+        };
+        let stop = if task.status.is_active() { " (se detiene lo que está haciendo ahora)" } else { "" };
+        return match replan.goal.as_deref() {
+            Some(goal) => format!("{what}{stop}.\n\nObjetivo nuevo:\n{}", clipped(goal, 1_500)),
+            None => format!("{what}{stop}."),
+        };
+    }
     if let (AiTaskStatus::Waiting, Some(wait)) = (task.status, task.wait.as_ref()) {
         return format!("Seguir la Tarea IA «{}» sin esperar más «{}».", task.title, wait.reason);
     }
@@ -190,12 +223,16 @@ pub fn delete_summary(task: &AiTask) -> String {
     format!("Borrar la Tarea IA «{}» y su historial.", task.title)
 }
 
-/// Why a task cannot be resumed, reviewed or cancelled now.
-pub fn check_resumable(task: &AiTask) -> Result<(), BackendError> {
-    if task.status.is_resumable() {
+/// Why a task cannot be resumed, reviewed or cancelled now. A correction
+/// (`goal` or `restart`) applies in any state: a task at work stops first.
+pub fn check_resumable(task: &AiTask, replan: Option<&Replan>) -> Result<(), BackendError> {
+    if replan.is_some() || task.status.is_resumable() {
         Ok(())
     } else {
-        Err(BackendError::invalid_input(format!("La tarea está {}: solo se reanuda una tarea fallida, cancelada, interrumpida o que espera.", task.status.label().to_lowercase())))
+        Err(BackendError::invalid_input(format!(
+            "La tarea está {}: solo se reanuda tal cual una tarea fallida, cancelada, interrumpida o que espera. Para corregir su objetivo pasá goal (o restart para empezarla de nuevo), en cualquier estado.",
+            task.status.label().to_lowercase()
+        )))
     }
 }
 

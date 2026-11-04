@@ -370,6 +370,9 @@ fn health(server: &ApiServer) -> Vec<u8> {
             "platform": std::env::consts::OS,
             "libraryId": library.as_ref().map(|library| library.id.clone()),
             "library": library.map(|library| library.name),
+            // How much this computer processes: a computer that syncs with
+            // it decides with it which one runs the library's services.
+            "device": crate::device_role::local_power(&server.app),
         }),
     )
 }
@@ -458,9 +461,7 @@ fn invoke(body: &[u8], server: &ApiServer) -> Vec<u8> {
         return error_body("400 Bad Request", "Solicitud inválida.");
     };
     let command = request.get("command").and_then(Value::as_str).unwrap_or_default();
-    // A host also keeps the meeting its clients record on their devices.
-    let host_client = server.kind == ServerKind::Host && crate::registry::is_host_client_command(command);
-    if !is_remote_command(command) && !host_client {
+    if !is_remote_command(command) {
         return error_body("403 Forbidden", "Esta operación solo está disponible en el equipo que ejecuta Notia.");
     }
     // The clients of a host act with their own label: some settings belong

@@ -180,7 +180,7 @@ interface BackendTransport {
 
 ### Protocolo del servidor headless
 
-El mismo protocolo sirve al modo Host de la ventana (ver «Modo Host y Cliente (2026-09-28)»).
+El mismo protocolo sirve al modo Host de la ventana (ver «Modo Host y Cliente: sincronización entre dispositivos»).
 
 Todas las respuestas llevan `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` y `Connection: close`. Las páginas HTML de la interfaz llevan además `Content-Security-Policy`. Todo `POST` exige `Origin: https://<host>`.
 
@@ -287,8 +287,7 @@ Llegan por `subscribeBackend`: en la ventana por el `emit` de Tauri y en el nave
 | `notia://telegram-library-changed` | `telegram_worker.rs` | `useTelegramLibraryChanges` |
 | `speech://state`, `speech://partial`, `speech://segments` | `services/speech_service.rs` | `speechService` |
 | `notia:events-lost` | `server/events.rs` (servidor headless o Host, al reconectar) | `RemoteApp` (aviso con «Recargar») |
-| `notia:host-link`, `notia:copy-sync` | `host_client.rs`, `host_mirror.rs` (cliente) | `ClientApp` |
-| `notia:collab-update`, `notia:collab-awareness`, `notia:collab-peers` | `collab.rs` | `markdownCollab.ts` |
+| `notia:host-link`, `notia:copy-sync` | `host_client.rs`, `host_mirror.rs` (cliente) | `ClientApp` (pantalla «Copiando la biblioteca») |
 | `notia:request-app-exit` | Bandeja de Windows (host Tauri, no el backend) | `services/window` |
 
 ### Seguridad del servidor y de la carpeta de datos
@@ -6259,10 +6258,17 @@ Al cambiar de módulo, `NotiaWorkspace` desmonta `MeetingView`, pero la sesión 
 2. `useFollowMeetingSession` (lo usan `MeetingView` y el botón Grabar de Inicio) llama a `voice.attach(meetingId)` mientras la reunión esté `live` o `processing` y el hook esté `idle`; el id de la reunión es el de su sesión de voz. El hook adopta el `sessionId`, así que vuelve a aceptar sus eventos, y pide `speech_session_state`. `attach` resuelve `true` si sigue la sesión. Si ya la seguía (un error descartado con la X deja el hook en `idle` con la sesión), vuelve a leer su estado; si sigue otra, resuelve `false` sin tocarla.
 3. Rust responde con la posición de la grabación sin pausas (`CaptureMeter`) y el estado (`recording` o `paused`). Durante la separación de hablantes, `stop_platform_session` guarda el id en `finalizing_session`, así que responde `finalizing` y el progreso llega con el siguiente evento.
 4. Si mientras tanto llegó un `speech://state` de esa sesión, la respuesta se descarta porque es más vieja. Si la sesión ya terminó, el hook suelta el id, el hook de seguimiento vuelve a leer la reunión y reintenta a los 2 s (`FOLLOW_RETRY_MS`) mientras siga `live`.
-5. Pausar, Finalizar y Cancelar de `MeetingView` primero se aseguran de seguir la sesión (`ensure`) y recién después actúan. Antes, con el hook en `idle`, esos botones no hacían nada y el reloj quedaba en 00:00.
+5. Pausar, Finalizar y Cancelar de `MeetingView` no esperan a seguir la sesión. Con el hook en `idle`, `voice.holdSession(meetingId)` adopta el id sin leer su estado y el botón llama al comando de esa sesión. Si Rust lo rechaza, el error se ve en el aviso de la vista.
 6. Una reunión `live` o `processing` con la fase de voz en `Idle` quedó huérfana: su worker terminó sin informarlo (por ejemplo, un `stop` cuyo worker falló). Toda sesión que tiene una reunión mantiene la fase fuera de `Idle` hasta avisar su fin (`on_completed`, `on_interrupted` o `discard_session`). Al leer la reunión (`meeting_snapshot`, `current_meeting`), `settle_orphaned_record` la completa con sus líneas, cancela la respuesta en vivo en curso y lo registra con `log::error!`. Así la vista pasa a «Finalizada» y la reunión se puede guardar.
+7. La sesión de una reunión también puede perderse con la fase todavía en `Recording` o `Paused`. Entonces `speech_session_state` responde «La grabación ya terminó», `attach` falla en cada reintento y `settle_orphaned_record` no actúa. Para ese caso, `stop_speech_session` y `cancel_speech_session` con un id que no es la sesión activa llaman a `speech_service::release_lost_session`. Esa función:
+   - confirma que ninguna sesión tiene ese id y que no se está finalizando (`finalizing_session`);
+   - deja la fase en `Idle` si no queda ninguna sesión, así se puede volver a grabar;
+   - lo registra con `log::error!` (solo la fase y si hay otra sesión activa).
 
-Antes, `attach` se intentaba una sola vez por reunión y fallaba en silencio: la vista quedaba en «Grabando 00:00» con Pausar y Finalizar inertes hasta cerrar Notia.
+   Después, `stop` completa la reunión con sus líneas (`meeting::finish_lost_session`) y `cancel` la descarta (`meeting::discard_session`, que ahora devuelve si la encontró). Pausar una sesión perdida sigue respondiendo un error, que se ve en la vista.
+8. `prepare_recognizer` no carga nada mientras haya una sesión activa. La grabación toma el modelo precargado y lo devuelve al terminar, y antes cada vista que se montaba durante una reunión cargaba una segunda copia de Whisper en la GPU.
+
+Antes, `attach` se intentaba una sola vez por reunión y fallaba en silencio: la vista quedaba en «Grabando 00:00» con Pausar y Finalizar inertes hasta cerrar Notia. La corrección del 2026-09-30 agregó los reintentos y `ensure`, pero el 2026-10-30 volvió a pasar: los botones seguían esperando a que `attach` funcionara, y con la sesión perdida eso nunca ocurría. No quedaron logs para confirmar por qué se perdió la sesión. Validado con `meeting::tests::a_meeting_whose_session_is_gone_finishes_with_its_lines` y `speech_service::tests::only_a_session_nobody_holds_or_finishes_is_lost`. Queda pendiente reproducirlo con una grabación real.
 
 Pausar, reanudar, consumir un turno y detener también informan esa posición sin pausas. Antes informaban el tiempo desde el inicio, que incluía las pausas, así que el reloj saltaba al pausar.
 
@@ -9271,6 +9277,8 @@ Objetivo: que una tablet Android grabe y transcriba una reunión presencial. Ant
 
 ### Meeting y dictado en un cliente
 
+> **Superado el 2026-11-03** (ver «Modo Host y Cliente: sincronización entre dispositivos»): un cliente trabaja siempre sobre su copia, así que la reunión, su nota, sus tareas y su IA usan la biblioteca del dispositivo; `meeting_store_note`, `meeting_store_tasks`, `meeting_ai_complete`, `meeting_saved_archive` y `HOST_CLIENT_COMMANDS` ya no existen.
+
 Desde el 2026-09-30 (pedido de la persona), un cliente con copia o sin copia transcribe en su propio dispositivo: el modelo es chico y una tablet tiene que poder transcribir una reunión presencial aunque se corte la red. La reunión también queda en el dispositivo. Al host solo va lo que toca su biblioteca o su proveedor de IA. Durante unas horas del mismo día hubo una versión en la que la reunión vivía en el host y el cliente le mandaba cada línea (`meeting_relay`); se reemplazó por esta.
 
 - **En el dispositivo** (`CLIENT_LOCAL_COMMANDS` de `backend-core/src/connection.rs`):
@@ -9307,68 +9315,88 @@ Desde el 2026-09-30 (pedido de la persona), un cliente con copia o sin copia tra
   - guardar la nota, exportar, enviar tareas y «Pasar por IA» a través del host;
   - un corte de red durante una reunión.
 
-## Modo Host y Cliente (2026-09-28)
+## Modo Host y Cliente: sincronización entre dispositivos (2026-09-28, rehecho el 2026-11-03)
 
 Configuraciones → General → «Modo de ejecución» sigue el lienzo de Configuraciones (claude.ai/artifact/Ka4XCBqVc1wdudkcoW7y1C), tableros «General · Host», «General · Cliente conectado» y «General · Cliente sin conexión».
 
 | Modo | Qué hace |
 |---|---|
-| **Host** | La instalación guarda la biblioteca y la sirve a los clientes por un puerto. |
-| **Cliente con copia** | Usa la biblioteca de un host y guarda una copia sincronizada para trabajar sin conexión. |
-| **Cliente remoto** | Usa la biblioteca del host sin guardar nada en el equipo. |
+| **Host** | La computadora guarda la biblioteca y la sirve por un puerto a los dispositivos que se sincronizan con ella. En Android, «Host» es solo «usa su propia biblioteca»: no tiene servidor. |
+| **Cliente** | Guarda una copia de la biblioteca de un host y trabaja siempre sobre ella, con o sin conexión. La copia y el host se sincronizan cada vez que se ven. |
 
-**Decisiones de la persona:**
-- El cliente se autentica con el usuario **Owner** de la biblioteca del host, en la misma ventana de login.
-- **Con copia y sin conexión** se usan la IA y la voz locales mientras tanto. Telegram nunca corre en un cliente.
-- Sin conexión, la base SQLite **se puede editar** (desde el 2026-10-08; antes era de solo lectura). Notas, archivos y registros de la base se concilian al volver: gana el último cambio, sin importar el dispositivo.
+**Cambio del 2026-11-03 (pedido de la persona, con capturas del teléfono):** al abrir, un cliente con copia mostraba «Conectando con el host 100.81.158.210:52480…», después trabajaba sobre el host, y Gimnasio, Finanzas o Agenda quedaban en «Cargando…» y la app se cerraba al tocar un botón. Se pidió:
+- que el host sea siempre una computadora (Windows, Linux o macOS) y los clientes, los Android u otras computadoras;
+- que entre dos computadoras decida la de mayor procesamiento;
+- quitar el cliente sin copia: todo cliente sincroniza;
+- que sin conexión todo se use como si el dispositivo fuera el host, y que con conexión se sincronicen los cambios de SQLite y de los Markdown;
+- que Android no ofrezca lo que es solo de computadora ni Telegram, y que sin conexión use la IA con sus herramientas y Ollama (en la nube).
 
-Con conexión, un cliente no llama a Ollama, no usa Telegram y no reconoce voz. Todo pasa por el host.
+**Qué cambió:**
+- Se quitaron el cliente **Remoto** (`ClientKind`), el reenvío de comandos al host (`registry::client_dispatch`, `host_client::forward`, `CLIENT_LOCAL_COMMANDS`, `HOST_CLIENT_COMMANDS`), el relé de eventos del host por WebSocket, el esquema `notiahost` (y su CSP), el transporte `hostTransport`, el ir y venir de la ventana entre host y copia (`WindowMove`, `moveTo`, `enter_offline_copy`, `leave_offline_copy`, la falla de comando) y la edición en conjunto (`collab.rs`, `collab_*`, `markdown/collab/`, `collabRuntime`, `sharedTextDocumentChange` y los paquetes `yjs`, `y-protocols`, `y-prosemirror` y `@milkdown/plugin-collab`). Sin ventanas sobre el host no quedaba quién se uniera a una sala.
+- En Meeting también se quitaron `meeting_store_note`, `meeting_store_tasks`, `meeting_ai_complete` y `meeting_saved_archive`, que solo usaba un cliente sobre el host: la reunión, su nota, sus tareas y su IA usan la biblioteca del dispositivo. ColdPass con huella abre el vault del dispositivo.
+- El cierre al tocar botones no se reprodujo: no había un teléfono conectado por adb. Los comandos de la ventana no esperaban la red en el hilo de comandos (las tareas pendientes corren en el runtime async), así que la causa no quedó confirmada. Con este cambio la ventana ya no habla con el host: si vuelve a pasar sobre la copia, hace falta el log del teléfono.
 
 ### Configuración del equipo (`backend-core/src/connection.rs`, `app/src/connection.rs`)
 
 Se guarda en el equipo, no en la biblioteca, en `app_data/connection.json`:
 
 ```json
-{ "mode": "client", "clientKind": "copy", "hostAddress": "192.168.0.10:52480", "port": 52480, "hostCertificate": "<sha-256 hex>" }
+{ "mode": "client", "deviceId": "<uuid>", "hostAddress": "192.168.0.10:52480", "port": 52480, "hostCertificate": "<sha-256 hex>", "copyFolder": { "uri": "content://…/tree/…", "name": "NotiaCopia" } }
 ```
 
+- **`deviceId`:** se crea la primera vez que se leen los ajustes (`connection::settings`) y se guarda. Las computadoras lo usan para desempatar la elección.
 - **Dirección del host:** acepta `equipo`, `equipo:puerto` y `[ipv6]:puerto`. Quita `https://` y la barra final, exige un puerto de 1024 o más y usa 52480 por defecto. Se guarda normalizada, en minúsculas.
 - **Normalización:**
   - Un puerto inválido vuelve a 52480.
   - El certificado recordado se descarta si no es un SHA-256 hex o si no hay host.
-  - Un archivo en modo cliente sin host arranca como Host.
-- **Android:** no tiene servidor. Su «Host» es su propia biblioteca, sin escuchar. «Con copia» guarda la copia en una carpeta que elige la persona (`copyFolder { uri, name }`, validada como tree SAF). Sin esa carpeta, guardar el cliente con copia falla con «Elegí la carpeta donde guardar la copia…».
+  - Un archivo en modo cliente sin host arranca como Host. En Android, también uno sin carpeta de copia (un cliente Remoto de antes): arranca como Host hasta que la persona elige la carpeta y guarda el host.
+  - Un `clientKind` guardado por una versión anterior se ignora.
+- **Android:** la copia vive en una carpeta que elige la persona (`copyFolder { uri, name }`, validada como tree SAF). Guardar el modo cliente sin esa carpeta falla con «Elegí la carpeta donde guardar la copia antes de guardar el host.».
 
-Comandos. Los tres están en `LOCAL_ONLY_COMMANDS`, así un cliente nunca cambia el modo de su host por `/api/invoke`:
+Comandos (en `LOCAL_ONLY_COMMANDS`: nadie los cambia por `/api/invoke`):
 
 | Comando | Entrada | Salida |
 |---|---|---|
-| `connection_settings` | — | `ConnectionView`: `mode`, `clientKind`, `hostAddress`, `canHost`, `server { listening, port, error }`, `link { state: unknown\|online\|offline, library, platform, signedIn, message, moveTo: copy\|host\|null }`, `hostOnlyCommands`, `canKeepCopy`, `copyNeedsFolder` (Android), `copyFolder` (nombre de la carpeta elegida), `offlineCopy`, `copy` (última sincronización), `collaboration`, `deviceName`, `statusInNotification` (Android: el estado va en la notificación y la ventana no muestra avisos) |
-| `save_connection_settings` | `payload { mode, clientKind, hostAddress, trustNewCertificate? }` | `{ connection, reload }` |
+| `connection_settings` | — | `ConnectionView`: `mode`, `hostAddress`, `canHost`, `server { listening, port, error }`, `link { state: unknown\|online\|offline, library, platform, signedIn, message }`, `copyNeedsFolder` (Android), `copyFolder` (nombre), `copyReady`, `copy` (última sincronización), `progress { done, total } \| null` (mientras mueve archivos), `runsServices`, `statusInNotification` (Android) |
+| `save_connection_settings` | `payload { mode, hostAddress, trustNewCertificate? }` | `{ connection, reload }`. `reload` cuando cambia el modo o el host de un cliente. Volver de Cliente a Host cierra la copia (`host_mirror::close_copy`) y vuelve a la biblioteca que estaba elegida antes |
 | `test_host_connection` | `payload { hostAddress? }` (sin él, el host guardado) | `{ ok, library, latencyMs, message }` |
+| `client_open` | — | `{ opening: 'copy' \| 'first-sync', message, connection }` |
+| `pick_copy_folder` | — | Android: elige la carpeta de la copia (vacía o con una copia anterior) |
+| `sync_copy_now` | — | Sincroniza ahora y devuelve la `CopyStatus` |
 
-- **`save_connection_settings`:**
-  - Cliente exige una dirección válida; si no, error `invalidInput` con un ejemplo.
-  - Host conserva la dirección anterior para volver a Cliente.
-  - Otra dirección, o `trustNewCertificate`, descarta el certificado recordado.
-  - Aplica el modo al instante: arranca o detiene el servidor y el enlace.
-- **Recarga:** `reload` es `true` cuando cambia el modo, o cuando un cliente cambia de tipo o de host. La interfaz recarga la ventana, porque el arranque decide de nuevo cómo llega al backend.
+### Qué computadora corre los servicios (`backend-core/src/connection.rs`, `app/src/device_role.rs`)
+
+Los servicios de la biblioteca corren en una sola computadora: Telegram (`telegram_worker::desired_worker` y el bloqueo de red `telegram_service::set_client_device`), WhatsApp (`whatsapp::is_supported`), el webhook (`webhooks::is_supported`), el agente autónomo (`agent_autonomy`), las Acciones IA (`ai_actions`), las Tareas IA (`ai_task_runner`, y sus herramientas de escritura en el chat), la sincronización de Agenda con Google (`agenda_sync`) y los backups (`backup`). Todos preguntan `device_role::runs_services`, que también deja el bloqueo de Telegram al día.
+
+- **Regla** (`runs_services_among`, función pura): entre las computadoras que se ven, la de más procesamiento: más hilos de CPU (`available_parallelism`) y, a igualdad, más memoria física (Windows `GlobalMemoryStatusEx`, Linux `/proc/meminfo`; 0 en otros). A igualdad decide la que está en modo Host, y al final el `deviceId`, así todas deciden lo mismo. Una computadora que no ve a ninguna otra los corre.
+- **Quién ve a quién:**
+  - El host anota cada computadora que se sincroniza (`note_client`): `host_sync_manifest` recibe `device: DevicePower { deviceId, threads, memoryMib, host }`. Solo la sesión del Owner llega ahí. Android no lo manda y nunca cuenta.
+  - El cliente anota a su host (`note_host`) con `device` de `GET /api/health`.
+  - Una computadora cuenta mientras se la vio en los últimos 90 s (`SEEN_FOR`).
+- **Sin doble Telegram:**
+  - Un cliente con más procesamiento que su host toma los servicios recién cuando el host lo conoce, es decir, cuando su última sincronización es reciente (`note_synced`). Hasta ahí los sigue corriendo el host.
+  - Al arrancar, un cliente espera el primer chequeo de su host (como mucho 20 s, `FIRST_CHECK`) antes de tomarlos.
+- **Android:** nunca los corre.
+- **Sin conexión, una computadora cliente los toma.** Es lo pedido: «como si el dispositivo fuera el host». Si el host sigue prendido pero no se ven (por ejemplo, una VPN caída con internet en los dos), corren en los dos hasta que vuelvan a verse. Telegram responde 409 al pedido de actualizaciones más viejo, así que cada mensaje lo atiende uno solo, pero las acciones programadas pueden repetirse.
+- **Configuración de Telegram, WhatsApp y el webhook:** se edita en la computadora en modo Host. La copia trae esas secciones al bajar `notiaConfig.json`, y un cliente que las cambia no las cambia en el host (`merge_client_config`, `backend_write_library_config` con `from_client`).
+- **Siempre en cualquier computadora:** la terminal, el navegador y los scripts del agente (`terminal::is_available`, `browser::is_available`, `agent_scripts::is_available`). El agente corre donde está la persona, también en una computadora cliente. Nunca en Android.
+- **Siguen en la computadora en modo Host:** el Task Manager publicado y los espacios públicos (`connection::is_client`), porque sus direcciones son las de esa computadora.
 
 ### Host (`app/src/host_server.rs`, `app/src/server/api.rs`)
 
-- **Servidor compartido:** las rutas del servidor headless pasaron a `server/api.rs` (`ApiServer`, `ServerKind::{Headless, Host}`). `server/headless.rs` quedó con la línea de comandos. El headless funciona igual que antes.
-- **Arranque:** `notia_app::start_device_services` lo llama la ventana, nunca el headless. En modo Host escucha en `0.0.0.0:<puerto>` (52480) con el certificado autofirmado de `app_data/host-server/tls`. Se detiene al pasar a Cliente. Un puerto ocupado queda como error, «El puerto 52480 está en uso por otro programa», y Configuraciones lo muestra en la fila Puerto («Sin escuchar»).
-- **Eventos:** `create_app` envuelve el emisor en `TeeEvents`, así cada evento llega a la ventana y al `EventHub` (`SharedEventHub`) que lee el WebSocket de los clientes.
+- **Servidor compartido:** las rutas del servidor headless están en `server/api.rs` (`ApiServer`, `ServerKind::{Headless, Host}`); `server/headless.rs` tiene la línea de comandos.
+- **Arranque:** `notia_app::start_device_services` lo llama la ventana, nunca el headless. En modo Host escucha en `0.0.0.0:<puerto>` (52480) con el certificado autofirmado de `app_data/host-server/tls`. Se detiene al pasar a Cliente. Un puerto ocupado queda como error y Configuraciones lo muestra en la fila Puerto («Sin escuchar»).
 - **Firewall:** la primera vez que escucha, Windows puede pedir permiso de red.
-- **Rutas nuevas o cambiadas** (también en el headless):
+- **Rutas** (también en el headless):
 
   | Ruta | Sesión | Qué hace |
   |---|---|---|
-  | `GET /api/health` | No | `{ ok, app: "notia", protocolVersion: 1, mode: "host"\|"headless", platform, libraryId, library }` |
+  | `GET /api/health` | No | `{ ok, app: "notia", protocolVersion: 1, mode: "host"\|"headless", platform, libraryId, library, device: { deviceId, threads, memoryMib, host } }` |
   | `GET /api/auth/status` | No | Estado de la biblioteca seleccionada, igual que `app_auth_status` pero sin lo que recuerda el host |
-  | `POST /api/auth/login` | No | `{ username, password }`: el Owner de la biblioteca, con las mismas comprobaciones que la app (también la desbloquea en el host). `{ password }`: la contraseña del headless, como antes. Sin nada válido, 401 con el mensaje |
+  | `POST /api/auth/login` | No | `{ username, password }`: el Owner de la biblioteca, con las mismas comprobaciones que la app. `{ password }`: la contraseña del headless |
   | `POST /api/auth/first-login`, `/create-password`, `/change-password` | No | «Primer inicio» y cambio de contraseña del Owner. Hasta 10 por minuto por IP. El cambio cierra todas las sesiones |
-  | `POST /api/invoke` | Sí | El límite pasó de 600 a 3000 pedidos por minuto y sesión, porque la edición en conjunto manda un mensaje cada pocas teclas |
+  | `POST /api/invoke` | Sí | Un comando remoto (no `LOCAL_ONLY_COMMANDS`), con la etiqueta `client`. La sincronización usa los `host_sync_*`. Hasta 3000 pedidos por minuto y sesión |
+  | `GET /api/file?path=` | Sí | Un archivo de una biblioteca registrada (las bajadas de la sincronización) |
 
 ### Cliente (`app/src/host_client.rs`)
 
@@ -9376,68 +9404,50 @@ Comandos. Los tres están en `LOCAL_ONLY_COMMANDS`, así un cliente nunca cambia
   - El cliente confía en el certificado que ve la primera vez que el host guardado responde, y guarda su SHA-256 en `hostCertificate` (`pin_host_certificate`).
   - Después rechaza cualquier otro con «El certificado del host cambió…».
   - Editar y guardar la dirección (`trustNewCertificate`) vuelve a confiar.
-  - Usa `rustls` con un verificador propio (`PinnedCertificate`) y `reqwest` con TLS preconfigurado y sin proxy.
-  - `Origin` va con la URL del host, como exige el servidor.
-- **Sesión:**
-  - Los comandos `app_auth_*` de un cliente van al host.
-  - La cookie `notia_session` vive en memoria, junto con usuario y contraseña de esa ejecución, para abrir otra sesión si el host se reinició.
-  - «Recordar sesión» guarda la contraseña protegida por el sistema (`config_vault`, clave `host-session-<biblioteca>`). «Recordar datos» usa la clave `host-<biblioteca>`. Esa contraseña también renueva la sesión cuando el proceso del cliente volvió a arrancar (`renew_session`).
-  - Solo un 401 seguido de un rechazo del host al volver a iniciar sesión (`host_refused`: 401/403) avisa `notia:host-link` con `signedIn: false`, y la ventana vuelve al login. Si el host no responde en ese momento, la sesión y las credenciales se conservan y se reintenta (ver «Recordar sesión que dura (2026-10-18)»).
-- **Comandos** (`registry::client_dispatch`, antes de `dispatch`). Mientras el enlace usa el host (`uses_host`: cliente y no trabajando con la copia):
-  - `CLIENT_LOCAL_COMMANDS` corre en el equipo: login, conexión, copia y preferencias del dispositivo.
-  - Todo comando remoto va a `/api/invoke`, con el error del backend del host tal cual.
-  - Lo que solo funciona en el equipo que ejecuta Notia (grabación, Meeting, selectores, alta de correo en el navegador) responde `unsupported`: «En modo cliente esta función la ofrece el host…».
-- **Archivos:** el esquema `notiahost` de la ventana (`tauri_host.rs::host_file`) pide `GET /api/file` al host con la sesión. La interfaz lo usa con `convertFileSrc(path, 'notiahost')`. La CSP suma `notiahost:` y `http://notiahost.localhost` en `img-src`, `media-src` y `connect-src`.
-- **Eventos:** un hilo abre `wss://host/api/events` (tungstenite sobre rustls, con la cookie y `Origin`) y emite en la ventana cada evento del host. Al reconectar pide `?since=<último seq>`.
-- **Monitor:** consulta `/api/health` cada 10 s con conexión y cada 4 s sin ella (espera hasta 3 s la respuesta, `HEALTH_TIMEOUT`), emite `notia:host-link` cuando cambia el estado o adónde debe ir la ventana (`moveTo`, ver «Base sin conexión y conciliación por fila») y lanza la sincronización de la copia en su propio hilo (`host_mirror::sync_in_background`), así las consultas siguen durante una sincronización larga.
-- **Servicios apagados en un cliente:** Telegram (`desired_worker`), el agente autónomo, la sincronización de Agenda, los backups, la publicación automática y la precarga del modelo de voz.
-- **`rustls` y `tungstenite`** pasaron a dependencias de todas las plataformas, porque el cliente de Android los usa.
+  - Usa `rustls` con un verificador propio (`PinnedCertificate`) y `reqwest` con TLS preconfigurado y sin proxy. `Origin` va con la URL del host.
+- **Sesión de la sincronización:**
+  - La cookie `notia_session` vive en memoria, junto con el usuario y la contraseña del Owner de esta ejecución.
+  - Llegan por `use_credentials` cuando el Owner inicia sesión en la copia (`app_auth::backend_app_auth_login`), o por `auth_login` en la primera copia.
+  - «Recordar sesión» guarda la contraseña protegida por el sistema (`config_vault`, clave `host-session-<biblioteca del host>`), para abrir la sesión cuando el proceso vuelve a arrancar (`renew_session`). La biblioteca del host sale del enlace o, antes de que el host responda, de `current.json` de la copia (`host_mirror::copied_library`).
+  - Un host que rechaza las credenciales (401/403 al renovar) las olvida y deja `signedIn: false`. Si el host no responde, se conservan y se reintenta.
+  - `sign_out` (al cerrar sesión en la copia) olvida las credenciales y la sesión.
+- **Llamadas:** `call_host` manda un comando a `/api/invoke` y devuelve el error del backend del host tal cual; `fetch_file` baja un archivo por `/api/file`. Las dos esperan hasta 30 min (`TRANSFER_TIMEOUT`), por los archivos grandes con poca señal.
+- **Monitor** (`notia-host-link`): consulta `/api/health` cada 10 s con conexión y cada 4 s sin ella (espera hasta 3 s), anota al host para la elección, emite `notia:host-link` cuando cambia el estado y, si el host responde y acepta la sesión (`ensure_session`), lanza la sincronización en su propio hilo (`host_mirror::sync_in_background`).
 
-### Interfaz del cliente
+### La ventana del cliente (`src/components/client/`)
 
-- **`src/main.tsx`:** la ventana carga `WindowApp` (`src/components/client/`), que lee `connection_settings`. Host abre la app como siempre. Cliente abre `ClientApp`:
-  1. `client_open` (Rust decide dónde abre la ventana; ver «Apertura del cliente (2026-10-02)»). Devuelve `{ opening: 'host' | 'copy' | 'offline', message, connection }`:
-     - `copy` → la app sobre la copia;
-     - `offline` → pantalla «Sin conexión con el host», con Reintentar, «Guardar esta dirección» y «Usar este equipo como host» (en Android, «Usar la biblioteca de este dispositivo»).
-  2. Con `host`, instala `createHostTransport` (`src/services/transport/hostTransport.ts`): Tauri IPC, `kind: 'remote'`, la plataforma del host, `supports` que oculta `hostOnlyCommands`, y `fileUrl` con `notiahost`.
-  3. `app_auth_status` del host. Si falta sesión, `LoginScreen` con Recordar sesión y datos.
-  4. La app. La copia se sincroniza en segundo plano: ya no hay pantalla «Sincronizando la copia local con el host…».
-- **Estilos:** `ClientApp` (y `RemoteApp`) importan `src/styles/notia.css`, porque el login, «Sin conexión con el host» y «Conectando…» se muestran antes de cargar la app, que es la que traía esa hoja. Sin eso, esas pantallas salían sin diseño (visto en Android).
-- **Avisos:**
-  - En Android (`statusInNotification`) la ventana no muestra avisos: el estado va solo en la notificación fija. Antes el aviso se dibujaba fuera del shell, sin los tokens del tema, y quedaba como texto suelto sobre la app.
-  - En Windows y Linux, `ClientNotice` muestra un aviso chico abajo a la derecha, con los tokens del tema (`.notia-app-shell.notia-client-notice`): «Reintentando…» (más «Usar la copia local» si hay copia) y, trabajando con la copia, que los cambios se concilian cuando vuelva.
-  - Sin conexión durante el uso, cuando Rust dice `moveTo: 'copy'` la ventana se recarga y `client_open` abre la copia.
-  - Cuando el host vuelve (`moveTo: 'host'`), cuenta 5 s («Volver ahora» en escritorio) para que el editor guarde; luego `leave_offline_copy` y recarga. La copia se concilia en segundo plano después de abrir la sesión.
-- **Dictado:** con `kind: 'remote'` la ventana graba y manda el audio a `speech_remote_audio`, y el host lo reconoce. Meeting se oculta porque `start_speech_session` no se ofrece.
+- **`WindowApp`** lee `connection_settings`. Host abre la app. Cliente abre `ClientApp`.
+- **`ClientApp`** llama `client_open`, que decide en Rust:
+  - **`copy`:** con una copia lista (`copy_ready`: `current.json` del host guardado, la base copiada y la carpeta presente), `host_mirror::open_copy` la agrega como biblioteca del dispositivo, la elige y la deja abierta. No consulta al host: la ventana abre al instante, con o sin conexión, y el Owner inicia sesión en la copia como en cualquier biblioteca. Si en esta ejecución acaba de hacerse la primera copia, la abre con esa misma sesión (`app_auth::unlock_copy`) y la persona no inicia sesión dos veces.
+  - **`first-sync`:** sin copia todavía. `app_auth_status` le pregunta al host (`signs_in_with_host`: cliente sin la copia abierta), `LoginScreen` inicia sesión con el Owner del host y la pantalla «Copiando la biblioteca» muestra `N de M archivos` (`progress`, cada 2 s y con `notia:copy-sync`). Cuando `copyReady` es verdadero, vuelve a `client_open`. Si el host no responde, «Sin conexión con el host» ofrece Reintentar, otra dirección o «Usar este equipo como host» (Android: «Usar la biblioteca de este dispositivo»). Un host cuyo Owner no tiene contraseña responde «creala en el host».
+- **Sin avisos en la ventana:** en Android el estado va en la notificación fija; en Windows, Linux y macOS, en Configuraciones → General.
+- **Inicio de sesión en la copia (`app_auth.rs`):**
+  - Corre en la copia. Si la copia rechaza la contraseña y el host la acepta (`host_accepts`), la contraseña cambió en otro equipo: se sincroniza y se reintenta.
+  - «Cambiar contraseña» en un cliente cambia primero en el host (`host_client::change_password`) y después en la copia. Sin conexión responde «Para cambiar la contraseña hace falta conexión con el host…».
+  - «Primer inicio» y «Creá tu contraseña» no se ofrecen contra el host.
 - **`RunModeSection`** (`src/components/notia/settings/`):
-  - Tarjetas de radio Host y Cliente.
-  - Fila Puerto con «Escuchando» o «Sin escuchar» y el puerto.
-  - Tipo de cliente Con copia o Remoto. En Android, Con copia muestra «Carpeta de la copia» con «Elegir carpeta»; elegir Con copia no se guarda hasta tener la carpeta.
-  - Fila del host con estado «Conectado», «No responde» o «Probando…», Editar, Probar conexión, el mensaje del error y la última sincronización de la copia.
-  - Elegir Cliente no aplica nada hasta guardar la dirección.
+  - Tarjetas Host y Cliente.
+  - En Host: la fila Puerto.
+  - En Cliente: la carpeta de la copia (Android, con «Elegir carpeta»; Guardar espera la carpeta), el host con su estado, Editar y Probar conexión, y la fila Sincronización con el estado y «Sincronizar ahora».
+  - En las computadoras: la fila «Servicios de la biblioteca» («En esta computadora» o «En otra computadora»).
   - Usa los tokens de la paleta en los dos temas, apila en una columna por debajo de 560 px de contenedor y da toques de 44 px.
 
-### Copia local («Con copia»)
+### La copia (`backend-core/src/mirror_sync.rs`, `app/src/host_sync.rs`, `app/src/host_mirror.rs`)
 
-Archivos: `backend-core/src/mirror_sync.rs`, `app/src/host_sync.rs`, `app/src/host_mirror.rs`.
-
-- **Qué viaja** (`is_synced_path`): la biblioteca entera.
-  - Viajan los archivos visibles, `.agent/` y `.notia/`: configuración, caché de enlaces y la escritura a mano de las notas (`.notia/ink/`, que antes no viajaba).
-  - La base `.notia/notia.db` viaja aparte: entera la primera vez y después fila por fila (ver «Base sin conexión y conciliación por fila»).
-  - No viajan sus copias de respaldo ni sus diarios (`.notia/notia.db*`), la marca de la copia (`.notia/notia-copy.json`), los ocultos dentro de esas carpetas, los demás ocultos (`.git`, `.obsidian`) ni las carpetas vacías.
-- **Dónde:** en Windows y Linux, `app_data/mirror/<biblioteca>/<nombre>/`; en Android, la carpeta SAF elegida (ver abajo). En los dos, el registro de la última sincronización en `app_data/mirror/<biblioteca>.json` (base por archivo con tamaño y fecha de cada lado) y `app_data/mirror/current.json` (host y biblioteca copiados, para arrancar sin conexión).
+- **Qué viaja** (`is_synced_path`): la biblioteca entera: los archivos visibles, `.agent/` y `.notia/` (configuración, caché de enlaces, escritura a mano). La base `.notia/notia.db` viaja aparte: entera la primera vez y después fila por fila. No viajan sus respaldos ni diarios (`.notia/notia.db*`), la marca de la copia (`.notia/notia-copy.json`), los ocultos dentro de esas carpetas, los demás ocultos (`.git`, `.obsidian`) ni las carpetas vacías.
+- **Dónde:** en las computadoras, `app_data/mirror/<biblioteca>/<nombre>/`; en Android, la carpeta SAF elegida. En los dos, el registro de la última sincronización en `app_data/mirror/<biblioteca>.json` (base por archivo con tamaño y fecha de cada lado) y `app_data/mirror/current.json` (host y biblioteca copiados).
 - **Comandos del host** (remotos, con sesión del Owner):
 
   | Comando | Entrada | Salida |
   |---|---|---|
-  | `host_sync_manifest` | `payload { libraryId }` | `{ root, files: [{ path, size, modifiedMs }], database: { size, modifiedMs } \| null, databaseId: string \| null }`. `root` sin el prefijo `\\?\` de Windows, que no acepta `/`; `databaseId` identifica la biblioteca aunque cambie su id de catálogo |
-  | `host_sync_database` | `payload { libraryId }` | `{ contentBase64, modifiedMs, databaseId, seq } \| null`: una copia consistente con `VACUUM INTO` aunque el host esté escribiendo, con el registro de cambios sin pendientes |
-| `host_sync_database_changes` | `payload { libraryId, since, databaseId }` | `{ changes: RowChange[], lastSeq, more, reset }`: hasta 500 filas cambiadas después de `since`. `reset: true` si la copia sigue otra base o un `seq` mayor que el del host |
-| `host_sync_database_push` | `payload { libraryId, changes: RowChange[] }` (hasta 500) | `{ applied, kept, failed }`: aplica las filas de la copia; gana el cambio más nuevo |
-  | `host_sync_write` | `payload { libraryId, path, contentBase64, modifiedMs }` | `{ path, size, modifiedMs }`: escribe con archivo temporal y renombrado, y pone la fecha del cliente. Hasta 24 MB |
+  | `host_sync_manifest` | `payload { libraryId, device? }` | `{ root, files: [{ path, size, modifiedMs }], database: { size, modifiedMs } \| null, databaseId: string \| null }`. `root` sin el prefijo `\\?\` de Windows; `databaseId` identifica la biblioteca aunque cambie su id de catálogo. `device` anota a la computadora para la elección |
+  | `host_sync_database` | `payload { libraryId }` | `{ contentBase64, modifiedMs, databaseId, seq } \| null`: una copia consistente con `VACUUM INTO`, con el registro de cambios sin pendientes |
+  | `host_sync_database_changes` | `payload { libraryId, since, databaseId }` | `{ changes: RowChange[], lastSeq, more, reset }`: hasta 500 filas cambiadas después de `since`. `reset: true` si la copia sigue otra base o un `seq` mayor que el del host |
+  | `host_sync_database_push` | `payload { libraryId, changes: RowChange[] }` (hasta 500) | `{ applied, kept, failed }`: aplica las filas de la copia; gana el cambio más nuevo |
+  | `host_sync_write` | `payload { libraryId, path, contentBase64, modifiedMs }` | `{ path, size, modifiedMs }`: archivo temporal y renombrado, con la fecha del cliente. Hasta 24 MB. `.notia/notiaConfig.json` pasa por `merge_client_config` |
   | `host_sync_delete` | `payload { libraryId, path }` | Borra el archivo y las carpetas que quedan vacías |
 
-  Las rutas pasan por `LogicalPathDto` y `is_synced_path`. Una carpeta existente del camino no puede ser un enlace fuera de la biblioteca. Los archivos se bajan por `/api/file`.
+  Las rutas pasan por `LogicalPathDto` y `is_synced_path`. Una carpeta existente del camino no puede ser un enlace fuera de la biblioteca.
 - **Reglas de cada archivo** (`plan`: base, copia y host):
 
   | Cambió | Acción |
@@ -9445,200 +9455,83 @@ Archivos: `backend-core/src/mirror_sync.rs`, `app/src/host_sync.rs`, `app/src/ho
   | Nada | Nada |
   | Solo el host | Baja el archivo, o lo borra en la copia |
   | Solo la copia | Sube el archivo, o lo borra en el host |
-  | Los dos | El de fecha de modificación más nueva gana; un empate queda con el del host; una edición gana a un borrado; iguales en los dos lados solo se registran |
-  | Está en los dos lados, la copia nunca lo sincronizó (sin base) y difiere | Gana el del host (2026-10-02). Es una bajada cortada: su fecha es la de la escritura, no una edición, y podía estar incompleto. Antes ganaba por fecha y se subía al host |
+  | Los dos | Gana la fecha de modificación más nueva; un empate queda con el del host; una edición gana a un borrado; iguales en los dos lados solo se registran |
+  | En los dos lados, sin base (nunca sincronizado), distintos | Gana el del host: es una bajada cortada |
 
-- **Cuándo:** con conexión y sesión, en segundo plano (`sync_in_background`, un hilo `notia-copy-sync`; si ya corre una, no se lanza otra): apenas se abre una sesión con el host (login, sesión recordada o renovada) y en cada vuelta del monitor (10 s). `sync_copy_now` sigue disponible y espera el resultado. La ventana nunca espera la sincronización. Un archivo que no viajó (más de 24 MB, o el host no lo dio) queda en `skipped` y se reintenta. El evento `notia:copy-sync` y `connection_settings.copy` informan el resultado.
-- **Avance guardado (2026-10-02):** la primera copia de una biblioteca grande en un celular (~1500 archivos por SAF) tarda minutos. Antes el registro solo se guardaba al terminar: si la app se cerraba o Android la congelaba, la próxima vez empezaba de cero y volvía a subir al host lo que ya había bajado.
-  - `Pass::save` guarda el registro cada 2 s y apenas se copia la base. Desde ahí la copia abre sin conexión aunque falten archivos.
-  - Cada archivo escrito se registra con el tamaño y la fecha que tiene en la carpeta de la copia: `write_synced` en escritorio, y en Android `writeFile` devuelve `size`/`lastModified` (`write_android_content_bytes_stamped`). Solo se vuelve a listar la carpeta para lo que el proveedor no informó.
-  - Con 20 archivos o más, o con la primera copia de la base, `KeepRunning` arranca el servicio en primer plano `dataSync` de `ContinuityPlugin` mientras dura la sincronización, para que Android no congele el proceso con la ventana oculta.
-  - `host_mirror::progress` informa archivos hechos y totales. La notificación de Android dice «Sincronizando la copia · <biblioteca> con <host>: N de M archivos.». Si al terminar quedaron archivos sin copiar, dice «… · N archivos sin copiar; se vuelve a intentar.» en lugar de «copia al día».
-- **Sin conexión:**
-  - `enter_offline_copy` agrega la carpeta como biblioteca de este equipo (`add_desktop_library`) y la selecciona, recordando la selección anterior.
-  - `database_is_offline_copy` (escritorio) y `database_uri_is_offline_copy` (Android) hacen que `open_library_connection`, `open_mobile_library_connection` y la inicialización abran la base de la copia con `open_copy_database_file`: escribible, migrada y solo si ya tiene las tablas del host. Antes se abría en solo lectura.
-  - La IA y la voz son las locales. La configuración cifrada se abre con el login del Owner sobre la copia.
-  - `leave_offline_copy` vuelve al host y restaura la selección. La siguiente sincronización concilia lo cambiado.
-- **Errores:** sin copia previa, «Todavía no hay una copia de la biblioteca en este equipo: conectate al host al menos una vez.».
-- **Orden y fallas (2026-09-28):**
-  - Orden (2026-10-02): primero sube lo que cambió en este equipo (`Upload` y `DeleteRemote`), así la ventana, ya sobre el host, muestra enseguida lo editado sin conexión; después la base; al final lo que cambió en el host. En la primera sincronización no hay nada que subir, así que la base sigue bajando antes que los archivos: la copia se abre sin conexión solo si la tiene (`database_ms`); si no, «La copia de este equipo todavía no tiene la base de datos…».
-  - Un archivo que no se puede escribir o leer queda en `skipped` y la sincronización sigue. Solo se corta si el host deja de responder (`ProviderUnavailable`, `Unauthorized` o `Forbidden`).
-  - Antes, un archivo con error cortaba todo antes de la base. Sin conexión, el plugin Android creaba una base vacía y el inicio de sesión fallaba con «No se pudo revisar el inicio de sesión…».
-  - Al abrir la base de la copia, `check_copy_snapshot` exige la tabla `library_users` antes de migrarla: un archivo vacío no se convierte en una biblioteca nueva.
-  - La ventana de inicio de sesión muestra el motivo real del backend con «Reintentar», y `backend_app_auth_status` lo registra en el log.
-- **Marca:** la copia guarda `.notia/notia-copy.json` con la biblioteca del host (`{ "hostLibraryId" }`). Una carpeta con la marca de otra biblioteca no se sincroniza: «La carpeta de la copia tiene la copia de otra biblioteca…».
-- **La biblioteca cambia de id en el host (2026-10-13):** el id de una biblioteca es un UUID del catálogo del host (`library-catalog.json`); si el catálogo se vuelve a crear, la misma carpeta recibe otro id (el host de esta casa tiene seis ids registrados para `gaia`). Hasta hoy, el cliente veía el id nuevo como otra biblioteca: en Android la carpeta de la copia tenía la marca del id viejo y cada sincronización se rechazaba con el mensaje de arriba (en la notificación, «No se pudo sincronizar la copia»); en Windows y Linux empezaba una copia nueva en `mirror/<id nuevo>/` y lo editado sin conexión en la copia vieja quedaba huérfano. Ahora:
-  - `host_sync_manifest` devuelve también `databaseId`, el id de la base del host (`notia_sync_meta`, leído sin migrar; `null` si la base es de antes del registro por fila). Ese id vive en `.notia/notia.db` de la biblioteca, así que sobrevive a los cambios de catálogo: la misma base es la misma biblioteca.
-  - `host_mirror::adopt_previous_record`: cuando el registro del id nuevo está vacío, lee `current.json` (la última biblioteca copiada en este equipo) y el registro de ese id. Si su `databaseId` es el del host, o si el registro es de antes del registro por fila y coinciden el host y el nombre de la biblioteca, el registro pasa al id nuevo (con sus bases por archivo, `databaseId` y `databaseSeq`, y en escritorio la carpeta de siempre), el viejo se borra, `current.json` queda con el id nuevo y la marca de la carpeta se reescribe. La sincronización sigue como una más: lo editado sin conexión sube, lo del host baja, y la base sigue por filas sin bajar entera. La dirección del host no cuenta cuando el `databaseId` coincide, así que también cubre un host que cambió de IP.
-  - Si la marca no es ni el id nuevo ni el adoptado, la carpeta sí tiene otra biblioteca y se sigue rechazando.
-  - Regresión en `the_copy_follows_the_host_and_keeps_the_last_modified_file`: el catálogo del host cambia el id (y el registro de rutas lo vincula), el Owner inicia sesión con el id nuevo sin crear contraseña (el hash vive en la base de la biblioteca), y la sincronización sube el cambio de la copia, baja el del host, deja la marca y `current.json` con el id nuevo y borra el registro viejo. `cargo test -p notia-app --features bluetooth`: 507 + 11 ignoradas; `cargo check` Android sin errores. Pendiente: probarlo en la tablet (la copia que hoy rechaza la sincronización debería seguir sola al volver a conectarse) y aclarar el aviso de error al guardar que aparece en la tablet, que no se reprodujo acá.
+- **Cuándo:** con conexión y sesión, en segundo plano (`sync_in_background`, un hilo `notia-copy-sync`, nunca dos a la vez): al abrirse la sesión y en cada vuelta del monitor (10 s). La copia está abierta mientras tanto: la ventana la escribe y la sincronización la concilia. La ventana nunca espera. Un archivo que no viajó (más de 24 MB, o el host no lo dio) queda en `skipped` y se reintenta.
+- **Orden:** primero sube lo que cambió en el dispositivo (`Upload`, `DeleteRemote`), después la base, al final lo que cambió en el host. La primera vez no hay nada que subir, así que la base baja antes que los archivos: la copia abre solo si la tiene (`database_ms`).
+- **La ventana se entera** (`announce_changes`, con la copia abierta): si bajaron o se borraron archivos, `notia-library-tree-changed` (el explorador relee). Si bajaron filas, `notia:finance-data-changed`, `notia:agenda-data-changed` y `notia:routine-data-changed`. Las demás vistas leen lo nuevo al volver a abrirse.
+- **Avance guardado:** `Pass::save` guarda el registro cada 2 s y apenas se copia la base. Cada archivo escrito queda con el tamaño y la fecha que tiene en la carpeta de la copia: `write_synced` en las computadoras y, en Android, lo que informa `writeFile` (`write_android_content_bytes_stamped`). Con 20 archivos o más, o con la primera base, `KeepRunning` arranca el servicio `dataSync` de `ContinuityPlugin` para que Android no congele el proceso.
+- **Fallas:** un archivo que no se puede leer o escribir queda en `skipped` y la sincronización sigue; solo se corta si el host deja de responder (`ProviderUnavailable`, `Unauthorized`, `Forbidden`). Al abrir la base de la copia, `check_copy_snapshot` exige `library_users` antes de migrarla: un archivo vacío no se convierte en una biblioteca nueva.
+- **Marca y cambio de id:** la copia guarda `.notia/notia-copy.json` con la biblioteca del host. Una carpeta con la marca de otra biblioteca no se sincroniza. Si el host vuelve a crear su catálogo y la biblioteca cambia de id, `adopt_previous_record` la reconoce por su `databaseId` (o, en registros viejos, por host y nombre) y sigue con el registro anterior.
 - **Android** (`CopyStore::Saf`):
-  - `pick_copy_folder` (local, en `CLIENT_LOCAL_COMMANDS` y `LOCAL_ONLY_COMMANDS`) abre el selector SAF, que conserva el permiso de lectura y escritura. Solo acepta una carpeta vacía o con la marca de una copia; si no, «Elegí una carpeta vacía para la copia…», porque lo que tuviera subiría al host como archivos nuevos.
-  - La carpeta se guarda en `connection.json`. Otra carpeta empieza el registro de cero.
-  - Los archivos se escriben con `writeFile` sobre la URI de documento. La carpeta de cada archivo se crea o resuelve una vez por sincronización con `createPathEntry` desde el grant raíz y queda en memoria (`CopyStore::Saf { folders }`). Cada archivo se crea con `createEntry` sobre esa carpeta: una consulta por archivo en lugar de una por nivel. Se leen y borran resolviendo esa URI. La URI tree nunca se usa para leer o escribir ni se normaliza.
-  - `readFlatFileList` de `DirectoryPickerPlugin.kt` devuelve también `size` y `lastModified` de cada archivo (columnas SAF opcionales; `build.rs` copia la fuente de `resources/` a `gen/`). SAF no deja fijar la fecha, así que la base guarda la fecha propia de la copia, la que `writeFile` informa después de escribir.
-  - Listar una carpeta SAF es lento: la copia se lista al arrancar, al elegir carpeta y al volver de trabajar sin conexión. Mientras hay conexión solo la escribe la sincronización, y las demás vueltas confían en el registro.
-  - Al recibir una base nueva, `cleanupDatabases` descarta las copias temporales de SQLite del plugin, para que la próxima apertura copie la nueva.
-  - Sin conexión, `add_android_library` suma la carpeta al catálogo como biblioteca SAF. `open_mobile_library_connection` abre su copia temporal escribible, y `sync_mobile_library_connection` la vuelve a escribir en la carpeta después de cada cambio, como en cualquier biblioteca Android.
+  - `pick_copy_folder` abre el selector SAF, que conserva el permiso de lectura y escritura. Solo acepta una carpeta vacía o con la marca de una copia. Otra carpeta empieza el registro de cero.
+  - Los archivos se escriben con `writeFile` sobre la URI de documento; la carpeta de cada uno se resuelve una vez por sincronización desde el grant raíz. La URI tree nunca se usa para leer o escribir ni se normaliza.
+  - **Listar una carpeta SAF es lento.** Antes la copia se listaba solo al arrancar, porque con conexión únicamente la escribía la sincronización. Ahora la ventana la escribe siempre, así que `mobile_directory_picker` cuenta las escrituras de este proceso en carpetas de bibliotecas (`library_writes`: cada `writeFile` y cada alta, borrado o renombre). La sincronización vuelve a listar solo si el contador cambió desde la última lista (`listed_at`); si no, confía en el registro.
+  - La base de la copia es la temporal del plugin (`prepareDatabase`), la misma que usa la ventana; la sincronización escribe sus filas ahí y la guarda en la carpeta con `syncDatabase`. Al recibir una base entera nueva, `cleanupDatabases` descarta las temporales.
 
-### Telegram nunca desde un cliente
+### Base y conciliación por fila (`app/src/row_sync.rs`)
 
-Un equipo en modo cliente no puede activar Telegram, ni en su equipo ni en el host:
-
-- **Red:** `telegram_service::set_client_device`, que llama `connection::start`, bloquea en el equipo toda llamada a la API de Telegram (`api_base`). Esto incluye mensajes, actualizaciones, descargas y «Probar conexión» sin conexión. Además el worker no arranca (`desired_worker`) y el agente autónomo no corre.
-- **Ajustes reenviados al host:** el servidor en modo Host despacha los pedidos de sus clientes con la etiqueta `client` (`registry::CLIENT_WINDOW_LABEL`); el headless sigue con `remote`. Con esa etiqueta, `backend_write_library_config` conserva la sección `telegram` guardada, junto con las secciones que ya eran del backend (correo, Google Cloud y clima). El resto de los ajustes se guarda igual.
-- **Copia sin conexión:** en el equipo cliente la misma escritura conserva la sección `telegram` de la copia. Cuando la copia sube `.notia/notiaConfig.json`, `host_sync_write` no escribe el archivo tal cual: `library_config::merge_client_config` abre la copia con la clave de la biblioteca desbloqueada en el host y guarda sus ajustes. Telegram, el cliente de Google Cloud y las cuentas de correo quedan como estaban en el host. Si el host está bloqueado, la subida falla y se reintenta.
-- **Interfaz:** en Configuraciones → Telegram de un cliente, el interruptor del bot, el token, el agente autónomo y «Probar conexión» quedan deshabilitados, con el aviso «Este equipo es un cliente: Telegram lo maneja el host…». Vincular y desvincular usuarios sigue disponible.
-- **Pruebas:**
-  - de punta a punta contra un host real: un cliente que manda `telegram.enabled: true` no lo prende en el host y sí cambia otro ajuste;
-  - una copia que prende Telegram sin conexión no lo prende en el host al sincronizar;
-  - el bloqueo de red (`check_bot` responde «En modo cliente Telegram no se usa en este equipo…»).
-
-### Edición en conjunto (`app/src/collab.rs`, `src/components/notia/views/markdown/collab/`)
-
-Cuando dos ventanas del mismo host abren la misma nota (el host y sus clientes, o varios clientes), cada una ve los cambios de las otras mientras se escriben y el bloque que edita cada persona, marcado con su color y su nombre.
-
-- **Rust** (sala por biblioteca y ruta, en memoria del host):
-
-  | Comando | Entrada | Salida |
-  |---|---|---|
-  | `collab_join` | `payload { libraryId, path, name }` | `{ room, peerId, color, initializer, saver, updates, peers }` |
-  | `collab_update` | `payload { room, peerId, update }` (update Yjs en base64, hasta 4 MB) | Guarda el cambio y emite `notia:collab-update { room, from, update }` |
-  | `collab_awareness` | `payload { room, peerId, update }` | Emite `notia:collab-awareness` (cursor, selección, nombre y color). También cuenta como «sigue acá» |
-  | `collab_leave` | `payload { room, peerId }` | Sale de la sala. El último la termina: la próxima vez se parte del archivo |
-
-  - **Relleno:** el primero de una sala nueva la llena con la nota (`initializer`).
-  - **Colores:** salen de la paleta en orden de llegada (teal, periwinkle, ámbar, violeta, salvia, coral, oro).
-  - **Nombre:** el del dispositivo (`deviceName`: `COMPUTERNAME`/`HOSTNAME`, «Android»).
-  - **Guardado:** solo uno guarda (`saver`, el primero presente). Si se va, guarda el siguiente, y `notia:collab-peers { room, peers, saver }` lo avisa.
-  - **Ausencias:** quien no da señales en 60 s sale de la sala.
-- **Interfaz:**
-  - Paquetes: `yjs`, `y-protocols`, `y-prosemirror` y `@milkdown/plugin-collab@7.19.0`, la versión del editor.
-  - `markdownCollab.ts`:
-    - aplica los cambios guardados;
-    - junta los propios cada 120 ms y la posición cada 200 ms;
-    - avisa cada 20 s que sigue;
-    - con `collabServiceCtx`, `applyTemplate` solo si es la primera y luego `connect`.
-  - `collabBlocksPlugin` marca el bloque de primer nivel donde está el cursor de cada otra persona (contorno de su color y etiqueta con el nombre). `yCursorPlugin` dibuja su cursor.
-  - Quien no guarda llama a `sharedTextDocumentChange` (acción nueva de `NotiaActions`), que deja la pestaña al día y sin cambios pendientes (`handleExternalTextDocumentChange`, sin revisión). Así el que pasa a guardar escribe sin chocar con la revisión.
-  - Si la sala se pierde (el host se reinició), la nota sigue sola.
-- **Cuándo se activa:** `connection_settings.collaboration` es `true` en un cliente conectado o en un host que escucha. Aplica al editor de notas de las pestañas; el diálogo de fuente del Task Manager y las notas grandes no participan.
-
-### Apertura del cliente y estado de la conexión (2026-10-02)
-
-Archivos: `app/src/connection.rs` (`client_open`), `app/src/client_status.rs`, `app/src/host_mirror.rs`, `app/src/host_client.rs`, `app/src/mobile_continuity.rs`, `resources/continuity/android/ContinuityPlugin.kt`, `src/components/client/ClientApp.tsx`.
-
-- **`client_open`** (comando local del cliente: está en `LOCAL_ONLY_COMMANDS` y en `CLIENT_LOCAL_COMMANDS`):
-  - Con una copia lista (`host_mirror::copy_ready`: «Con copia», `current.json` del host guardado, `database_ms` y la carpeta de la copia presente), prueba el host esperando como mucho `HEALTH_TIMEOUT` (3 s), el mismo tiempo del monitor. Así un host que el monitor ve responder también responde al abrir, y la ventana no entra en un ciclo copia → host → copia.
-  - Sin copia lista, prueba con el tiempo de «Probar conexión» (15 s).
-  - Si el host responde: `leave_offline_copy` y `opening: 'host'`. Si no, con copia: `enter_offline_copy` y `opening: 'copy'`; si eso falla, o sin copia, `opening: 'offline'` con el motivo.
-  - Antes la ventana hacía esta decisión en React (`test_host_connection` + `enter_offline_copy`) y además esperaba `sync_copy_now` después del login.
-- **Estado de la conexión** (`client_status::describe`, función pura con pruebas): `connecting`, `connected`, `syncing`, `failed` o `offline`, con título y texto en español. Sale del enlace (`LinkView`: estado, biblioteca, sesión, mensaje) y de la copia (`is_offline`, `is_transferring`, `last_error`). Un dispositivo que no es cliente no tiene estado.
-  - `syncing` solo mientras la sincronización mueve archivos o la base (`transferring`), no en cada comparación de 10 s.
-  - Se recalcula (`client_status::refresh`) al emitir `notia:host-link`, al empezar a transferir, al terminar una sincronización, al entrar o salir de la copia, en `client_open` y en `connection::start` (un cambio a Host la quita).
-- **Notificación fija en Android:**
-  - `refresh` manda el estado a un hilo propio (`notia-link-status`), que solo llama al plugin cuando el estado cambió y descarta los intermedios. Al arrancar, el primer envío quita una notificación que haya quedado de una ejecución anterior.
-  - `ContinuityPlugin.showConnectionStatus { kind, title, text }` publica la notificación `0x4E0B` en el canal «Conexión con el host» (`notia-host-connection`, importancia baja), continua (`setOngoing`), sin sonido al actualizarse y con un ícono del sistema según `kind`. Tocarla abre Notia. `clearConnectionStatus` la quita.
-  - En Android 13 o superior, la primera vez pide `POST_NOTIFICATIONS` (el permiso ya estaba en el manifiesto). Si se rechaza, Android no la muestra.
-  - `onDestroy` del plugin la quita cuando la actividad se cierra (no al rotar). Desde Android 14 la persona puede descartarla; vuelve a aparecer con el próximo cambio de estado.
-  - En Windows y Linux no hay notificación: la ventana muestra el estado en un aviso chico abajo a la derecha.
-
-### Base sin conexión y conciliación por fila (2026-10-08)
-
-Archivos: `app/src/row_sync.rs` (nuevo), `app/src/database.rs`, `app/src/host_sync.rs`, `app/src/host_mirror.rs`, `app/src/host_client.rs`, `app/src/client_status.rs`, `app/src/connection.rs`, `resources/database/android/LibraryDatabasePlugin.kt`, `src/components/client/ClientApp.tsx`.
-
-**Problema (Android, informado con capturas):**
-- Sin conexión con el host, la app abría la copia y quedaba bloqueada en «No se pudo abrir la biblioteca · No se pudo preparar la base SQLite Android», con un aviso suelto encima que decía que la base era de solo lectura.
-- Si la conexión se cortaba durante el uso, aparecía sobre la pantalla el texto «Sin conexión con el host. Reintentando…» con «Usar la copia local», sin fondo ni borde.
-- La base de la copia era de solo lectura, así que lo hecho sin conexión en Gimnasio, Salud, Agenda o Finanzas no se podía guardar.
-
-**Causas:**
-1. `LibraryDatabasePlugin.prepare` buscaba `.notia/notia.db` pidiendo `DocumentsContract.getDocumentId` a la URI raíz de la biblioteca, que es una URI `tree` (`/tree/<id>`) sin id de documento. La excepción terminaba en el mensaje genérico. Ahora `rootDocumentUri` arma el documento raíz (`buildDocumentUriUsingTree` + `getTreeDocumentId`), y una falla registra solo la clase de la excepción (`NotiaDatabase`), nunca la URI.
-2. Aunque el plugin respondiera, `initialize_library_database` migraba en Android una conexión abierta en solo lectura.
-3. El aviso se dibujaba fuera de `.notia-app-shell` y no tenía los tokens del tema.
-
-**Diseño:**
-- **Registro de cambios** (`row_sync`), en todas las bases (host y copias). `migrate` termina con `ensure_tracking`:
+- **Registro de cambios** en todas las bases (host y copias). `migrate` termina con `ensure_tracking`:
   - crea `notia_row_changes (seq AUTOINCREMENT, table_name, row_key, changed_ms, pending, UNIQUE(table_name, row_key))` y `notia_sync_meta` con un `database_id` aleatorio;
-  - crea tres triggers por tabla (`notia_track_v1_<tabla>_insert|update|delete`). Cada uno borra la entrada de la fila y la vuelve a insertar con un `seq` nuevo, con la clave primaria como `json_array(...)` y la hora en ms. No usan `INSERT OR REPLACE`: dentro de un trigger, la política de conflicto de la sentencia de la app (un upsert, `OR IGNORE`) reemplaza la del trigger, y la escritura fallaba con `UNIQUE constraint failed`. Un cambio de clave registra también la clave vieja (como borrado). El registro no copia la fila: quien lo lee, lee la fila como está;
-  - solo considera tablas con clave primaria de texto o enteros (`json_array` no admite BLOB, y un trigger que falla haría fallar la escritura de la app). Hoy son todas;
-  - no registra tablas propias de cada equipo: `notia_schema_migrations`, el índice de archivos (`library_inventory*`), `backend_operation_journal` y `ai_action_meta` (la reserva de acciones programadas, que el host renueva cada minuto);
-  - si los triggers ya están, solo hace dos lecturas del esquema.
-- **Reglas** (`apply_changes`):
-  - una fila llega como `RowChange { table, key, changedMs, row | null }` (`null` = borrada). Los valores van en JSON, y los BLOB como `{ "$blob": base64 }`. Los enteros y los reales conservan su tipo;
-  - se aplica solo si es más nueva que el último cambio que esa base conoce de la fila; un empate deja la fila como está;
-  - se escriben solo las columnas que existen en los dos lados (`INSERT … ON CONFLICT(<clave>) DO UPDATE`), con las claves foráneas apagadas: las cascadas del otro lado llegan como sus propias filas;
-  - cada fila aplicada queda registrada con su propia hora y sin pendiente.
-- **Copia** (`host_mirror::sync_database`):
-  1. Sube lo pendiente (`host_sync_database_push`, de a 500) y lo marca enviado.
-  2. Baja lo que cambió en el host después de su `seq` (`host_sync_database_changes`, de a 500) y lo aplica. El cursor (`database_seq` en el registro de la copia) avanza solo después de guardar; en Android, después de escribir la base en la carpeta (`save_database`).
-  3. Toma la base entera solo si no la tiene, si la copia es de antes de este cambio (sin `databaseId`) o si el host responde `reset`. Antes siempre sube lo pendiente.
-  - Corre en cada sincronización (cada 10 s con conexión). Reemplaza a `DATABASE_REFRESH`, que bajaba la base entera como mucho cada 10 minutos.
-  - Si la base de la copia no se puede abrir por otro motivo, no se pisa: la sincronización informa el error y los archivos siguen viajando.
-- **Host:** `host_sync_database` copia la base ya migrada y deja el registro sin pendientes. Los dos comandos nuevos abren la base del host con `busy_timeout` de 10 s.
-- **Ventana** (`host_client::window_move`, `LinkView.moveTo`):
-  - `copy` cuando el host no responde desde hace 10 s (`MOVE_TO_COPY_AFTER`), la ventana está sobre el host y la copia está lista: un corte corto no recarga la ventana;
-  - `host` cuando la ventana está sobre la copia y el host responde.
-  - El monitor lo anuncia con `notia:host-link` cuando cambia (`announce_move`), y también al entrar o salir de la copia.
-- **Notificación:** «Sin conexión con el host · Trabajás con la copia local. Los cambios se concilian con <host> cuando vuelva a responder.» Antes de pasar a la copia: «<host> no responde. Reintentando; si no vuelve, seguís con la copia local.»
+  - crea tres triggers por tabla (`notia_track_v1_<tabla>_insert|update|delete`) que borran la entrada de la fila y la vuelven a insertar con un `seq` nuevo, la clave primaria como `json_array(...)` y la hora en ms. No usan `INSERT OR REPLACE`: dentro de un trigger, la política de la sentencia de la app la reemplaza y la escritura fallaba con `UNIQUE constraint failed`;
+  - solo tablas con clave primaria de texto o enteros. No registra las propias de cada equipo: `notia_schema_migrations`, `library_inventory*`, `backend_operation_journal` y `ai_action_meta`.
+- **Reglas** (`apply_changes`): una fila llega como `RowChange { table, key, changedMs, row | null }` (`null` = borrada; BLOB como `{ "$blob": base64 }`). Se aplica solo si es más nueva que el último cambio conocido de esa fila (un empate la deja), con las columnas que existen en los dos lados y las claves foráneas apagadas.
+- **Copia** (`sync_database`): sube lo pendiente, baja lo que cambió después de su `seq` y avanza el cursor solo después de guardar. Toma la base entera solo si no la tiene, si es de antes del registro por fila o si el host responde `reset`.
 
-**Validaciones:**
-- `row_sync`: todas las tablas de la biblioteca quedan registradas; el registro sigue altas, cambios, cambios de clave y borrados; las filas nuevas y borradas de los dos lados se conservan y en un conflicto gana el cambio más nuevo, en los dos sentidos; un BLOB y un real viajan con su tipo; una columna que el otro lado no tiene no impide el cambio; un valor único repetido queda afuera; el host entrega los cambios en orden y por tandas.
-- De punta a punta con un host real en 127.0.0.1 (`the_copy_follows_the_host_and_keeps_the_last_modified_file`): una fila del host baja; sin conexión cada lado agrega una nota y los dos editan la compartida; al sincronizar quedan las tres notas y el texto del cambio más nuevo en los dos lados.
-- La copia sin conexión se escribe por la apertura normal de la biblioteca y queda pendiente (`without_the_host_the_copy_opens_and_the_owner_signs_in`); un archivo vacío no se abre como copia (`an_offline_copy_without_its_tables_is_reported`).
-- `window_move` y los textos nuevos de la notificación.
-- `cargo test --offline -p notia-app --features bluetooth`: 499 aprobadas + 10 ignoradas (antes 492). `cargo check` para Android (`aarch64-linux-android`): sin errores, 58 warnings como antes. El Kotlin compila (`:app:compileArm64DebugKotlin`) y la copia de `gen/android` coincide con la fuente. Frontend: `npx tsc -p tsconfig.app.json`, ESLint de lo tocado y Vitest de `settings`, `client` y `connection` (13) sin errores.
-- Pendiente: probar en el celular el arranque sin conexión, el corte durante el uso (por ejemplo, en Gimnasio) y la vuelta con cambios en los dos lados.
+### Estado en Android (`app/src/client_status.rs`)
 
-### Eventos nuevos
+- `describe` (función pura con pruebas) arma `{ kind, title, text }` con el enlace y la sincronización:
+
+  | Estado | `kind` | Título | Texto |
+  |---|---|---|---|
+  | Todavía sin chequear | `connecting` | Buscando el host | Trabajás con la copia local mientras Notia busca `<host>`. |
+  | Sin conexión | `offline` | Sin conexión con el host | Trabajás con la copia local. Los cambios se sincronizan cuando `<host>` responda. (o el mensaje del enlace, como un certificado cambiado) |
+  | Responde sin sesión | `connecting` | Host disponible | Iniciá sesión en Notia para sincronizar `<biblioteca>`. |
+  | Moviendo archivos | `syncing` | Sincronizando | `<biblioteca>` con `<host>`: N de M archivos. |
+  | Error | `failed` | No se pudo sincronizar | El error |
+  | Al día | `connected` | Sincronizado con el host | `<biblioteca>` con `<host>` · al día. (o «N archivos sin copiar; se vuelve a intentar») |
+
+- `refresh` lo manda a un hilo propio (`notia-link-status`) que llama a `ContinuityPlugin.showConnectionStatus` solo cuando cambió: notificación continua `0x4E0B` en el canal «Conexión con el host». En Android 13 o superior pide `POST_NOTIFICATIONS` la primera vez.
+
+### Telegram nunca desde un dispositivo que no corre los servicios
+
+- **Red:** `telegram_service::set_client_device`, que `device_role::runs_services` deja al día, bloquea en el dispositivo toda llamada a la API de Telegram («Este dispositivo no atiende Telegram: lo atiende la computadora de la biblioteca con más procesamiento.»). El worker no arranca (`desired_worker`).
+- **Ajustes:** el servidor en modo Host despacha los pedidos de sus clientes con la etiqueta `client` (`registry::CLIENT_WINDOW_LABEL`); con ella, y en un cliente, `backend_write_library_config` conserva la sección `telegram` guardada. Cuando la copia sube `.notia/notiaConfig.json`, `merge_client_config` lo abre con la clave de la biblioteca y conserva Telegram, Google Cloud, las cuentas de correo, WhatsApp y el webhook del host.
+- **Interfaz:** en Configuraciones → Telegram de un cliente, el bot, el token, el agente autónomo y «Probar conexión» quedan deshabilitados.
+
+### Eventos
 
 | Evento | Emisor | Consumidor |
 |---|---|---|
-| `notia:host-link` | `host_client.rs` | `ClientApp` (avisos, vuelta al login, regreso desde la copia) |
-| `notia:copy-sync` | `host_mirror.rs` | Informativo (`connection_settings.copy`) |
-| `notia:collab-update`, `notia:collab-awareness`, `notia:collab-peers` | `collab.rs` | `markdownCollab.ts` |
+| `notia:host-link` | `host_client.rs` | Informativo (`connection_settings.link`) |
+| `notia:copy-sync` | `host_mirror.rs` | Pantalla «Copiando la biblioteca» (`ClientApp`) |
+| `notia-library-tree-changed`, `notia:finance-data-changed`, `notia:agenda-data-changed`, `notia:routine-data-changed` | `host_mirror::announce_changes` | Explorador, Finanzas, Agenda y Rutina |
 
 ### Límites
 
-- **Android:**
-  - La copia vive en una carpeta visible. Si otra app la cambia mientras hay conexión, el cambio se detecta recién en la próxima lectura completa (al reiniciar Notia o volver de trabajar sin conexión).
-  - Un proveedor que no informe tamaño o fecha deja la copia sin detectar cambios propios.
-  - Las carpetas que quedan vacías al borrar no se eliminan.
-  - El dictado del cliente usa el micrófono del WebView; falta probar sus permisos.
-- **Copia:**
-  - La primera sincronización baja toda la biblioteca.
-  - Mientras la sincronización en segundo plano sube lo editado sin conexión, la ventana ya muestra el host. Si en esos segundos se edita en el host el mismo archivo, gana la fecha más nueva: la edición sin conexión se pierde.
-  - Las fechas dependen del reloj de cada equipo.
-  - La base se concilia por fila. Si los dos lados cambian la misma fila, queda entera la del cambio más nuevo: no se mezclan campos ni el JSON de una fila (por ejemplo, la sesión de Gimnasio en curso). Como la copia se pone al día cada 10 s, esto solo pasa si la conexión se corta justo después de un cambio en otro equipo.
-  - Una fila que choca con un valor único del otro lado (por ejemplo, un comercio con el mismo nombre creado en los dos lados) no se aplica y queda solo donde se creó; se cuenta en `failed` y se registra el nombre de la tabla.
-  - El host no avisa a sus ventanas cuando aplica filas de una copia: lo que ya estaba abierto se ve al volver a cargarlo.
-- **Edición en conjunto:**
-  - La sala guarda todos los cambios hasta que se va el último (en memoria del host).
-  - Quien entra a una sala existente reemplaza lo que había escrito antes de unirse.
-  - Deshacer usa el historial del editor.
-- **Selección de biblioteca:** un cliente usa el catálogo del host, así que elegir otra biblioteca también la cambia en el host.
+- **Sin edición en conjunto.** Si dos dispositivos editan la misma nota entre dos sincronizaciones, queda la versión con la fecha de modificación más nueva y la otra se pierde (no se guarda una copia del conflicto). Las fechas dependen del reloj de cada equipo.
+- **Base por fila.** Si los dos lados cambian la misma fila, queda entera la del cambio más nuevo: no se mezclan campos ni el JSON de una fila (por ejemplo, la sesión de Gimnasio en curso). Una fila que choca con un valor único del otro lado no se aplica y se cuenta en `failed`.
+- **Vistas abiertas.** Gimnasio, Salud, Recetas y ColdPass no tienen evento de cambio: lo que llegó por la sincronización se ve al volver a abrirlos. El host tampoco avisa a sus ventanas cuando aplica filas de una copia.
+- **Elección.** La terminal y el navegador del agente corren en la computadora donde está la persona, también en un cliente. En una partición (las dos prendidas y sin verse), las dos corren los servicios.
+- **Tareas IA** se crean y corren solo en la computadora que corre los servicios: en un cliente sus herramientas de escritura no se ofrecen.
+- **Android:** si otra app cambia la carpeta de la copia, el cambio se detecta recién cuando este proceso escribe algo o al reiniciar Notia. Un proveedor que no informe tamaño o fecha deja la copia sin detectar cambios propios.
+- **Primera copia:** baja toda la biblioteca y necesita conexión con el host y el Owner con contraseña.
 
-### Validaciones
+### Validaciones (2026-11-03)
 
-- **Rust core:** `cargo test --offline -p notia-backend-core` → 402, antes 397. Cubre direcciones, normalización, comandos locales del cliente y reglas de la copia.
-- **Rust app:** `cargo test --offline -p notia-app --features bluetooth` → 427 aprobados + 2 ignorados, antes 412. Suma:
-  - de punta a punta con un host real en 127.0.0.1: TLS, certificado fijado, login del Owner, comando reenviado, comando local rechazado y evento del host recibido por el cliente;
-  - la copia: primera bajada con la base, cambios sin conexión en los dos lados, conflicto resuelto por fecha en ambos sentidos, borrado, y la marca de otra biblioteca rechazada;
-  - salas de edición, `host_sync` (rutas, enlaces y carpetas vacías), cookies, certificado y configuración.
-- **Otras compilaciones:**
-  - `cargo check --offline -p notia --features app`: sin errores.
-  - Android (`aarch64-linux-android`): sin errores, 60 warnings (antes 61).
-  - Escritorio: 37 warnings.
-- **Frontend:** `npx tsc -p tsconfig.app.json` sin errores, `eslint` de lo tocado sin errores y `npx vitest run` → 364 (87 archivos), con el flujo de Android que pide la carpeta antes de guardar Con copia. Suma `hostTransport`, `RunModeSection`, `markdownCollab` con Yjs real y base64.
-- **Visual:** capturas de la tarjeta en Host, Cliente conectado y Cliente sin conexión, en tema oscuro y claro y a ancho de teléfono.
-- **Pendiente:**
-  - dos equipos reales (Windows host y cliente) con firewall;
-  - un cliente Android;
-  - la copia sin conexión en la app (login local, IA local, base editable) y la vuelta con filas en los dos lados;
-  - la edición en conjunto en el editor real con dos ventanas;
-  - el reinicio del host;
-  - un certificado cambiado;
-  - build Linux (WSL).
+- **Rust core:** `cargo test --offline -p notia-backend-core` → 817 + 7 ignoradas (más la falla conocida de `image_generation::only_sexual_content_with_minors_is_refused`), con `the_computer_with_the_most_processing_runs_the_services` y un `connection.json` anterior con `clientKind` que se sigue leyendo.
+- **Rust app:** `cargo test --offline -p notia-app --features bluetooth` → 538 + 14 ignoradas (sin las pruebas del ir y venir de la ventana y de las salas):
+  - `the_window_works_on_the_copy_and_it_syncs_while_open`, contra un host real en 127.0.0.1: sin copia abre `first-sync`; después de la primera copia abre `copy` con la sesión de esa copia; un cambio en la copia (nota y fila) sube y uno del host baja con la copia abierta; la contraseña cambiada en el host se aprende al iniciar sesión en la copia; sin host la copia abre en menos de 2 s; `close_copy`.
+  - `the_copy_follows_the_host_and_keeps_the_last_modified_file` (sin cambios de fondo), `a_client_signs_in_with_its_host_and_cannot_change_what_only_the_host_decides`, `device_role` (host que cede a una computadora más fuerte; cliente más fuerte que toma los servicios solo cuando el host lo conoce), `client_status` y `connection`.
+- **Compilaciones:** escritorio con `--tests --features bluetooth` 35 warnings (antes 36); Android (`aarch64-linux-android`) sin errores, 58 warnings (antes 59).
+- **Frontend:** `npx tsc -b` y ESLint de lo tocado sin errores; `npx vitest run` → 753 en 148 archivos (`RunModeSection`: 5 casos, con servicios, «Sincronizar ahora», sin conexión y la carpeta de Android antes de guardar; sin las pruebas de `hostTransport` ni de las salas).
+- **Pendiente (no probado en equipos reales):**
+  - el teléfono o la tablet: abrir sin conexión, usar Gimnasio, Finanzas y Agenda, y volver a conectarse con cambios en los dos lados; ver si el cierre al tocar botones sigue (con `adb logcat`);
+  - la primera copia en Android desde cero;
+  - dos computadoras: la elección de la que corre Telegram, el cambio cuando la más fuerte se apaga y vuelve, y el firewall;
+  - el chat con Ollama en la nube en Android sin conexión al host;
+  - build Linux (WSL) y macOS.
 
 ## Herramientas de Task Manager en el chat principal y Telegram (2026-09-28)
 
@@ -9886,6 +9779,7 @@ El campo `passkey` de las entradas se reemplazó por `password`.
   - No hay límite por ticket. En la práctica rige antes el tope de 8 MiB del snapshot.
   - `apply_mutation` arma y guarda el snapshot en `commit_applied`. Si cualquiera de los dos pasos falla, vuelve al snapshot previo (`replace_snapshot(before)`) y devuelve el error.
   - Así, una mutación que supera un límite (por ejemplo, crear el ticket 2001) se rechaza sin bloquear la biblioteca.
+- **Reemplazado el 2026-10-30.** `may_continue`, `PendingText`, `add_text_part` y la ventana de 3 s ya no existen: los reemplazó la espera de 10 s por chat (ver «WhatsApp con Baileys y espera antes de responder en Telegram»).
 - **`backend-core/src/telegram_bot.rs`.** `may_continue` dice si un mensaje puede ser parte de un texto partido: tiene que medir 2000 unidades UTF-16 o más. Telegram cuenta así, y el valor deja margen por los espacios que se pierden en el corte.
 - **`app/src/telegram_worker.rs`.**
   - Un texto escrito pasa por `collect_text_part`/`add_text_part`, que guardan por chat las partes pendientes (`PendingText`). Cuenta como texto escrito si no trae adjuntos ni audio y no empieza con `/`.
@@ -11952,6 +11846,8 @@ En el recuadro de una selección del lazo, al lado de «Borrar», hay un botón 
 
 ## Host/Cliente: un comando que falla pasa la ventana a la copia al instante (2026-10-14)
 
+> **Superado el 2026-11-03** (ver «Modo Host y Cliente: sincronización entre dispositivos»): la ventana de un cliente ya no trabaja sobre el host, así que no hay comandos reenviados ni pase a la copia.
+
 **Qué pasó (celular Android, con captura).** En el gimnasio, con la señal yéndose, el módulo Gimnasio mostró «No se pudo contactar al host de Notia» y no se pudo usar, aunque el celular es un cliente con copia. La regla de la ventana era: pasar a la copia solo cuando el monitor veía al host sin responder durante 10 s seguidos (`MOVE_TO_COPY_AFTER`). Con poca señal eso no pasa nunca: `/api/health` (una respuesta chica, hasta 3 s) contesta de vez en cuando y vuelve a poner el enlace en línea, mientras cada comando de la ventana (una serie marcada en Gimnasio) falla al conectar. La persona ve fallar lo que hace y la ventana no se mueve. Además, si por fin se movía, `client_open` volvía a probar el host al recargar: si contestaba justo en ese momento, la ventana abría otra vez sobre el host y todo fallaba de nuevo; y de vuelta en la copia, con el primer `health` que pasara se anunciaba la vuelta al host.
 
 **Regla nueva (`host_client::window_move`, con `LinkTiming`).**
@@ -11975,6 +11871,8 @@ Lo demás no cambia: la ventana se recarga sobre la copia (la vista abierta se p
 - Falta probarlo en el celular: el corte en Gimnasio, la vuelta con la señal a medias y la conciliación de lo hecho en los dos lados.
 
 ## Editor: la edición confirmada del agente se ve con la nota compartida (2026-10-14)
+
+> **Superado el 2026-11-03** (ver «Modo Host y Cliente: sincronización entre dispositivos»): se quitó la edición en conjunto; un texto de afuera vuelve a reemplazar el estado del editor con `replaceAll(body, true)` en `MarkdownView`, sin `externalBody.ts`.
 
 **Síntoma.** Con un `.md` abierto, el chat de IA proponía un cambio y, al tocar «Confirmar» o «Confirmar todos», el archivo cambiaba, pero el editor seguía con el texto viejo hasta cerrar y volver a abrir la nota.
 
@@ -13147,3 +13045,334 @@ Pedido: ajustar la barra superior del Task Manager publicado al board «Web publ
   - `notia-app`: 535 pasan, 12 ignoradas. `drives_a_real_browser_through_the_script` (ignorada, corrida con `--exact --include-ignored`) ahora hace una captura con grilla de un enlace, un clic en `A1` que navega, un arrastre, y la captura con grilla de un elemento en una página desplazada; con `NOTIA_BROWSER_SHOT` guarda la captura de la página con su grilla, que se revisó a ojo. Ojo: `--include-ignored` sin `--exact` también corre `serves_a_host_for_the_extension_probe`, que no termina.
   - Vitest 756 en 150 archivos y `tsc -b` sin errores.
 - **Pendiente.** Un captcha real (reCAPTCHA, hCaptcha, Turnstile, uno de texto, uno de deslizar) y un código de autenticador con el modelo real por Telegram; el comportamiento del modelo ante la regla de no resolver solo.
+
+## WhatsApp con Baileys y espera antes de responder en Telegram (2026-10-30)
+
+- **Pedido.** Herramientas de WhatsApp con Baileys; una ventana de configuración que liste los chats del WhatsApp conectado, con permisos de lectura y escritura y autorespuesta por chat; herramientas del agente para listar chats, leer su contenido, escribir, mandar archivos y recibir imágenes; un prompt por chat para la autorespuesta; y que la autorespuesta espere un tiempo al azar de 2 a 3 minutos desde el último mensaje antes de leer todos los nuevos y responder. La misma espera en el chat de Telegram.
+- **Decisiones propias (no consultadas; se pueden cambiar).**
+  - Solo el Owner, como la terminal y el navegador: canales `App` y `Telegram` (y las Tareas IA), nunca el tablero publicado, Meeting ni otro usuario. Es la cuenta personal del Owner.
+  - `whatsapp_send_message` y `whatsapp_send_file` piden confirmación con el chat y el texto exacto («Confirmar todos» cubre el resto del pedido). Las de lectura son `read_only`: las corridas de solo lectura (la revisión de cada hora, un correo que llega) pueden leer los chats con Lectura, nunca escribir.
+  - La autorespuesta es una sola llamada al modelo configurado (`backend_runtime::complete_with_images`), **sin herramientas, memoria ni biblioteca**: habla con terceros, así que no puede leer ni cambiar nada del Owner. Responde con su cuenta y no se presenta como IA salvo que el prompt lo pida.
+  - Los tres permisos son independientes: la autorespuesta escribe aunque el chat no tenga Escritura (esa gobierna al asistente). Un chat sin nada prendido no se guarda y no existe para el asistente.
+  - La autorespuesta no contesta si el Owner escribió en el chat durante la espera (desde el teléfono), si el modelo responde `[SIN_RESPUESTA]`, ni a los mensajes del historial que WhatsApp manda al vincular (`messages.upsert` de tipo distinto de `notify`). Mira hasta 3 imágenes de los mensajes nuevos.
+  - Telegram: la espera vale para los pedidos nuevos. Respuestas a una confirmación o pregunta, mensajes durante un pedido del chat (el clasificador decide en el acto si cancelan o esperan en cola) y comandos (`/…`) siguen siendo inmediatos.
+  - Al desconectar se borran la sesión y el almacén de la PC; los permisos y prompts quedan en la configuración para la próxima vez.
+- **Núcleo** (`backend-core/src/whatsapp.rs`, `backend-core/src/reply_wait.rs`).
+  - `reply_wait`: `WHATSAPP_WAIT` (60 s) y `TELEGRAM_WAIT` (10 s), fijos, contados desde el último mensaje. Al principio era un tiempo al azar de 2 a 3 minutos para los dos; el mismo día el usuario lo bajó a 1 minuto en WhatsApp y 10 s en Telegram.
+  - Configuración `whatsapp` de `.notia/notiaConfig.json`: `{ "enabled": bool, "chats": [{ "id", "name", "read", "write", "autoReply", "prompt" }] }`. `WhatsAppConfig::from_library_config` descarta ids inválidos, repetidos y chats sin nada prendido; `prompt` hasta `MAX_PROMPT_CHARS` (4000; `set_chat` lo rechaza, la lectura lo corta); hasta 1000 chats. `normalize_whatsapp_config` la normaliza en `normalize_library_config`.
+  - Ids válidos (`is_chat_id`): `<dígitos>@s.whatsapp.net`, `<dígitos>@lid` (contacto con número oculto) y `<dígitos>[-<dígitos>]@g.us`; nunca `status@broadcast`, listas de difusión ni canales.
+  - `WhatsAppStore` (persistido por el adaptador): chats (`name`, `lastMessageMs`, `unread`), contactos (`name` guardado por el Owner, `notify` puesto por el contacto) y mensajes (`id`, `fromMe`, `sender`, `senderName`, `timestampMs`, `text`, `kind` = text/image/video/audio/document/sticker/location/contact/poll/other, `fileName`, `byNotia`), ordenados por hora, sin repetir por id (una repetición conserva `byNotia`). Topes: 500 chats más recientes, 100 mensajes por chat, 4000 caracteres por texto. Nombre: guardado por el Owner, asunto del grupo o nombre del chat, el del contacto, el `pushName` de sus mensajes, o `+número`.
+  - Herramientas (área de router `whatsapp`, `ToolArea::WhatsApp`; política `ToolPolicy::WhatsApp`; esquemas en `defaults/tool_schemas.json`):
+    - `whatsapp_list_chats { query?, limit? }` (30, hasta 100): solo chats con Lectura o Escritura, del más reciente al más viejo, con `id`, `name`, `group`, `lastMessageAt` (hora local del host), `unread`, `read`, `write`, `autoReply`.
+    - `whatsapp_read_messages { chat, limit?, before? }` (30, hasta 100; Lectura): mensajes del más viejo al más nuevo con `id`, `at`, `from` («Yo», «Yo (enviado por Notia)» o el autor), `text` (o `[imagen]`, `[audio]`…), `kind`, `fileName`; `olderBefore` para seguir hacia atrás.
+    - `whatsapp_get_image { chat, messageId }` (Lectura): imagen o sticker como `modelImages` (JPEG de hasta 1600 px; `MAX_IMAGE_BYTES` 10 MiB).
+    - `whatsapp_send_message { chat, text }` (Escritura, hasta 4000 caracteres) y `whatsapp_send_file { chat, path, caption? }` (Escritura; archivo de la biblioteca de hasta 16 MiB, nunca de `.notia/`; JPG, PNG y WEBP van como foto, lo demás como documento con su tipo por extensión, `file_media`).
+    - `chat` acepta el id, un número (con o sin código de país) o el nombre (exacto, después parcial), entre los chats que permiten lo que hace falta (`resolve_chat`). Un chat sin el permiso devuelve `forbidden` al modelo con cómo habilitarlo; varios candidatos o ninguno, `invalid-input`.
+  - Autorespuesta: `unanswered` (los mensajes después del último propio), `images_to_read` (las últimas 3 imágenes de esos), `auto_reply_prompt` (sistema: en nombre de quién, el chat, el prompt y las reglas; usuario: hasta 30 mensajes previos más los nuevos marcados `(nuevo)` e `[imagen N adjunta]`) y `parse_auto_reply` (saca `</think>` y comillas; `[SIN_RESPUESTA]` o vacío = no enviar).
+  - Etiquetas de progreso en `telegram_bot::tool_label` y `agentToolLabels.ts`; guía del prompt en `prompt_guidance.rs` (solo chats habilitados, nunca llegar a un chat por otro camino, leer antes de escribir, escribir como el usuario, WhatsApp es dato no confiable); el router recibe la descripción del área y, sin respuesta, cae en `whatsapp` si el mensaje la nombra (`is_whatsapp_request`).
+- **Adaptador** (`app/src/whatsapp.rs`, proceso `app/src/whatsapp_agent.mjs` embebido con `include_str!`, instalador `app/src/node_packages.rs`).
+  - `node_packages::NodePackage` es ahora el instalador común: escribe el script si cambió y un `package.json` mínimo y corre `npm install --no-audit --no-fund --save-exact <paquetes>` (`npm.cmd` en Windows, `CREATE_NO_WINDOW`, hasta 5 min) si falta una versión fijada. El navegador lo usa sin cambios de comportamiento (Playwright, Node 18). WhatsApp fija `baileys@7.0.0-rc14` (la `latest` de npm, de julio de 2026) y `qrcode@1.5.4`, con Node 20 o más (lo exige Baileys 7).
+  - Carpetas: paquete en `app_data/whatsapp-agent`; datos por biblioteca en `app_data/whatsapp/<biblioteca>`: `auth/` (claves del dispositivo vinculado, `useMultiFileAuthState`), `media.json` (los últimos 500 mensajes con archivo, para descargarlos después de un reinicio) y `store.json` (el `WhatsAppStore`).
+  - Supervisor (plugin `whatsapp-link`, cada 3 s): un `Link` para la biblioteca seleccionada con `whatsapp.enabled`, solo en escritorio y nunca en un cliente (`is_supported`). Decide bajo el lock del link, así una desconexión, que apaga la sección con ese lock tomado, no vuelve a abrirlo. Relee la configuración solo si cambió `config_generation` o pasó un minuto. Guarda el almacén como mucho cada 15 s si cambió. Manda las autorespuestas vencidas.
+  - Proceso: `node whatsapp_agent.mjs <carpeta de datos>`, stdin y stdout por pipe, stderr descartado, `console.*` del script redirigido a stderr y logger de Baileys en silencio. Si termina solo, se reinicia a los 10 s; si no se pudo instalar (sin Node, npm falló), queda en error y reintenta a los 5 min o con **Reintentar**.
+  - Protocolo, una línea JSON por mensaje:
+    - Eventos: `{ "event": "qr", "svg": "<svg…>" }`; `{ "event": "state", "state": "connecting|open|closed|loggedOut|replaced", "account"?: { "id", "name" }, "reason"? }`; `{ "event": "chats", "chats": [{ "id", "name"?, "timestampMs"?, "unread"? }] }`; `{ "event": "chatsDeleted", "ids": [] }`; `{ "event": "contacts", "contacts": [{ "id", "name"?, "notify"? }] }`; `{ "event": "messages", "live": bool, "messages": [{ "chat", "id", "fromMe", "sender"?, "senderName"?, "timestampMs", "text", "kind", "fileName"? }] }`.
+    - Pedidos y respuestas: `{ "id": 4, "op": "send", "chat", "text" }`; `{ "id": 5, "op": "sendFile", "chat", "base64", "fileName", "mimetype", "caption"?, "asImage" }` → `{ "id", "ok": true, "message": {…, "byNotia": true} }`; `{ "id": 6, "op": "download", "messageId" }` → `{ "id", "ok": true, "base64", "mimetype", "bytes" }`; `{ "op": "logout" }`. Un fallo es `{ "id", "ok": false, "error": "<primera línea>" }` y vuelve al modelo como `conflict` reintentable. Esperas: 30 s, 120 s con archivos o descargas, 15 s para desvincular.
+  - Ids: el script prefiere el id con número (`remoteJidAlt`, `participantAlt`, `pnJid`, `phoneNumber`, los `lidPnMappings` del historial y `lid-mapping.update`); si no lo conoce, queda el `@lid`. Se ignoran reacciones, ediciones, borrados y mensajes de protocolo.
+  - Conexión: `markOnlineOnConnect: false` (el teléfono sigue notificando), `syncFullHistory: false`, `Browsers.windows('Notia')`, versión de WhatsApp Web de `fetchLatestBaileysVersion` (o la de Baileys sin red), `getMessage` desde los mensajes recientes para los reenvíos. `restartRequired` (justo después de escanear) reconecta enseguida; otros cortes, con espera creciente de 3 s a 60 s. `loggedOut` borra la sesión y el script termina: el adaptador apaga `enabled`, borra el almacén y la sección explica que hay que volver a conectar. `connectionReplaced` termina igual, sin borrar la sesión.
+  - Mensajes vivos (`live`): uno de otra persona en un chat con autorespuesta (re)programa su respuesta a `ahora + WHATSAPP_WAIT`; uno propio que no mandó Notia (el Owner desde el teléfono) la cancela. Al vencer, un hilo por chat (nunca dos a la vez para el mismo) descarga las imágenes, arma el prompt, llama al modelo (hasta 180 s) y solo envía si los mensajes sin responder siguen siendo los mismos, no hay otra espera para el chat y la autorespuesta sigue prendida.
+  - `preview` arma la confirmación (hunk `whatsapp`: «Enviar por WhatsApp a Juan Pérez», con el chat, el número y el texto o el archivo). Un chat no permitido vuelve al modelo antes de preguntar. `backend_runtime` ofrece las herramientas solo si el WhatsApp de la biblioteca está conectado en este host (`is_connected`).
+  - El log solo registra el paso («herramienta … hecha», «autorespuesta enviada»), nunca números, nombres ni textos.
+- **Comandos de Configuración** (`registry.rs`; todos remotos, así un cliente configura el WhatsApp de su host): `whatsapp_view { libraryId, query }`, `whatsapp_connect { libraryId, query }`, `whatsapp_disconnect { libraryId, query }` y `whatsapp_set_chat { libraryId, query, chatId, read, write, autoReply, prompt }`. Los cuatro devuelven `WhatsAppView`: `{ available, unavailableReason?, enabled, state: off|starting|qr|open|closed|error, qrSvg?, account?: { name, number }, message?, chats: [{ id, name, group, lastMessageMs, read, write, autoReply, prompt }], totalChats }` (hasta 200 chats que coinciden con `query`, búsqueda en Rust por nombre o número).
+  - La sección `whatsapp` es del backend: `backend_write_library_config` no la acepta de la ventana, la lectura que recibe la ventana la quita (`without_whatsapp`), y la copia sin conexión de un cliente conserva la del host (`HOST_ONLY_KEYS`).
+- **Interfaz** (`settings/WhatsAppSection.tsx`, `services/whatsapp/whatsappRuntime.ts`, sección «WhatsApp» en Integraciones). React solo muestra: estado con el nombre y número, QR (`<img>` con el SVG que manda Rust) y los pasos para vincular, **Conectar**/**Reintentar**/**Cancelar**/**Desconectar**, buscador, y por chat interruptores con texto visible (Lectura, Escritura, Autorespuesta; 44 px en táctil) y **Prompt**, que abre el texto con **Guardar**. Relee la vista cada 2 s mientras conecta o espera el QR y cada 10 s conectado; la búsqueda espera 300 ms. Ícono con el verde salvia de la paleta. Debajo de 560 px de ancho los controles bajan debajo del nombre.
+- **Telegram** (`app/src/telegram_worker.rs`).
+  - `PendingBatch` por chat (reemplaza a `PendingText`): textos, audios transcriptos, fotos, PDF e imágenes, y álbumes ya completos (`PendingAlbum.batched`) se suman con `add_to_batch` (hasta 10 archivos) y cada mensaje mueve `ready_at` a `ahora + TELEGRAM_WAIT`. Un hilo por lote revisa cada segundo y, al vencer, lo manda por `dispatch_text` (solo texto: respuesta pendiente, clasificador o cola) o lo encola con sus archivos. Las partes se unen con salto de línea.
+  - `waits_for_more`: un mensaje espera si el chat no tiene una pregunta abierta ni un pedido propio corriendo, y no es un comando. Si no espera, primero sale el lote pendiente (`flush_batch`) para conservar el orden.
+  - `/cancelar` con un lote esperando lo descarta («Listo, descarté lo que me estabas escribiendo.»).
+  - Un lote se guarda en el archivo del worker como pedido sin texto (`PendingBatch::stored`), así un reinicio o un cambio de biblioteca durante la espera lo informa como interrumpido; un worker que se detiene deja de esperar y no lo manda.
+  - El acuse de un audio dice «Audio recibido: …» (antes «Solicitud … recibida y en proceso», que ya no era cierto durante la espera).
+- **Diferencia con el Task Manager publicado.** Como la terminal y el navegador, WhatsApp es una herramienta del chat del tablero de la app que la publicación no tiene: lo rechazan la política, la proyección `PublishedTaskManager` y `is_published_tool`.
+- **Límites.**
+  - Un vínculo por PC host, el de la biblioteca seleccionada. Android no vincula WhatsApp (no hay Node.js); un cliente configura el de su host.
+  - Notia solo conoce lo que llegó desde que se vinculó, más el historial reciente que WhatsApp manda al vincular, y guarda los últimos 100 mensajes de cada chat. Un archivo viejo puede no descargarse si WhatsApp ya lo borró de sus servidores (el script pide el reenvío con `updateMediaMessage`).
+  - La autorespuesta y Telegram esperan en memoria: si Notia se cierra durante la espera de una autorespuesta, no responde; un pedido de Telegram queda informado como interrumpido y hay que mandarlo de nuevo (Notia no guarda su texto).
+  - Audios, videos y documentos recibidos se ven como `[audio]`, `[video]`, `[archivo]` con su nombre: el asistente no los escucha ni los abre.
+  - Baileys es una implementación no oficial de WhatsApp Web; WhatsApp puede cambiar el protocolo o limitar cuentas que automatizan mucho.
+  - Depende de Node.js 20+ y npm en la PC host y la primera instalación necesita internet.
+- **Validaciones.**
+  - `notia-backend-core`: 791 pasan, 7 ignoradas, y falla solo `image_generation::only_sexual_content_with_minors_is_refused`, que ya fallaba. Nuevas: 10 en `whatsapp::tests` (ids, configuración, almacén, lista de Configuración, acceso del agente y resolución de chats, páginas de mensajes, argumentos y confirmaciones, prompt y respuesta de la autorespuesta), y `whatsapp_is_the_owners_where_the_terminal_is_and_sending_asks_first`, más casos en el router. Se borró `only_a_message_long_enough_to_be_a_split_part_may_continue`.
+  - `notia-app`: 538 pasan, 13 ignoradas. Nuevas: `messages_written_line_by_line_become_one_request_after_the_last_wait` (reemplaza a `a_long_text_split_by_telegram_becomes_one_message`), `an_image_reaches_the_model_as_a_jpeg_of_bounded_size`, `a_moment_is_written_in_local_time`, `the_wire_messages_of_the_script_fit_the_store` y la ignorada `the_script_connects_and_offers_a_qr`, que se corrió con `--exact --include-ignored` y pasó: instala Baileys con npm en una carpeta temporal, el script se conecta a WhatsApp, manda el QR en SVG y rechaza un envío sin vínculo. `drives_a_real_browser_through_the_script` también pasó con el instalador común.
+  - Vitest: 760 en 151 archivos; nuevo `WhatsAppSection.test.tsx` (4: conectar y QR, permisos y prompt, búsqueda, dispositivo sin WhatsApp). `tsc -b` y eslint sin errores.
+  - `cargo check` Android (`aarch64-linux-android`): sin errores, 59 warnings, los mismos que la línea base.
+  - Inestabilidad previa vista al filtrar por `telegram`: `telegram_service::tests::endpoint_accepts_standard_bot_token_shape` falla a veces en paralelo porque otra prueba prende el modo cliente global (`CLIENT_DEVICE`) que lee `api_base`; pasa sola y en la suite completa. No se tocó.
+- **Pendiente.** Escanear el QR con un teléfono real y probar con el modelo real: la lista de chats después del historial, leer un chat, mirar una imagen, escribir y mandar un archivo con confirmación (app, Telegram y Tarea IA), una autorespuesta con prompt e imagen, cancelarla escribiendo desde el teléfono, desvincular desde el teléfono, reinicio de Notia con la sesión guardada, y la sección desde una tablet conectada como cliente. En Telegram: varios mensajes seguidos, un álbum con texto, un audio, `/cancelar` durante la espera y la respuesta inmediata a una confirmación.
+
+## Tareas IA: trámites por WhatsApp con espera de respuesta (2026-10-30)
+
+- **Pedido.** Que una Tarea IA pueda gestionar un chat de WhatsApp como un hilo de mail: enviar un mensaje y esperar la respuesta, para resolver un trámite con una empresa (Swiss Medical, Movistar). Implementado como se propuso: una espera `whatsapp`, que espere a que la otra parte termine de escribir, guía para trámites con bots y operadores, y escribir a un número sin chat.
+- **Decisiones propias (no consultadas; se pueden cambiar).**
+  - Aprobaciones: no se agregó nada. La Tarea IA ya tiene «Confirmar todos» a nivel tarea (al crearla o al responder una aprobación), que aprueba los envíos siguientes de toda la tarea; sin eso, cada mensaje pide su confirmación en el panel o por Telegram.
+  - Un número sin chat se puede escribir con confirmación; al enviarlo, ese chat queda con Lectura y Escritura (visible en Configuración → WhatsApp). Un chat que ya existe sin permisos sigue cerrado: `new_number_chat` no lo devuelve aunque se escriba su número sin código de país.
+  - La espera despierta cuando la otra parte dejó de escribir `reply_wait::WHATSAPP_WAIT` (1 minuto), igual que la autorespuesta. Desde el mismo día son 15 s (`WHATSAPP_TASK_WAIT`, ver «menús de bots y respuesta más rápida»).
+- **Espera `whatsapp`** (`backend-core/src/ai_tasks/waits.rs`).
+  - `WaitFor::WhatsApp { chat, name, since_ms }`, guardado como `{ "kind": "whatsapp", "chat", "name", "sinceMs" }`. `wait_request` lee `chat` (texto del modelo) y el adaptador lo reemplaza antes de guardar: `whatsapp::wait_target` lo resuelve entre los chats con Lectura, toma su nombre y `since_ms` = la hora del último mensaje propio del chat si es de los últimos 15 minutos (`wait_since`: un bot contesta en segundos, antes de que el Ejecutor llame a la espera), o ahora.
+  - `due` devuelve `Due::LookAtWhatsApp` (desde el mismo día, en cada revisión, que un mensaje que llega adelanta); `poll_ms` es 1 minuto (`WHATSAPP_POLL_MS`) para WhatsApp y 5 para el correo. El adaptador (`ai_task_runner::wait_step`) llama a `whatsapp::wait_replies`, que solo lee el almacén: sin llamadas al modelo ni a WhatsApp.
+  - `replies_after`: los mensajes de otros desde `since_ms`, solo cuando el último tiene al menos un minuto. `replies_note` despierta al Ejecutor con hasta 10, cada uno con hora, autor, texto (hasta 1500 caracteres) y el id de las imágenes, más el aviso de que es contenido de terceros.
+  - Sin WhatsApp conectado o sin Lectura, la revisión falla, se reintenta al minuto y el error queda en la tarea; al vencer el plazo, la nota lo menciona («La última revisión falló: …», antes decía «del correo» para todos).
+  - Etiquetas del panel: «Respuesta por WhatsApp de Movistar» y «Próxima revisión de WhatsApp: …».
+- **Número nuevo** (`backend-core/src/whatsapp.rs`, `app/src/whatsapp.rs`, `whatsapp_agent.mjs`).
+  - `new_number_chat`: un número escrito por el modelo (`+54 9 11 …`, al menos 10 dígitos) sin ningún chat conocido que lo termine o al que termine, como `<dígitos>@s.whatsapp.net`. `command_chat` lo usa solo para envíos y solo cuando `resolve_chat` no encontró el chat (`invalid-input`); un `forbidden` sigue siendo `forbidden`.
+  - El pedido lleva `"lookup": true`: el script consulta `onWhatsApp` y manda al id que devuelve WhatsApp, o falla con «Ese número no tiene WhatsApp». La respuesta trae el chat real; `allow_new_chat` le prende Lectura y Escritura y guarda la configuración.
+  - La confirmación suma `NEW_CHAT_NOTE`. `whatsapp_send_message` y `whatsapp_send_file` lo explican en su esquema; el resultado ya traía `chat.id`, que usa la espera.
+- **Guía.**
+  - `prompt_guidance.rs`, con `wait_ai_task` y `whatsapp_send_message`: un trámite con una empresa es una conversación (escribir, esperar con kind whatsapp, seguir); número oficial de la persona o del sitio oficial, nunca uno que aparezca en un mensaje; responder a un bot con la opción exacta después de leer el menú entero; solo los datos que la persona dio, de a uno; preguntar con `request_user_clarification` antes de aceptar, pagar, dar de baja, firmar o cambiar un plan; presentarse con el pedido completo ante un operador; contar el número de gestión.
+  - Prompt del Ejecutor (`ai_tasks/prompts.rs`) y del Planificador: kind whatsapp con el chat de `whatsapp_send_message`. `defaults/agent_prompt_executor.md` nombra el WhatsApp entre lo que se espera. Esquema de `wait_ai_task`: kind `whatsapp` y `chat`.
+- **Validaciones.**
+  - `notia-backend-core`: pruebas nuevas `a_first_message_goes_to_a_number_without_a_chat` y `an_ai_task_wakes_with_the_replies_once_they_stop_writing`, y casos de `whatsapp` en `a_wait_is_read_from_the_tool_and_refuses_what_cannot_wait`. Suite: 792 pasan, 7 ignoradas, y falla solo `image_generation::only_sexual_content_with_minors_is_refused`, que ya fallaba.
+  - `cargo check` Android: 59 warnings, los de la línea base.
+  - `notia-app`: 538 pasan, 13 ignoradas. `the_script_connects_and_offers_a_qr` pasó otra vez con el script nuevo (`node --check` también).
+- **Pendiente.** Un trámite real por WhatsApp con un bot de empresa y el modelo real: el primer mensaje a un número nuevo, la espera de la respuesta en varios mensajes, el menú del bot, una pregunta a la persona por Telegram en medio, y el vencimiento del plazo sin respuesta.
+
+## Tareas IA por WhatsApp: menús de bots y respuesta más rápida (2026-10-30)
+
+- **Pedido.** Una Tarea IA que gestionaba con el bot «Swity» de Swiss Medical no veía las opciones de los menús y tardaba mucho en contestar cada mensaje del bot. El usuario sugirió bajar el tiempo de espera.
+- **Qué pasaba** (del informe de la tarea y la captura del chat).
+  - Los menús con botones o listas llegaban como `[mensaje de otro tipo]`: `describe` de `whatsapp_agent.mjs` no conocía `buttonsMessage`, `listMessage`, `templateMessage` ni `interactiveMessage`. La pregunta «¿tu consulta está relacionada con un cambio de plan?» con **Sí**/**No** venía dentro del mensaje interactivo, así que el agente no la vio y escribió otra cosa («Reclamo»). El bot repitió la pregunta.
+  - Cada turno tardaba unos 4 minutos: 60 s de silencio (`WHATSAPP_WAIT`, el de la autorespuesta), revisión cada 60 s y el tick del watch cada 60 s, más la corrida del modelo.
+  - Al esperar otra vez en el mismo chat sin escribir nada, la espera arrancaba en el último mensaje propio (`wait_since`), así que despertaba enseguida con las mismas respuestas que ya había mostrado. En el informe: «Fin de la espera … 12:34» dos veces.
+- **Menús** (`whatsapp_agent.mjs`, `backend-core/src/whatsapp.rs`).
+  - `menuOf` lee el texto y las opciones de `buttonsMessage` (botones), `templateMessage` (`hydratedTemplate`: respuestas rápidas), `listMessage` (filas de todas las secciones) e `interactiveMessage` (native flow: `quick_reply` y filas de `single_select`). Los botones de enlace, llamada o copiar código van al texto («Enlaces: Web: https://…»), porque no se responden. Tope: 30 opciones de hasta 100 caracteres.
+  - El mensaje llega como `kind: "menu"` con `options`. `StoredMessage.options` se guarda en el almacén, recortado y sin vacías (hasta 30, de hasta 200 caracteres). `MessageKind::Menu` se muestra como `[menú]` cuando no tiene texto.
+  - `StoredMessage::shown_text` agrega «Opciones del menú: «Sí» · «No»». Lo usan `whatsapp_read_messages`, el aviso de la espera (con «(menú, id …)») y el prompt de la autorespuesta.
+  - Las respuestas a menús (`buttonsResponseMessage`, `templateButtonReplyMessage`, `listResponseMessage`, `interactiveResponseMessage`) se leen como texto con la opción elegida, también las que el Owner toca en su teléfono.
+- **Elegir una opción** (`whatsapp_send_message { chat, text, replyTo? }`).
+  - Con `replyTo` (el id de un mensaje con opciones), `menu_option` busca la opción del menú: exacta, y si no, sin distinguir mayúsculas. Si no está, el modelo recibe un error con la lista de opciones. La confirmación dice «Elige en el menú del chat la opción: …».
+  - El adaptador pide `{ "op": "reply", "chat", "messageId", "option" }`. El script toma el mensaje original de los recientes en memoria y manda lo mismo que manda el teléfono al tocar la opción, citando el menú:
+    - botones: `buttonReply` `plain`;
+    - plantilla: `buttonReply` `template`;
+    - lista: `listReply` con `singleSelectReply.selectedRowId`;
+    - native flow: `interactiveResponseMessage` con `nativeFlowResponseMessage { name, paramsJson: {"id"}, version: 3 }`, armado con `generateWAMessageFromContent` y `relayMessage`.
+  - Un menú que llegó antes de la última conexión del script ya no está en memoria: el error pide mandar la opción como texto, sin `replyTo`.
+  - Guía: el esquema de `whatsapp_send_message`, la nota de `whatsapp_read_messages`, el aviso de la espera y el prompt del Ejecutor explican `replyTo`.
+- **Espera más corta** (`reply_wait.rs`, `ai_tasks/waits.rs`, `app/src/ai_task_runner.rs`, `app/src/whatsapp.rs`).
+  - `WHATSAPP_TASK_WAIT` = 15 s de silencio para las Tareas IA (un bot manda su menú en una ráfaga de segundos). La autorespuesta sigue en 60 s (`WHATSAPP_WAIT`).
+  - El watch ya no duerme 60 s fijos. `wait_for_next_look` duerme hasta el intervalo o hasta una revisión pedida. Un mensaje de otro en un chat que espera una tarea (`watched_chats`, recalculado en cada revisión con las esperas guardadas, también las de una corrida en curso) pide una revisión a los 15 s + 1 s (`whatsapp_message_arrived`). Al dejar una tarea esperando, se pide una revisión a 1 s por si la respuesta llegó durante la corrida.
+  - `due` devuelve siempre `LookAtWhatsApp` para WhatsApp: leer el almacén no cuesta nada. El intervalo de 60 s queda como respaldo. Panel: «Sigue 15 s después del último mensaje que llegue» en lugar de «Próxima revisión de WhatsApp».
+  - `wait_since(messages, now, run_started_ms)`: la espera nunca arranca antes del inicio de la corrida del Ejecutor (`CurrentRun.started_ms`), así no repite las respuestas del aviso que la despertó.
+  - Quedan dos demoras: los 15 s de silencio y la corrida del modelo. Si una persona escribe en partes separadas por más de 15 s, la tarea despierta con la primera parte; el Ejecutor puede leer el chat y volver a esperar.
+- **Decisiones propias (no consultadas; se pueden cambiar).** 15 s de silencio; la opción se elige solo con `replyTo` explícito (sin `replyTo`, el texto se manda como texto); el menú se cita en la respuesta, como en el teléfono.
+- **Validaciones.**
+  - Script contra los tipos reales de Baileys 7.0.0-rc14 (prueba descartable en el scratchpad, no está en el repo): los cuatro tipos de menú, codificados y decodificados con `proto.Message`, dan el texto y las opciones esperadas. Cada opción arma una respuesta válida (`buttonsResponseMessage`, `listResponseMessage`, `interactiveResponseMessage`, `templateButtonReplyMessage`), que cita el menú (`stanzaId`) y se lee de vuelta como la opción. `node --check` sin errores.
+  - `notia-backend-core`: 799 pasan, 7 ignoradas, y falla solo `image_generation::only_sexual_content_with_minors_is_refused`, que ya fallaba. Nueva: `a_bots_menu_shows_its_options_and_one_is_chosen_as_written`. Casos nuevos en `an_ai_task_wakes_with_the_replies_once_they_stop_writing` (no repetir el aviso) y `a_wait_is_read_from_the_tool_and_refuses_what_cannot_wait` (WhatsApp se revisa cuando se pide).
+  - `notia-app`: 539 pasan, 14 ignoradas. Nueva: `a_reply_in_a_watched_chat_makes_the_watch_look_early`.
+- **Pendiente.** Repetir el trámite con Swity: que el menú de Sí/No aparezca con sus opciones, que tocar una opción con `replyTo` haga avanzar al bot, y el tiempo real entre la respuesta del bot y el próximo mensaje de la tarea. WhatsApp podría no aceptar una respuesta de native flow mandada desde un dispositivo vinculado. Si el bot no reacciona, el Ejecutor puede mandar la opción como texto.
+
+## Scripts Python de soporte en `.agent/scripts` (2026-10-30)
+
+- **Pedido.** Una carpeta `.agent/scripts` donde la IA cree scripts Python de soporte cuando un trabajo difícil no tiene herramientas o se optimiza con un script, y donde la persona pueda agregar los suyos; los scripts funcionan como herramientas de la IA.
+- **Decisiones propias (no consultadas; se pueden cambiar).**
+  - Tres herramientas fijas (`list_agent_scripts`, `run_agent_script`, `save_agent_script`) en lugar de una herramienta por script: el catálogo, la autorización, el journal y las pausas trabajan con nombres fijos. Para que el modelo los vea como herramientas, la descripción de `run_agent_script` lista cada script con su firma y descripción en cada turno nuevo.
+  - Guardar un script (código nuevo o cambiado) pide confirmación con el archivo entero; correr uno ya guardado no la pide. Los de la persona son de confianza porque los puso ella. La guía le pide al modelo no cambiarlos salvo pedido o error.
+  - Misma frontera que la terminal: solo el Owner, canales App y Telegram (y Tareas IA), solo en la PC host, nunca el tablero publicado ni Meeting. `list_agent_scripts` es la única de solo lectura: la revisión de cada hora puede ver la lista, nunca correr.
+  - Área de router propia, `scripts`. Como comunes, las tres dejaban sin lugar a Finanzas en la revisión de cada hora (`the_hourly_review_reads_every_area_it_asks_for`). El router la elige por la descripción, el agente puede cambiar a ella con `change_tool_areas` y, sin router, la eligen las palabras «script» o «python».
+  - Corren con el Python 3 de la PC, sin entorno propio ni paquetes instalados por Notia.
+- **Formato** (`backend-core/src/agent_scripts.rs`). `<nombre>.py` con nombre `[a-z][a-z0-9_]*` de hasta 64 caracteres, que es el nombre del script. Empieza (después de líneas `#`) con un docstring de comillas triples, dobles o simples. Si trae frontmatter `---`, se leen `description:` y `parameters:` con líneas `- nombre (tipo, requerido): descripción`. Tipos: string, number, integer, boolean, array, object, con sinónimos en castellano (texto, entero…). Sin frontmatter, la descripción es la primera línea del docstring; sin docstring, queda vacía y el script igual corre. Hasta 100 scripts de hasta 200 KB y 20 parámetros cada uno. Los archivos con otro nombre, demasiado grandes o que no son UTF-8 aparecen en `unreadable` de la lista.
+- **Herramientas** (esquemas en `defaults/tool_schemas.json`, política `ToolPolicy::Scripts`):
+  - `list_agent_scripts {}`: `scripts` con `name`, `file`, `description` y `parameters` como JSON schema, más `unreadable`.
+  - `run_agent_script { script, arguments?, timeoutSeconds? }` (120 s por defecto, hasta 1800). `arguments` es un objeto (o un texto JSON); los parámetros requeridos y los tipos declarados se comprueban antes de correr (`check_arguments`), y los demás pasan igual. El resultado trae `ok`, `status`, `exitCode`, `seconds`, `result` si stdout es JSON o `output` con los últimos 20 000 caracteres (y `outputCut`), `stderr` con los últimos 4000 y una `note` si falló.
+  - `save_agent_script { name, description, parameters?: [{ name, type, required, description }], code }`: `SaveRequest::source` escribe el encabezado (descripción, parámetros y cómo corre) y después el código, sin el encabezado propio que pudiera traer. La confirmación (hunk `.agent/scripts`) muestra la ruta y el archivo entero.
+- **Adaptador** (`app/src/agent_scripts.rs`).
+  - Lee la carpeta con `std::fs` desde la raíz de escritorio de la biblioteca, sin el inventario: un script nuevo se ve en el próximo turno.
+  - `describe_scripts` reemplaza la descripción de `run_agent_script` después del ruteo de un turno nuevo, así un turno retomado conserva la que tenía.
+  - Python: `py -3`, `python` y `python3` en Windows (el `python3` de Windows suele ser el acceso a la Microsoft Store, que falla `--version`); `python3` y `python` en Linux y macOS. Sirve el primero cuyo `--version` sale bien y dice «Python 3», y se recuerda solo un éxito, así se encuentra un Python instalado después.
+  - Ejecución: `<python> -X utf8 <script>` en la raíz de la biblioteca, con `NOTIA_LIBRARY`, `NOTIA_SCRIPTS`, `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1` y `PYTHONDONTWRITEBYTECODE=1` (sin `__pycache__` en la biblioteca). Los argumentos van como JSON por stdin, que después se cierra. stdout y stderr se guardan hasta 2 MiB cada uno. Al vencer el tiempo o cancelarse el pedido, se corta con `terminal::stop`, ahora compartido (`taskkill /T` en Windows; en Unix, grupo de procesos propio). Sin consola en Windows.
+  - Guardar crea `.agent/scripts` (también está en `AGENT_FOLDERS`) y escribe por `library_documents`. Al preparar el espacio del agente se escribe `.agent/scripts/README.md` (`defaults/agent_scripts_readme.md`) si falta: explica el formato con un ejemplo.
+  - El log dice solo si un script se creó o se reemplazó y cómo terminó una corrida.
+- **Guía del prompt** (`prompt_guidance.rs`, con `run_agent_script` y `save_agent_script`): cuándo escribir un script; reusar o mejorar uno existente; genéricos y con parámetros; biblioteca estándar; `json.load(sys.stdin)` y resultado en JSON; nada interactivo; no borrar ni sobrescribir lo que el pedido no nombra; sin contraseñas ni tokens; no usarlos para lo que ya tiene herramienta propia; no tocar los de la persona salvo pedido o error; corregir y reintentar si fallan.
+- **Diferencia con el Task Manager publicado.** Como la terminal, son herramientas del chat del tablero de la app que la publicación no tiene: lo rechazan la política, la proyección `PublishedTaskManager` y `is_published_tool`.
+- **Límites.**
+  - Un script corre con los permisos de la persona en la PC host: puede leer y escribir lo que ella puede. Notia solo confirma el código cuando lo escribe la IA.
+  - Sin entorno virtual ni instalación de paquetes por Notia.
+  - En Android y en una copia sin conexión no hay scripts.
+  - La salida que lee el modelo es texto (sin imágenes).
+- **Validaciones.**
+  - `notia-backend-core`: 798 pasan, 7 ignoradas, y falla solo `image_generation::only_sexual_content_with_minors_is_refused`, que ya fallaba. Nuevas: 5 en `agent_scripts::tests` (encabezado y parámetros, argumentos, lista en la descripción, resultado JSON o texto, archivo guardado) y `the_support_scripts_are_the_owners_where_the_terminal_is_and_saving_asks_first`, más el caso del router.
+  - `notia-app`: 537 pasan y 14 ignoradas en la suite completa. Falló una vez `terminal::tests::a_command_past_its_time_is_stopped_with_what_it_started` con la carga de la suite; sola pasó dos veces. La ignorada nueva `a_script_runs_with_its_arguments_and_returns_its_json` se corrió con `--include-ignored` y pasó con el Python 3.13 de esta PC: argumentos por stdin, `NOTIA_LIBRARY`, UTF-8, JSON de vuelta y corte por tiempo.
+  - `tsc -b` sin errores; Vitest de `src/services/ai` (5). `cargo check` Android: 59 warnings, los de la línea base.
+- **Pendiente.** Con el modelo real: que escriba un script cuando conviene (y no cuando hay una herramienta), la confirmación con el código en la app y en Telegram, un script de la persona, un paquete faltante, una Tarea IA que use uno, y la carpeta vista desde el explorador en Windows y en la tablet conectada como cliente.
+
+### README de `.agent/scripts` como archivo `#System` (2026-10-30)
+
+- **Pedido.** Que `.agent/scripts/README.md` sea de tipo System (no editable por la persona) y que Notia asegure que siempre exista.
+- `agent_scripts::README_PATH` entra en `agent_workspace::SYSTEM_FILES` (8 archivos). Con eso, `library_session` rechaza que la persona lo edite, lo renombre, lo mueva, lo borre o cree otro archivo con ese nombre, y el editor lo abre de solo lectura. `holds_system_files(".agent/scripts")` también es verdadero, así que la carpeta no se borra, renombra ni mueve. Los scripts de la carpeta siguen siendo de la persona: se agregan, cambian y borran como cualquier archivo.
+- `agent_scripts::ensure_readme` escribe el README de `defaults/agent_scripts_readme.md` con contexto `#System` cuando falta o cuando su contenido difiere del que trae Notia, así una versión nueva de Notia lo actualiza. Lo llama `write_missing_lists`, que corre al preparar el espacio del agente en cada sesión y en cada turno del Owner con memoria (`ensure_agent_list_files`, también desde el agente autónomo). Un README borrado por fuera de Notia vuelve en el próximo turno. El texto dice que lo mantiene Notia.
+- **Validaciones.** `notia-backend-core`: `agent_workspace` (18) pasa, con casos nuevos para el README y su carpeta. `notia-app`: 538 pasan, 14 ignoradas.
+- **Pendiente.** Ver en la app el README de solo lectura, que el explorador rechace borrarlo o borrar la carpeta, y que vuelva después de borrarlo desde el Explorador de Windows.
+
+## Asistente: entradas de `improve.md` del 28 al 31 de octubre (2026-10-31)
+
+- **Pedido.** Resolver las 54 entradas de `.agent/memory/improve.md` de gaia (muchas repetidas: `add_agent_thought` lleno aparecía 13 veces) y sacarlas del archivo. Quedó una sin resolver (leer chats de Teams sin el navegador).
+- **Pensamientos llenos** (`agent_workspace.rs` del core y del adaptador, `agent_knowledge.rs`).
+  - `thoughts.md` de gaia tenía 292 apuntes y unos 103.000 caracteres, más que `THOUGHTS_LIMIT` (100.000). La organización por el modelo debía bajarlo a `THOUGHTS_TARGET` en una sola respuesta; si no lo lograba, `apply_operations` rechazaba todas las listas, y cada `add_agent_thought` fallaba con «Tus pensamientos están llenos y no se pudieron reorganizar».
+  - `without_oldest_thoughts(thoughts, budget)` quita los apuntes más viejos hasta entrar en el presupuesto y nunca quita el último.
+  - `append_thought_locked` lo usa cuando el archivo pasa `THOUGHTS_LIMIT`: baja a `THOUGHTS_TARGET` y la nota nueva siempre entra. Ya no pasa por `append_bounded` ni llama al modelo antes de guardar. La organización que sigue a cada guardado une y descarta como antes.
+  - `apply_operations` recorta igual los pensamientos que no entran en su presupuesto, en lugar de rechazar las operaciones de los seis archivos.
+  - Decisión propia: los pensamientos son notas de trabajo, así que descartar los más viejos es aceptable; no se archivan aparte. Memoria, reglas, biografía, habla y personas siguen como estaban.
+- **Tareas IA** (`ai_tasks/mod.rs`, `prompts.rs`, `tools.rs`, `ai_task_runner.rs`, esquemas).
+  - `resume_ai_task` acepta `goal` (el objetivo nuevo y completo) y `restart`. Con alguno de los dos sirve en cualquier estado: una tarea que trabaja se detiene primero (`stop`) y, si no se detuvo en 20 s, devuelve `conflict` reintentable.
+  - `AiTask::replan(goal, restart)`: con `goal` conserva los pasos hechos y deja `replan = true` (serde `default`, se omite si es falso). `next_work` vuelve a `Plan`, y `planner_request` muestra los informes hechos y pide solo los pasos que faltan, o uno que verifique y cierre si ya está cumplido. `set_plan` agrega esos pasos después de los hechos, en una ronda nueva, así una aprobación del objetivo viejo no los cubre. Con `restart` olvida pasos y revisiones. Las dos opciones descartan la espera, la aprobación pendiente, el resultado y el error.
+  - `parse_plan(answer, goal)` ya no falla: sin pasos en la respuesta, usa los pasos numerados o con viñetas del objetivo y, si tampoco hay, un paso «Cumplir el objetivo» con el objetivo como detalle.
+  - `cancel` espera hasta `STOP_WAIT` (20 s) a que el runner suelte la tarea. Así `list_ai_tasks` la muestra cancelada enseguida, en la herramienta y en el panel. Si no se detiene a tiempo, el resultado lo dice.
+  - `create_ai_task` devuelve `status` y una nota que distingue la tarea recién creada (el Planificador arma el plan; si el objetivo pide esperar una hora, el paso espera) y dice cómo corregirla sin crear otra.
+  - Las herramientas de una ronda corren en orden. El listado viejo se debía a que `cancel` volvía antes de que el runner terminara.
+- **Task Manager** (`task_manager_tools.rs`, `task_manager_commands.rs`).
+  - `list_tickets` busca con `text_search` (`matching_tickets`): cada palabra por separado en el título, el cuerpo y las etiquetas, sin acentos, conectores ni plurales, y también en el texto con las palabras pegadas («ApiSearch» encuentra «API Search» y al revés). Si ninguno tiene todas las palabras, devuelve los que tienen más, primero. Antes buscaba la frase entera como subcadena.
+  - `TaskTicketListRequest.title_prefix` (`titlePrefix`, serde `default`) filtra por comienzo del título, sin mayúsculas ni acentos.
+  - El resultado de toda mutación confirmada suma `applied` y `status` («Aplicado: el cambio ya quedó guardado…»), porque el `preview` del resultado parecía pendiente de confirmar. La app, el tablero publicado y el chat usan el mismo `list_tickets`.
+- **Navegador** (`backend-core/src/browser.rs`, `app/src/browser.rs`, `browser_agent.mjs`).
+  - `SeenPages` guarda la última instantánea completa y las 3 anteriores. `check_reference` acepta una referencia que ya no está en la última si una anterior la muestra con nombre (`button "Enviar"`). `described_target` pasa ese rol y nombre al proceso como `described`.
+  - En el script, `present` usa la referencia si sigue en la página. Si no, `relocated` toma una instantánea y usa el único elemento con el mismo rol y nombre. `act` reintenta una vez un clic, una escritura o una opción que agotó el tiempo o encontró el elemento separado del DOM, sobre el elemento encontrado de nuevo. Cada caso queda en `notes`, que llega al modelo.
+  - `enableAccessibility`: en una app de Flutter (`flt-semantics-placeholder`, el botón «Enable accessibility») despacha el clic que activa su árbol de accesibilidad. Lo hace después de cada acción y antes de una instantánea entera, una vez por dirección de la página.
+  - Probado con el script real y Edge sin ventana: la referencia vieja de un botón que la página redibujó hizo clic en el nuevo, con su nota, y el campo detrás del botón de Flutter apareció en la instantánea. Los formularios en iframes ya funcionaban (referencias `f1e3`): el login de Swiss Medical era una app de Flutter.
+  - Guía nueva: Google rechaza el login en un navegador automatizado, Microsoft pide Authenticator (avisar antes y ofrecer otro método), conviene navegar directo a la página de ingreso, y hay que verificar el destinatario y el tipo de chat antes de enviar en un sitio (el caso de Teams que mandó al grupo).
+- **Gmail** (`mail_tools.rs` del core y del adaptador).
+  - `message_detail` suma `links` (`html_links`): texto y dirección http(s) de cada enlace del HTML, sin repetidos, hasta 40.
+  - `readable_text` revisa el texto de un PDF adjunto: menos del 85 % de caracteres habituales, o menos del 60 % de palabras largas con vocal, es texto ilegible (fuentes con codificación propia), y `attachment_view` devuelve `unsupported` con qué hacer en lugar de ese texto. No hay OCR.
+  - `trash_gmail_messages`, `move_gmail_messages`, `mark_gmail_spam` y `mark_gmail_read` aceptan `query` en lugar de `messageIds`. `change_query` lo lee y el adaptador lo resuelve en la confirmación y al aplicar (`query_matches`, hasta `MAX_QUERY_MESSAGES` = 500, páginas de la API). `with_message_ids` arma el mismo pedido con esos ids. La confirmación muestra la búsqueda y cuántos son.
+  - `move_gmail_messages` suma `markRead` (`Move.read`).
+  - Mover, spam y leído devuelven `finalState` (`final_state`): carpetas y si siguen sin leer de hasta 10 correos, leídos después del cambio.
+  - Decisión propia: el conjunto de una búsqueda se vuelve a buscar al aplicar, así que puede incluir un correo que llegó entre la confirmación y el cambio.
+- **Finanzas** (`backend_runtime.rs`, `finance_agent_inputs.rs`).
+  - `save_finance_transaction` con el id de un movimiento guardado lo completa con lo guardado (`with_stored_transaction`): alcanza con los campos que cambian. El esquema pide solo `id` dentro de `record`.
+  - Un registro de `save_finance_*` incompleto lista todos los campos que faltan juntos (`missing_fields`: prueba, completa el campo que nombra serde y vuelve a probar).
+  - `AgentInputError::fields` describe qué pide cada campo (`FIELD_HINTS`) y pide preguntarle a la persona en lugar de inventarlos. La guía de `create_finance_service` pide los datos que faltan en un mensaje.
+  - `create_finance_transaction` acepta `splits`: 2 a 10 partes con `amount`, `categoryId` y `description` opcional, que deben sumar `amount` (`split_parts`, en centavos). Cada parte es una llamada con id `«call»-N`, así tiene su propia referencia de origen y la deduplicación no la confunde con otra. La confirmación lista las partes y el resultado trae `parts`.
+- **Telegram** (`formatting.rs`).
+  - `emphasis_end`: el contenido de un énfasis no empieza ni termina con espacio («2 * 3» no es cursiva) y un `*` no es media `**`.
+  - `***x***` es negrita y cursiva.
+  - Una negrita o un tachado que no cierra en su línea se descarta en lugar de mostrar sus asteriscos; `__` se deja, por los nombres con guiones bajos.
+  - Los títulos van de `#` a `######` (`heading_text`), los ítems con sangría la conservan antes de la viñeta, y `1)` también es un ítem.
+  - Todos los envíos de Markdown ya pasaban por `markdown_to_telegram_html`; los asteriscos de los recordatorios salían de estos casos.
+- **Terminal** (`terminal.rs` del core y del adaptador).
+  - `run_terminal_command` acepta `diskUsage: { path }` en lugar de `command` (`DiskUsageRequest`). Es un parámetro y no una herramienta nueva por el presupuesto de herramientas de la revisión horaria.
+  - `scan_disk` recorre la carpeta una vez, sin seguir enlaces ni junctions. Suma el tamaño y los archivos de cada entrada directa, guarda los 15 archivos más grandes y cuenta lo que no pudo leer. Se corta a los `DISK_SCAN_TIMEOUT` (5 min) con `partial` o ante un cancel.
+  - `disk_usage_result` las ordena por tamaño (hasta 25) y suma notas sobre lo no leído o parcial. Pide la misma confirmación que un comando y no publica eventos de terminal.
+  - La descripción también pide `-ErrorAction SilentlyContinue` y acotar la carpeta o la profundidad al buscar con PowerShell: las carpetas sin permiso hacen que termine con `exitCode` 1.
+- **Documentos** (`library_tools.rs`, `backend_runtime.rs`).
+  - `read_active_markdown_document` resuelve la ruta de la pestaña con `workspace_logical_path`: barras invertidas, una barra inicial, la carpeta de la biblioteca delante (también `\\?\`). Si no es una ruta de la biblioteca, el error nombra el documento y dice cómo leerlo. Un `path` explícito se compara después de la misma normalización.
+  - `replace_library_document` usa `replacement_content`: si el contenido nuevo no trae frontmatter, conserva el del documento y reemplaza el cuerpo, también en el diff de la confirmación. El resultado suma `frontmatter` (`kept`, `replaced` o `none`), `charactersBefore`, `charactersAfter` y una nota que remite a `preview_markdown_edit` para cambios parciales.
+- **Guía** (`prompt_guidance.rs`):
+  - hacer en orden y una por vez las acciones encadenadas y contar cada una;
+  - corregir con `set_task_people` a quien la conversación dice que no es responsable;
+  - avisar que un bot de WhatsApp que promete un humano y vuelve al menú no deriva, y proponer otro canal;
+  - corregir una Tarea IA con `resume_ai_task` en lugar de cancelarla y crear otra;
+  - usar `splits` cuando el desglose se conoce.
+- **Entradas que ya estaban resueltas**: los menús de los bots de WhatsApp (sección del 2026-10-30).
+- **Sin resolver, queda en `improve.md`**: leer chats de Teams sin el navegador. Necesitaría la API de Microsoft Graph con un registro de aplicación propio de la persona, como Gmail. La guía indica leerlos con el navegador en teams.microsoft.com.
+- **Validaciones.**
+  - `notia-backend-core`: 806 pasan, 7 ignoradas, y falla solo `image_generation::only_sexual_content_with_minors_is_refused`, que ya fallaba. Nuevas:
+    - `a_corrected_goal_keeps_the_steps_done_and_plans_what_is_missing`;
+    - `tickets_are_found_word_by_word_and_by_title_prefix`;
+    - `a_pdf_text_in_its_own_encoding_is_unreadable_and_links_are_listed`;
+    - `short_reminders_never_show_their_markdown`;
+    - `a_disk_scan_is_asked_instead_of_a_command_and_reads_biggest_first`;
+    - `a_workspace_path_in_another_form_becomes_the_logical_path`;
+    - `a_whole_replacement_keeps_the_frontmatter_unless_it_brings_one`.
+  - También hay casos nuevos en las pruebas de pensamientos, plan, referencias del navegador y argumentos de Gmail.
+  - `notia-app`: 540 pasan, 14 ignoradas. Nueva: `a_movement_splits_into_categories_that_add_up_to_its_total`.
+  - El script del navegador se probó con Playwright 1.64.1 y Edge sin ventana (prueba descartable fuera del repo), y `node --check` pasa.
+  - `cargo check` Android: 59 warnings, los de la línea base.
+  - Sin cambios de frontend.
+- **Pendiente.** Con el modelo real y las cuentas reales:
+  - una Tarea IA corregida con `goal` mientras espera;
+  - un cambio de Gmail por búsqueda en una casilla grande;
+  - el aviso de PDF ilegible con la factura de Rappi (el umbral puede necesitar ajuste con PDFs reales);
+  - el uso de disco del perfil de usuario;
+  - una edición parcial de un movimiento de un documento;
+  - un gasto dividido;
+  - el login de Swiss Medical con la accesibilidad de Flutter;
+  - un recordatorio por Telegram.
+
+## Chat de Meeting sin respuesta final y entradas de `improve.md` del 1 y 2 de noviembre (2026-11-02)
+
+- **Pedido.** Arreglar el error «El runtime backend no devolvió una respuesta final» del chat de IA de Meeting. Resolver también 11 entradas nuevas de `.agent/memory/improve.md` de gaia y sacarlas del archivo. Sigue quedando la de Teams.
+- **Chat de Meeting** (`runtime.rs`, `meeting_tools.rs`, `meeting.rs`, `backend_runtime.rs`, `ai_chat.rs`).
+  - Causa, vista en `backend_operation_journal` de gaia: tres turnos («cambia todas…», «Volve a intentar», «arranca») quedaron en `waiting-confirmation` por `correct_meeting_transcript`, sin `preview`. El ejecutor no tenía vista previa para las herramientas de Meeting (`Ok(None)`), y `status_from_review` armó un estado sin `interaction`. `run_agent` del chat salía del bucle con ese error, que no se registraba.
+  - `meeting_tools::preview_text(name, arguments, record)` arma la confirmación.
+    - Una corrección prueba cada par sobre una copia de la reunión, en el orden en que se aplican, y muestra cuántas apariciones cambia cada uno y el total.
+    - Las notas y el contexto validan sus argumentos y muestran lo pedido.
+    - Sin reunión abierta, solo se puede cambiar el contexto.
+  - `meeting::preview_agent_tool` la usa con la reunión abierta, y `preview` del ejecutor la devuelve como `meeting:<biblioteca>`.
+  - `begin_confirmation_with_preview` usa `call_preview` cuando ni el ejecutor ni la revisión dan una vista previa: el nombre de la herramienta y sus argumentos. Así ninguna confirmación queda sin algo que mostrar, en ningún canal.
+  - `run_agent` del chat registra con `log_request_failure` cuando termina sin respuesta.
+- **Rasgos de habla llenos** (`agent_knowledge.rs`, `agent_workspace.rs`).
+  - El log repetía «un dato de la reflexión (forma de hablar) no se guardó: InvalidInput». `talk.md` tenía 49 rasgos y 7.930 caracteres, para un tope de 8.000 y una meta de 6.000. Es el mismo caso que tuvieron los pensamientos: el modelo no lo bajaba a la meta, la organización no aplicaba nada y cada rasgo nuevo fallaba.
+  - `without_oldest_thoughts` pasa a llamarse `without_oldest`. `apply_operations` lo aplica a `Talk` además de `Thoughts`, así que los rasgos más viejos se descartan si el modelo no los une: un rasgo más nuevo ya gana una contradicción.
+  - Memoria, reglas y personas siguen pidiendo que el modelo los achique.
+- **Ollama 500** (`backend_ollama.rs`, `agent.rs`).
+  - `map_service_error` marca como reintentables los errores del propio servidor (`is_server_failure`: Internal Server Error, Bad Gateway, Service Unavailable, Gateway Timeout, overloaded, HTTP 5xx). Antes ninguno lo era y el turno se cortaba al primer error.
+  - `max_provider_retries` pasa de 1 a 2. `call_provider_with_retry` espera antes de cada reintento (`PROVIDER_RETRY_PAUSES`: 2 s y 5 s) y un cancel corta la espera.
+  - En Telegram, un pedido que falla dice si alguna acción llegó a hacerse (`failure_progress`, por los eventos `ToolCompleted`), así se sabe si repetirlo es seguro.
+- **Tareas IA** (`ai_task_runner.rs`, `ai_tasks/prompts.rs`).
+  - `PhaseStop::Interrupted`: un plan, paso o revisión que se corta porque el proveedor falla (`ProviderUnavailable` o `Timeout`, que incluye «La IA no devolvió contenido ni solicitó herramientas») se intenta de nuevo hasta `MAX_RUN_RETRIES` (2), con 5 s entre intentos.
+  - Un paso cuyo informe es solo el resumen de acciones (`step_without_report`, que empieza con `WORK_SUMMARY_START` del agente) también vuelve a hacerse. Antes quedaba «Hecho» sin entregable.
+  - En los dos casos el paso queda `Failed` con cómo terminó. `executor_request` se lo muestra al Ejecutor con la orden de no repetir lo que ya cambió datos o mandó mensajes. Los pasos hechos se conservan. Agotados los intentos, la tarea falla y se puede reanudar.
+  - `owner_chat`: las preguntas, aprobaciones y el resultado de una tarea van al chat de Telegram del Owner (`owner_telegram_link`) aunque la tarea se haya creado en la app o en una Acción IA. Antes solo iban si se creó en Telegram.
+  - `answer_reply_from_telegram`: un mensaje del Owner que responde («Responder») al mensaje de una aprobación contesta la tarea: responde una pregunta o, en una confirmación o un plan, propone otra cosa. Para eso `IncomingTelegramUpdate.reply_to_message_id` lee `reply_to_message` de Telegram, y `WaitingApproval` guarda el chat y el mensaje de la aprobación. El mensaje lo explica.
+  - Decisión propia: no hay herramienta nueva para escribir por Telegram desde el Ejecutor. `request_user_clarification` ya llega al Owner y espera su respuesta, y el resultado le llega solo al terminar. Las guías del Planificador y del Ejecutor lo dicen, y piden no planificar un paso aparte para «mandar el informe por Telegram».
+- **`get_finance_record`** (`backend_runtime.rs`, `finance_records.rs`, esquema).
+  - Lee por id compras (con sus líneas, `purchase_items`), sueldos, resúmenes de tarjeta, planes de cuotas, servicios, ocurrencias y facturas de servicio, cuentas, categorías y comprobantes (`finance_record_by_id`). Busca el id en la lista de la entidad.
+  - El `enum` del esquema ahora lista solo esas entidades y los movimientos; antes prometía 18 y el runtime solo aceptaba movimientos.
+- **Navegador** (`browser.rs`, `browser_agent.mjs`, guía).
+  - `state` informa `signIn` cuando la página o uno de sus marcos muestra un campo de contraseña visible (`asksToSignIn`). `tool_result` lo convierte en `session`: el sitio pide iniciar sesión, la sesión del perfil de Notia no está activa ahí, y no hay que reintentar.
+  - La guía dice cómo saber si la sesión sigue activa (abrir la página y mirar `session`) y que, si un sitio muestra un error o vuelve al ingreso, después de un segundo intento igual hay que parar y avisar, porque muchos sitios bloquean por intentos (el caso de Mercado Libre).
+- **Sin resolver, queda en `improve.md`**: leer chats de Teams sin el navegador (ver la sección del 2026-10-31).
+- **Validaciones.**
+  - `notia-backend-core`: 807 pasan, 7 ignoradas, y falla solo `image_generation::only_sexual_content_with_minors_is_refused`, que ya fallaba. Nueva: `the_confirmation_counts_each_replacement_without_changing_the_meeting`. Hay casos nuevos en las pruebas de la organización (rasgos recortados, personas que siguen exigiendo al modelo), del navegador (`session`) y de las Tareas IA (`step_without_report`).
+  - `notia-app`: 540 pasan, 14 ignoradas, con casos nuevos en la prueba de errores de Ollama.
+  - `cargo check` Android: 59 warnings, los de la línea base. `node --check` del script del navegador pasa.
+  - Sin cambios de frontend.
+- **Pendiente.** Con el modelo real:
+  - un pedido de corrección en el chat de Meeting que muestre la confirmación con los conteos;
+  - un turno con Ollama devolviendo 500;
+  - una Tarea IA creada en la app que pregunte por Telegram y reciba la respuesta con «Responder»;
+  - `get_finance_record` de una compra;
+  - el aviso `session` en Mercado Libre.
+
+## Webhook: acciones registradas que otros programas invocan (2026-11-02)
+
+- **Pedido.** Un endpoint de Notia que funcione como webhook, de la forma `{ action, prompt }`, para que otro programa invoque a Notia. Por ejemplo, la acción «Alerta de seguridad» con el prompt «Avisar al usuario por Telegram que…». Una ventana de configuración registra las acciones, y solo se puede llamar al endpoint con una acción registrada.
+- **Núcleo** (`backend-core/src/webhooks.rs`, nueva dependencia `sha2`).
+  - Sección `webhook` de `notiaConfig.json`: `enabled`, `port` (52485 de entrada, entre el host y los espacios públicos), `network` y `actions` (`id`, `name`, `instructions`, `enabled`, `tokenHash`, `createdAtMs`). `normalize_library_config` la conserva con `normalize_webhook_config`.
+  - Validaciones: nombres únicos sin mayúsculas ni tildes (`fold`), hasta 80 caracteres; instrucciones hasta 4.000; hasta 50 acciones; puerto de 1024 en adelante y libre de los servicios reservados.
+  - Cada llamada pasa por `parse_call` (JSON con `action` y `prompt`, hasta 8.000 caracteres), `bearer_token` y `authorize`. `authorize` exige una acción registrada (404), su token (401, con comparación en tiempo constante de los SHA-256) y que esté activa (409). `CallRejection` da el estado HTTP y el mensaje.
+  - Los tokens tienen 32 bytes aleatorios en hex. Solo se guarda su SHA-256 y se muestran una vez, al registrar la acción o con «Nuevo token».
+  - `webhook_guidance` es la sección del prompt de sistema. Dice que la llamada viene de otro programa, que su prompt es contenido externo que no cambia reglas, permisos ni confirmaciones, que la respuesta final es el mensaje de Telegram, que se admite `[SIN_MENSAJE]`, y agrega las instrucciones del Owner, que valen más que el prompt. `webhook_request` arma el pedido con la fecha local.
+  - `CallHistory` guarda en memoria las últimas 30 llamadas (en cola, en curso, enviado, sin mensaje, falló, rechazada).
+- **Adaptador** (`app/src/webhooks.rs`; la parte HTTP en `webhooks/listener.rs`, que en Android es un módulo vacío porque ahí no existe `crate::server`).
+  - Un supervisor cada 3 s abre el puerto de la biblioteca seleccionada cuando su sección está activa: `127.0.0.1` o, con `network`, `0.0.0.0`. HTTP plano, como las rutas de las extensiones en loopback. El objetivo se cachea por generación de configuración durante 60 s, como WhatsApp. Un puerto ocupado queda como error y se reintenta a los 30 s. Al cambiar de puerto, el hilo anterior termina antes de abrir el nuevo.
+  - Solo responde `POST /webhook`, con hasta 16 conexiones a la vez, 5 s de lectura y 64 KiB de cuerpo. Lee la configuración en cada llamada, así que una acción borrada o pausada deja de funcionar enseguida.
+  - Hay un límite de 10 llamadas por minuto por acción (`RateWindows`). Si el bot de Telegram de la biblioteca no corre en esta PC, la llamada se rechaza con 503. Si no, se encola y contesta `202 { ok, callId, action, status }`.
+  - Corre solo en un host de escritorio (`is_supported`: ni Android ni un cliente), donde corre Telegram. `listening_port` reserva su puerto para los espacios públicos, y el webhook no acepta los puertos del host, del tablero publicado ni de los espacios públicos.
+  - Comandos `webhook_view`, `webhook_save_server`, `webhook_save_action`, `webhook_new_token` y `webhook_delete_action`, remotos para un cliente del host.
+  - `library_config`: `webhook` está en `HOST_ONLY_KEYS` y entre las secciones que solo escriben los comandos del backend, y `without_webhook` la saca de la configuración que recibe la interfaz.
+- **Corrida** (`telegram_worker.rs`, `backend_runtime.rs`, `protocol.rs`).
+  - `AgentRequest.webhook_call` (`WebhookCallPrompt`) marca la corrida. Como `scheduled_action`, el runtime la rechaza si no es del Owner, persistente y por Telegram. Agrega `webhook_guidance` al prompt de sistema, y el router no le ofrece el prompt conversacional.
+  - `Job.webhook` (`WebhookJob`) va a la cola del chat de Telegram del Owner por `enqueue_webhook`. Nunca se guarda: tras un reinicio, el programa vuelve a llamar.
+  - `drive_action` y el nuevo `drive_webhook` comparten `drive_unattended` (corrida sin mensaje de progreso, notas antes de una pregunta, cancelación desde Telegram) y `deliver_unattended` (envío, historial del chat y pensamiento). `run_webhook` informa el resultado a `webhooks::finish_call`.
+- **Interfaz** (`WebhookSection.tsx`, `webhookRuntime.ts`, sección «Webhook» en Integraciones, entre WhatsApp y Cuentas asociadas).
+  - Tarjeta del servidor (Activo, Puerto, Llamadas desde la red, direcciones y estado), aviso si Telegram no corre en la PC, tarjeta de token de una sola vez con Copiar, lista de acciones (activar, editar, nuevo token, eliminar con un segundo toque) y últimas llamadas.
+  - Al pie, el ejemplo `curl` con `exampleUrl` y el límite que manda Rust.
+  - Lee el estado cada 5 s. Los botones y el formulario sirven por toque; en anchos de hasta 560 px los botones ocupan la fila.
+- **Diferencias de plataforma.** En Android la sección se ve, pero el webhook no escucha (`unavailableReason`), igual que Telegram, que no corre ahí. Un cliente del host configura el webhook de la PC host.
+- **Decisiones propias.**
+  - Cada acción tiene su token: la condición «solo con una acción registrada» no alcanza para un endpoint que dispara turnos del Owner con terminal y navegador.
+  - El servidor es propio, en un puerto aparte, y no el del modo Host, para que funcione sin activar el modo Host.
+  - Las llamadas recientes viven en memoria y no en la base.
+  - La corrida puede hacer cambios con confirmación por Telegram, como una Acción IA, no solo leer.
+- **Validaciones.**
+  - `notia-backend-core`: 816 pasan, 7 ignoradas, y falla solo `image_generation::only_sexual_content_with_minors_is_refused`, que ya fallaba. Son 9 pruebas nuevas en `webhooks::tests` (llamada autorizada, cuerpo, token Bearer, nombres únicos, nuevo token, sección, puertos, guía e historial).
+  - `notia-app`: 540 pasan, 14 ignoradas. Escritorio sin warnings nuevos (36) y `cargo check` Android con los 59 de la línea base.
+  - Frontend: `npx tsc -b` y eslint de los archivos nuevos sin errores; `WebhookSection.test.tsx` (4 pruebas) junto con el resto de Settings, 28 pasan.
+- **Pendiente.** Una llamada real con `curl` en la app abierta con Telegram activo, otra desde otro equipo con el firewall, el cambio de puerto con el webhook activo y la vista en un cliente Android.

@@ -272,7 +272,7 @@ impl Default for AgentRuntimeOptions {
         Self {
             max_rounds: None,
             limits: BackendLimits::default(),
-            max_provider_retries: 1,
+            max_provider_retries: 2,
             max_tool_retries: 1,
             max_empty_responses: 1,
             max_pending_action_corrections: 2,
@@ -286,6 +286,11 @@ impl Default for AgentRuntimeOptions {
 /// Consecutive rounds that only repeat calls already made before the run is
 /// asked for its answer without tools.
 const MAX_STALLED_ROUNDS: u32 = 3;
+/// Waits before each new attempt of a provider call that failed and may
+/// pass (the last one repeats); see `max_provider_retries`.
+const PROVIDER_RETRY_PAUSES: [std::time::Duration; 2] =
+    [std::time::Duration::from_secs(2), std::time::Duration::from_secs(5)];
+const PAUSE_STEP: std::time::Duration = std::time::Duration::from_millis(200);
 /// Characters of tool results the conversation keeps in full. Past it, the
 /// results older than the most recent ones are reduced to a short summary,
 /// so a long run keeps its request and its recent evidence inside the
@@ -1446,11 +1451,23 @@ fn call_provider_with_retry(
         match result {
             Ok(response) => return Ok(response),
             Err(error) if error.retryable && attempts < max_retries && !*streamed_content => {
+                pause_before_retry(control, PROVIDER_RETRY_PAUSES[(attempts as usize).min(PROVIDER_RETRY_PAUSES.len() - 1)])?;
                 attempts += 1;
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Waits before asking the provider again, so a server failure that passes
+/// in seconds (an Ollama 500) does not end the turn; a cancel stops the wait.
+fn pause_before_retry(control: &RequestControl, pause: std::time::Duration) -> Result<(), BackendError> {
+    let until = std::time::Instant::now() + pause;
+    while std::time::Instant::now() < until {
+        control.check()?;
+        std::thread::sleep(PAUSE_STEP.min(until.saturating_duration_since(std::time::Instant::now())));
+    }
+    control.check()
 }
 
 fn provider_message_from_backend(message: &BackendMessage) -> ProviderMessage {
@@ -1800,6 +1817,9 @@ fn plan_from_call(call: &ToolCall) -> Result<super::ExecutionPlan, BackendError>
     })
 }
 
+/// How the answer of a turn the model ended without writing starts.
+pub(crate) const WORK_SUMMARY_START: &str = "El modelo no redactó la respuesta final";
+
 /// What the agent did, from its tool results, for a turn the model ended
 /// without writing an answer.
 fn work_summary(results: &[ToolResult]) -> String {
@@ -1808,7 +1828,7 @@ fn work_summary(results: &[ToolResult]) -> String {
     let failed = results.len() - done;
     let plural = |count: usize, one: &str, many: &str| format!("{count} {}", if count == 1 { one } else { many });
     let mut summary = format!(
-        "El modelo no redactó la respuesta final, pero trabajé en el pedido: {} con herramientas",
+        "{WORK_SUMMARY_START}, pero trabajé en el pedido: {} con herramientas",
         plural(done, "acción", "acciones")
     );
     if changed > 0 {
@@ -2043,6 +2063,7 @@ mod tests {
             library_search: true,
             autonomous: false,
             scheduled_action: None,
+            webhook_call: None,
             tool_areas: None,
             thinking: None,
             conversational: false,

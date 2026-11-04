@@ -59,8 +59,8 @@ pub(crate) fn init() -> crate::host::plugin::TauriPlugin<crate::host::Wry> {
 }
 
 fn sync_selected_library(app: &AppHandle) {
-    // The host syncs the agenda of a client's library.
-    if crate::connection::is_client(app) {
+    // Only the computer that runs the library's services syncs with Google.
+    if !crate::device_role::runs_services(app) {
         return;
     }
     let Some(library) = crate::library_catalog::selected_library(app) else {

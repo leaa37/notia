@@ -109,6 +109,15 @@ fn route(command: &str) -> Option<Route> {
         "backend_check_google_cloud_credentials" => backend_check_google_cloud_credentials,
         "backend_remove_google_cloud_credentials" => backend_remove_google_cloud_credentials,
         "backend_import_google_cloud_json" => backend_import_google_cloud_json,
+        "webhook_view" => webhook_view,
+        "webhook_save_server" => webhook_save_server,
+        "webhook_save_action" => webhook_save_action,
+        "webhook_new_token" => webhook_new_token,
+        "webhook_delete_action" => webhook_delete_action,
+        "whatsapp_view" => whatsapp_view,
+        "whatsapp_connect" => whatsapp_connect,
+        "whatsapp_disconnect" => whatsapp_disconnect,
+        "whatsapp_set_chat" => whatsapp_set_chat,
         "coldpass_unlock" => coldpass_unlock,
         "coldpass_status" => coldpass_status,
         "coldpass_generate_password" => coldpass_generate_password,
@@ -243,12 +252,8 @@ fn route(command: &str) -> Option<Route> {
         "meeting_export" => meeting_export,
         "meeting_task_boards" => meeting_task_boards,
         "meeting_send_tasks" => meeting_send_tasks,
-        "meeting_store_note" => meeting_store_note,
-        "meeting_store_tasks" => meeting_store_tasks,
-        "meeting_ai_complete" => meeting_ai_complete,
         "meeting_history" => meeting_history,
         "meeting_open_saved" => meeting_open_saved,
-        "meeting_saved_archive" => meeting_saved_archive,
         "get_qwen3_tts_status" => get_qwen3_tts_status,
         "reload_qwen3_tts" => reload_qwen3_tts,
         "synthesize_qwen3_tts_speech" => synthesize_qwen3_tts_speech,
@@ -322,8 +327,6 @@ fn route(command: &str) -> Option<Route> {
         "save_connection_settings" => save_connection_settings,
         "test_host_connection" => test_host_connection,
         "client_open" => client_open,
-        "enter_offline_copy" => enter_offline_copy,
-        "leave_offline_copy" => leave_offline_copy,
         "sync_copy_now" => sync_copy_now,
         "pick_copy_folder" => pick_copy_folder,
         "host_sync_manifest" => host_sync_manifest,
@@ -332,10 +335,6 @@ fn route(command: &str) -> Option<Route> {
         "host_sync_database_push" => host_sync_database_push,
         "host_sync_write" => host_sync_write,
         "host_sync_delete" => host_sync_delete,
-        "collab_join" => collab_join,
-        "collab_update" => collab_update,
-        "collab_awareness" => collab_awareness,
-        "collab_leave" => collab_leave,
         _ => return None,
     };
     Some(route)
@@ -414,6 +413,15 @@ pub const COMMAND_NAMES: &[&str] = &[
     "backend_check_google_cloud_credentials",
     "backend_remove_google_cloud_credentials",
     "backend_import_google_cloud_json",
+    "webhook_view",
+    "webhook_save_server",
+    "webhook_save_action",
+    "webhook_new_token",
+    "webhook_delete_action",
+    "whatsapp_view",
+    "whatsapp_connect",
+    "whatsapp_disconnect",
+    "whatsapp_set_chat",
     "coldpass_unlock",
     "coldpass_status",
     "coldpass_generate_password",
@@ -548,12 +556,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "meeting_export",
     "meeting_task_boards",
     "meeting_send_tasks",
-    "meeting_store_note",
-    "meeting_store_tasks",
-    "meeting_ai_complete",
     "meeting_history",
     "meeting_open_saved",
-    "meeting_saved_archive",
     "get_qwen3_tts_status",
     "reload_qwen3_tts",
     "synthesize_qwen3_tts_speech",
@@ -609,8 +613,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "save_connection_settings",
     "test_host_connection",
     "client_open",
-    "enter_offline_copy",
-    "leave_offline_copy",
     "sync_copy_now",
     "pick_copy_folder",
     "host_sync_manifest",
@@ -619,10 +621,6 @@ pub const COMMAND_NAMES: &[&str] = &[
     "host_sync_database_push",
     "host_sync_write",
     "host_sync_delete",
-    "collab_join",
-    "collab_update",
-    "collab_awareness",
-    "collab_leave",
 ];
 
 /// Commands that act on devices of the computer running Notia (microphone,
@@ -674,12 +672,8 @@ pub const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "meeting_export",
     "meeting_task_boards",
     "meeting_send_tasks",
-    "meeting_store_note",
-    "meeting_store_tasks",
-    "meeting_ai_complete",
     "meeting_history",
     "meeting_open_saved",
-    "meeting_saved_archive",
     "coldpass_bluetooth_status",
     "coldpass_bluetooth_connect",
     "coldpass_bluetooth_submit_pin",
@@ -705,8 +699,6 @@ pub const LOCAL_ONLY_COMMANDS: &[&str] = &[
     "save_connection_settings",
     "test_host_connection",
     "client_open",
-    "enter_offline_copy",
-    "leave_offline_copy",
     "sync_copy_now",
     "pick_copy_folder",
 ];
@@ -714,26 +706,6 @@ pub const LOCAL_ONLY_COMMANDS: &[&str] = &[
 /// Whether a remote client (headless server) may call `command`.
 pub fn is_remote_command(command: &str) -> bool {
     route(command).is_some() && !LOCAL_ONLY_COMMANDS.contains(&command)
-}
-
-/// Local-only commands a host also runs for its clients (Host mode, always
-/// the library's Owner). A client records and keeps its Meeting on its own
-/// device; what touches the library or the AI provider of the host runs
-/// there: the note and its export, the tasks, the boards and the AI. The
-/// headless server, open to other library users, never runs them.
-pub const HOST_CLIENT_COMMANDS: &[&str] = &[
-    "meeting_task_boards",
-    "meeting_ai_context_options",
-    "meeting_save_ai_context_choice",
-    "meeting_store_note",
-    "meeting_store_tasks",
-    "meeting_ai_complete",
-    "meeting_history",
-    "meeting_saved_archive",
-];
-
-pub fn is_host_client_command(command: &str) -> bool {
-    HOST_CLIENT_COMMANDS.contains(&command)
 }
 
 /// A library user on a published Task Manager: every command runs as that
@@ -831,32 +803,9 @@ pub fn dispatch_app_invoke(app: &AppHandle, window_label: &str, body: &Value) ->
         Err(error) => return Dispatch::Ready(Err(Value::String(format!("invalid {APP_INVOKE} body: {error}")))),
     };
     let args = if request.args.is_null() { Value::Object(Default::default()) } else { request.args };
-    if let Some(dispatch) = client_dispatch(app, &request.command, &args) {
-        return dispatch;
-    }
     dispatch(app, window_label, &request.command, &args).unwrap_or_else(|| {
         Dispatch::Ready(Err(Value::String(format!("command {} not found", request.command))))
     })
-}
-
-/// A client (Settings → General → «Modo de ejecución») runs on its host
-/// every command except its sign-in, its connection and the preferences of
-/// the device. What only works on the device that runs Notia (recording,
-/// pickers, the mail sign-in in the browser) is not offered to a client.
-fn client_dispatch(app: &AppHandle, command: &str, args: &Value) -> Option<Dispatch> {
-    if !crate::host_client::uses_host(app) || crate::backend::connection::is_client_local_command(command) {
-        return None;
-    }
-    if is_remote_command(command) || is_host_client_command(command) {
-        return Some(crate::host_client::forward(app, command, args.clone()));
-    }
-    route(command)?;
-    let error = crate::backend::BackendError::new(
-        crate::backend::BackendErrorCode::Unsupported,
-        "En modo cliente esta función la ofrece el host: usala desde el equipo host.",
-        false,
-    );
-    Some(Dispatch::Ready(reply_result::<(), _>(Err(error))))
 }
 
 fn arg<T: DeserializeOwned>(command: &str, args: &Value, key: &str) -> Result<T, Value> {
@@ -894,7 +843,7 @@ fn backend_read_library_config(app: &AppHandle, _window_label: &str, command: &s
 
 fn backend_write_library_config(app: &AppHandle, window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
     // A client never turns Telegram on: neither on its host (its calls come
-    // with the client label) nor on its own device (its offline copy).
+    // with the client label) nor on its own device (its copy).
     let from_client = window_label == CLIENT_WINDOW_LABEL || crate::connection::is_client(app);
     Ok(Dispatch::Ready(reply_value(crate::library_config::backend_write_library_config(arg(command, args, "payload")?, app, from_client))))
 }
@@ -1699,24 +1648,6 @@ fn meeting_add_mark(app: &AppHandle, _window_label: &str, command: &str, args: &
     Ok(Dispatch::Ready(reply_result(crate::meeting::meeting_add_mark(app.clone(), arg(command, args, "payload")?))))
 }
 
-fn meeting_store_note(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    let arg0 = app.clone();
-    let arg1 = arg(command, args, "payload")?;
-    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::meeting::meeting_store_note(arg0, arg1).await) })))
-}
-
-fn meeting_store_tasks(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    let arg0 = app.clone();
-    let arg1 = arg(command, args, "payload")?;
-    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::meeting::meeting_store_tasks(arg0, arg1).await) })))
-}
-
-fn meeting_ai_complete(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    let arg0 = app.clone();
-    let arg1 = arg(command, args, "payload")?;
-    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::meeting::meeting_ai_complete(arg0, arg1).await) })))
-}
-
 fn meeting_remove_mark(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
     Ok(Dispatch::Ready(reply_result(crate::meeting::meeting_remove_mark(app.clone(), arg(command, args, "payload")?))))
 }
@@ -1775,12 +1706,6 @@ fn meeting_open_saved(app: &AppHandle, _window_label: &str, command: &str, args:
     let arg0 = app.clone();
     let arg1 = arg(command, args, "payload")?;
     Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::meeting_history::meeting_open_saved(arg0, arg1).await) })))
-}
-
-fn meeting_saved_archive(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    let arg0 = app.clone();
-    let arg1 = arg(command, args, "payload")?;
-    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::meeting_history::meeting_saved_archive(arg0, arg1).await) })))
 }
 
 fn meeting_save_note(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
@@ -2097,6 +2022,60 @@ fn backend_save_google_cloud_credentials(app: &AppHandle, _window_label: &str, c
     Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::mail_accounts::backend_save_google_cloud_credentials(arg0, arg1).await) })))
 }
 
+fn webhook_view(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::webhooks::webhook_view(arg0, arg1).await) })))
+}
+
+fn webhook_save_server(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::webhooks::webhook_save_server(arg0, arg1).await) })))
+}
+
+fn webhook_save_action(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::webhooks::webhook_save_action(arg0, arg1).await) })))
+}
+
+fn webhook_new_token(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::webhooks::webhook_new_token(arg0, arg1).await) })))
+}
+
+fn webhook_delete_action(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::webhooks::webhook_delete_action(arg0, arg1).await) })))
+}
+
+fn whatsapp_view(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::whatsapp::whatsapp_view(arg0, arg1).await) })))
+}
+
+fn whatsapp_connect(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::whatsapp::whatsapp_connect(arg0, arg1).await) })))
+}
+
+fn whatsapp_disconnect(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::whatsapp::whatsapp_disconnect(arg0, arg1).await) })))
+}
+
+fn whatsapp_set_chat(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    let arg0 = app.clone();
+    let arg1 = arg(command, args, "payload")?;
+    Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::whatsapp::whatsapp_set_chat(arg0, arg1).await) })))
+}
+
 fn backend_check_google_cloud_credentials(_app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
     let arg0 = arg(command, args, "payload")?;
     Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::mail_accounts::backend_check_google_cloud_credentials(arg0).await) })))
@@ -2269,14 +2248,6 @@ fn client_open(app: &AppHandle, _window_label: &str, _command: &str, _args: &Val
     Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::connection::client_open(app).await) })))
 }
 
-fn enter_offline_copy(app: &AppHandle, _window_label: &str, _command: &str, _args: &Value) -> Result<Dispatch, Value> {
-    Ok(Dispatch::Ready(reply_result(crate::host_mirror::enter_offline_copy(app))))
-}
-
-fn leave_offline_copy(app: &AppHandle, _window_label: &str, _command: &str, _args: &Value) -> Result<Dispatch, Value> {
-    Ok(Dispatch::Ready(reply_result(crate::host_mirror::leave_offline_copy(app))))
-}
-
 fn sync_copy_now(app: &AppHandle, _window_label: &str, _command: &str, _args: &Value) -> Result<Dispatch, Value> {
     let app = app.clone();
     Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::host_mirror::sync(&app).await) })))
@@ -2314,22 +2285,6 @@ fn host_sync_delete(app: &AppHandle, _window_label: &str, command: &str, args: &
     Ok(Dispatch::Ready(reply_result(crate::host_sync::host_sync_delete(app, arg(command, args, "payload")?))))
 }
 
-fn collab_join(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    Ok(Dispatch::Ready(reply_result(crate::collab::collab_join(app, arg(command, args, "payload")?))))
-}
-
-fn collab_update(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    Ok(Dispatch::Ready(reply_result(crate::collab::collab_update(app, arg(command, args, "payload")?))))
-}
-
-fn collab_awareness(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    Ok(Dispatch::Ready(reply_result(crate::collab::collab_awareness(app, arg(command, args, "payload")?))))
-}
-
-fn collab_leave(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
-    Ok(Dispatch::Ready(reply_result(crate::collab::collab_leave(app, arg(command, args, "payload")?))))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2353,10 +2308,6 @@ mod tests {
         }
         assert!(is_remote_command("task_manager_board_view"));
         assert!(!is_remote_command("window_control"));
-        for command in HOST_CLIENT_COMMANDS {
-            assert!(LOCAL_ONLY_COMMANDS.contains(command), "{command}");
-        }
-        assert!(!is_host_client_command("start_speech_session"));
     }
 
     #[test]

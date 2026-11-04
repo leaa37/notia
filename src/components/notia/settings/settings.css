@@ -822,7 +822,6 @@
   gap: 12px;
 }
 .notia-settings-mode > .notia-settings-mode-options { padding: 0 20px 20px; }
-.notia-settings-mode-client > .notia-settings-mode-options { margin-top: 12px; }
 .notia-settings-mode-option {
   display: flex;
   align-items: flex-start;
@@ -838,7 +837,6 @@
   text-align: left;
   cursor: pointer;
 }
-.notia-settings-mode-client .notia-settings-mode-option { padding: 14px; }
 .notia-settings-mode-option[aria-checked="true"] {
   border-color: var(--settings-accent);
   background: color-mix(in srgb, var(--settings-accent) 8%, var(--settings-main-bg));
@@ -868,6 +866,7 @@
 .notia-settings-listening[data-on] { color: var(--color-sage); }
 .notia-settings-mode-client { padding: 16px 20px 20px; }
 .notia-settings-host { margin-top: 18px; }
+.notia-settings-mode-client > .notia-settings-host:first-child { margin-top: 0; }
 .notia-settings-host .notia-settings-row-description { margin-top: 3px; }
 .notia-settings-host-row {
   --settings-host: var(--settings-muted);
@@ -946,6 +945,55 @@
   .notia-settings-mode > .notia-settings-mode-options { padding: 0 14px 14px; }
   .notia-settings-mode-client { padding-left: 14px; padding-right: 14px; }
   .notia-settings-host-spacer { display: none; }
+}
+
+/* Integraciones → WhatsApp */
+.notia-settings-mail-icon[data-provider="whatsapp"] { background: color-mix(in srgb, var(--color-sage) 14%, transparent); color: var(--color-sage); }
+.notia-settings-wa-link { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; padding: 0 20px 16px; }
+.notia-settings-wa-link > .notia-settings-mail-steps { flex: 1 1 220px; margin: 0; }
+.notia-settings-wa-qr { width: 220px; max-width: 100%; aspect-ratio: 1; border: 1px solid var(--settings-divider); border-radius: 10px; }
+.notia-settings-wa-search { display: flex; align-items: center; gap: 12px; padding: 0 20px 12px; }
+.notia-settings-wa-search .notia-settings-search { flex: 1 1 auto; height: var(--settings-control); }
+.notia-settings-wa-chat { border-top: 1px solid var(--settings-divider); }
+.notia-settings-list-row.notia-settings-wa-chat-row { padding: 12px 20px 4px; }
+.notia-settings-wa-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 18px; padding: 0 20px 10px 68px; }
+.notia-settings-wa-switch { display: inline-flex; align-items: center; gap: 8px; min-height: var(--settings-control); font-size: 13px; cursor: pointer; }
+.notia-settings-modal .notia-settings-pane .notia-button.notia-settings-wa-prompt-toggle { margin-left: auto; }
+.notia-settings-wa-prompt { display: flex; flex-direction: column; gap: 8px; padding: 0 20px 14px 68px; }
+.notia-settings-modal .notia-settings-field.notia-settings-wa-prompt-field { width: 100%; height: auto; min-height: 110px; padding: 10px 12px; line-height: 1.45; resize: vertical; }
+.notia-settings-wa-prompt-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+@container settings (max-width: 560px) {
+  .notia-settings-wa-link,
+  .notia-settings-wa-search { padding-left: 14px; padding-right: 14px; }
+  .notia-settings-list-row.notia-settings-wa-chat-row { padding-left: 14px; padding-right: 14px; }
+  .notia-settings-wa-controls,
+  .notia-settings-wa-prompt { padding-left: 14px; padding-right: 14px; }
+  .notia-settings-wa-qr { width: 100%; max-width: 260px; }
+}
+
+/* Integraciones → Webhook */
+.notia-settings-mail-icon[data-provider="webhook"] { background: color-mix(in srgb, var(--settings-accent) 14%, transparent); color: var(--settings-accent); }
+.notia-webhook-url { display: block; }
+.notia-webhook-token { display: flex; flex-direction: column; gap: 8px; }
+.notia-webhook-token-value { display: block; padding: 10px 12px; border: 1px solid var(--settings-divider); border-radius: 8px; word-break: break-all; }
+.notia-webhook-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.notia-webhook-row-actions .notia-button { gap: 6px; }
+.notia-webhook-action { border-top: 1px solid var(--settings-divider); }
+.notia-webhook-action > .notia-webhook-row-actions { padding: 0 20px 12px; }
+.notia-webhook-instructions { padding: 0 20px 8px; white-space: pre-wrap; }
+.notia-webhook-form { display: flex; flex-direction: column; gap: 8px; padding: 4px 20px 14px; }
+.notia-settings-modal .notia-settings-field.notia-webhook-instructions-field { width: 100%; height: auto; min-height: 96px; padding: 10px 12px; line-height: 1.45; resize: vertical; }
+.notia-webhook-call { border-top: 1px solid var(--settings-divider); }
+.notia-webhook-call .notia-settings-list-name { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.notia-webhook-call .notia-settings-row-description[data-tone="error"] { color: var(--settings-danger); }
+.notia-webhook-example { margin: 0; padding: 12px 14px; border: 1px solid var(--settings-divider); border-radius: 10px; background: var(--settings-card-bg); white-space: pre-wrap; }
+
+@container settings (max-width: 560px) {
+  .notia-webhook-action > .notia-webhook-row-actions,
+  .notia-webhook-instructions,
+  .notia-webhook-form { padding-left: 14px; padding-right: 14px; }
+  .notia-webhook-row-actions .notia-button { flex: 1 1 auto; }
 }
 
 /* Publicar → Espacios públicos */

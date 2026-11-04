@@ -188,6 +188,131 @@ impl TerminalRequest {
     }
 }
 
+/// How long a disk scan may take before it answers with what it measured.
+pub const DISK_SCAN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Folders and files of the breakdown, and largest files, shown.
+pub const DISK_TOP_ENTRIES: usize = 25;
+pub const DISK_LARGEST_FILES: usize = 15;
+
+/// `run_terminal_command` with `diskUsage`: instead of a command, Notia
+/// measures a folder of the PC in one pass (every subfolder at once,
+/// folders it cannot read counted and skipped), which a shell does folder
+/// by folder and fails on the first access error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskUsageRequest {
+    pub path: String,
+}
+
+impl DiskUsageRequest {
+    /// The scan a call asks for, or `None` when it runs a command.
+    pub fn from_arguments(arguments: &Value) -> Result<Option<Self>, BackendError> {
+        let Some(scan) = arguments.get("diskUsage").filter(|scan| !scan.is_null()) else {
+            return Ok(None);
+        };
+        if arguments.get("command").and_then(Value::as_str).is_some_and(|command| !command.trim().is_empty()) {
+            return Err(BackendError::invalid_input("Usá command o diskUsage, no los dos."));
+        }
+        let path = scan
+            .as_str()
+            .or_else(|| scan.get("path").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|path| is_absolute_path(path))
+            .ok_or_else(|| BackendError::invalid_input("diskUsage.path debe ser una carpeta absoluta de esta PC (por ejemplo C:\\Users\\gabi)."))?;
+        Ok(Some(Self { path: path.to_string() }))
+    }
+
+    pub fn summary(&self) -> String {
+        format!("Medir el uso de disco de {}", one_line(&self.path, 160))
+    }
+
+    pub fn detail(&self) -> String {
+        format!(
+            "Notia recorre la carpeta {} una vez y suma lo que ocupa cada subcarpeta; solo lee tamaños, no abre ni cambia archivos.\nTiempo máximo: {}",
+            self.path,
+            duration_text(DISK_SCAN_TIMEOUT)
+        )
+    }
+}
+
+/// A folder or file directly inside the scanned folder, with everything
+/// under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub files: u64,
+    pub folder: bool,
+}
+
+/// What a disk scan measured.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiskUsage {
+    pub entries: Vec<DiskEntry>,
+    /// Path and size of the largest files found.
+    pub largest: Vec<(String, u64)>,
+    /// Folders or files that could not be read (no access, in use).
+    pub unreadable: u64,
+    /// It stopped at its time limit: the sizes are a lower bound.
+    pub partial: bool,
+}
+
+/// `1,5 GB`, `320 MB`, `12 KB`, `900 B`.
+pub fn size_text(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit]).replace('.', ",")
+    }
+}
+
+/// What the model reads of a disk scan: the total, the biggest entries
+/// first and the largest files.
+pub fn disk_usage_result(request: &DiskUsageRequest, mut usage: DiskUsage, elapsed: Duration) -> Value {
+    usage.entries.sort_by(|left, right| right.bytes.cmp(&left.bytes).then_with(|| left.name.cmp(&right.name)));
+    usage.largest.sort_by(|left, right| right.1.cmp(&left.1));
+    let total = usage.entries.iter().map(|entry| entry.bytes).sum::<u64>();
+    let files = usage.entries.iter().map(|entry| entry.files).sum::<u64>();
+    let shown = usage.entries.iter().take(DISK_TOP_ENTRIES).collect::<Vec<_>>();
+    let mut result = json!({
+        "ok": true,
+        "path": request.path,
+        "total": size_text(total),
+        "totalBytes": total,
+        "files": files,
+        "entries": shown.iter().map(|entry| json!({
+            "name": entry.name,
+            "size": size_text(entry.bytes),
+            "bytes": entry.bytes,
+            "files": entry.files,
+            "folder": entry.folder,
+        })).collect::<Vec<_>>(),
+        "largestFiles": usage.largest.iter().take(DISK_LARGEST_FILES).map(|(path, bytes)| json!({ "path": path, "size": size_text(*bytes) })).collect::<Vec<_>>(),
+        "seconds": elapsed.as_secs(),
+    });
+    if usage.entries.len() > DISK_TOP_ENTRIES {
+        result["moreEntries"] = json!(usage.entries.len() - DISK_TOP_ENTRIES);
+    }
+    if usage.unreadable > 0 {
+        result["unreadable"] = json!(usage.unreadable);
+        result["note"] = json!("Algunas carpetas o archivos no se pudieron leer (sin permiso o en uso) y no suman: el total puede ser algo mayor.");
+    }
+    if usage.partial {
+        result["partial"] = json!(true);
+        result["note"] = json!(format!(
+            "La medición llegó a su tiempo máximo ({}) y estos tamaños son lo medido hasta ahí: mide una subcarpeta para el detalle.",
+            duration_text(DISK_SCAN_TIMEOUT)
+        ));
+    }
+    result
+}
+
 /// Windows (`C:\…`, `\\server\…`) or Unix absolute paths, on any host.
 fn is_absolute_path(path: &str) -> bool {
     let bytes = path.as_bytes();
@@ -894,5 +1019,30 @@ mod tests {
         assert_eq!(duration_text(Duration::from_secs(12)), "12 s");
         assert_eq!(duration_text(Duration::from_secs(180)), "3 min");
         assert_eq!(duration_text(Duration::from_secs(3_900)), "1 h 5 min");
+    }
+
+    #[test]
+    fn a_disk_scan_is_asked_instead_of_a_command_and_reads_biggest_first() {
+        let scan = DiskUsageRequest::from_arguments(&json!({ "diskUsage": { "path": "C:\\Users\\gabi" } })).expect("valid").expect("scan");
+        assert_eq!(scan.path, "C:\\Users\\gabi");
+        assert!(scan.summary().contains("C:\\Users\\gabi") && scan.detail().contains("solo lee tamaños"));
+        assert_eq!(DiskUsageRequest::from_arguments(&json!({ "command": "dir" })).expect("valid"), None);
+        assert!(DiskUsageRequest::from_arguments(&json!({ "diskUsage": "relativa" })).is_err());
+        assert!(DiskUsageRequest::from_arguments(&json!({ "diskUsage": "/home", "command": "du" })).is_err());
+        assert_eq!(size_text(900), "900 B");
+        assert_eq!(size_text(1_610_612_736), "1,5 GB");
+        let usage = DiskUsage {
+            entries: vec![
+                DiskEntry { name: "Videos".into(), bytes: 5_000, files: 2, folder: true },
+                DiskEntry { name: "AppData".into(), bytes: 9_000, files: 40, folder: true },
+            ],
+            largest: vec![("C:\\a.iso".into(), 4_000)],
+            unreadable: 3,
+            partial: false,
+        };
+        let result = disk_usage_result(&scan, usage, Duration::from_secs(4));
+        assert_eq!(result["entries"][0]["name"], "AppData");
+        assert_eq!((result["totalBytes"].as_u64(), result["files"].as_u64(), result["unreadable"].as_u64()), (Some(14_000), Some(42), Some(3)));
+        assert!(result["note"].as_str().expect("note").contains("no se pudieron leer"));
     }
 }

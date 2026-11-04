@@ -447,11 +447,43 @@ fn to_value(status: AuthStatus) -> Result<serde_json::Value, BackendError> {
     serde_json::to_value(status).map_err(|_| BackendError::new(BackendErrorCode::Internal, "No se pudo leer el estado.", false))
 }
 
-// A client signs in with its host instead (`host_client`): the library
-// and its configuration are the host's.
+// A client signs in on its copy, which is the library it works on: the
+// Owner's user name and password also open the session of the sync with
+// the host (`host_client::use_credentials`). Only the first copy, before
+// there is a copy to open, signs in with the host itself.
+
+/// Whether this device is a client still without its copy open: it signs
+/// in with the host for the first copy.
+fn signs_in_with_host(app: &AppHandle) -> bool {
+    crate::connection::is_client(app) && !crate::host_mirror::is_open(app)
+}
+
+fn host_signs_in_first() -> BackendError {
+    BackendError::new(
+        BackendErrorCode::Unsupported,
+        "Para copiar la biblioteca, el Owner tiene que tener contraseña: creala en el host.",
+        false,
+    )
+}
+
+/// Signs the Owner in on the copy right after the first copy, with the
+/// session that copied it: the person does not sign in twice.
+pub(crate) fn unlock_copy(app: &AppHandle, library_id: &str, username: &str, password: &str, remember_session: bool) -> Result<(), BackendError> {
+    if crate::config_vault::is_unlocked(app, library_id) {
+        return Ok(());
+    }
+    let payload = LoginPayload {
+        library_id: library_id.to_string(),
+        username: username.to_string(),
+        password: password.to_string(),
+        remember_session,
+        remember_data: false,
+    };
+    app_auth_login(app, payload).map(|_| ())
+}
 
 pub(crate) async fn backend_app_auth_status(app: AppHandle, payload: AuthLibraryPayload) -> Result<serde_json::Value, BackendError> {
-    let status = if crate::host_client::uses_host(&app) {
+    let status = if signs_in_with_host(&app) {
         crate::host_client::auth_status(&app).await
     } else {
         blocking(move || app_auth_status(&app, payload).and_then(to_value)).await
@@ -463,39 +495,79 @@ pub(crate) async fn backend_app_auth_status(app: AppHandle, payload: AuthLibrary
     status
 }
 
+/// On a client, the copy keeps the password the host had at the last sync:
+/// when it changed on another device, the host accepts the new one, and a
+/// sync brings it to the copy before signing in again.
 pub(crate) async fn backend_app_auth_login(app: AppHandle, payload: LoginPayload) -> Result<serde_json::Value, BackendError> {
-    if crate::host_client::uses_host(&app) {
+    if signs_in_with_host(&app) {
         let LoginPayload { library_id, username, password, remember_session, remember_data } = payload;
         return crate::host_client::auth_login(&app, &library_id, &username, &password, remember_session, remember_data).await;
     }
-    blocking(move || app_auth_login(&app, payload).and_then(to_value)).await
+    let client = crate::connection::is_client(&app);
+    let LoginPayload { library_id, username, password, remember_session, remember_data } = payload;
+    let attempt = |app: AppHandle| {
+        let payload = LoginPayload {
+            library_id: library_id.clone(),
+            username: username.clone(),
+            password: password.clone(),
+            remember_session,
+            remember_data,
+        };
+        blocking(move || app_auth_login(&app, payload).and_then(to_value))
+    };
+    let mut signed_in = attempt(app.clone()).await;
+    if client && signed_in.as_ref().is_err_and(|error| error.code == BackendErrorCode::Unauthorized)
+        && crate::host_client::host_accepts(&app, &username, &password).await
+    {
+        crate::host_mirror::sync(&app).await?;
+        signed_in = attempt(app.clone()).await;
+    }
+    let status = signed_in?;
+    if client {
+        crate::host_client::use_credentials(&app, &username, &password, remember_session);
+    }
+    Ok(status)
 }
 
 pub(crate) async fn backend_app_auth_first_login(app: AppHandle, payload: FirstLoginPayload) -> Result<(), BackendError> {
-    if crate::host_client::uses_host(&app) {
-        return crate::host_client::auth_first_login(&app, &payload.username).await;
+    if signs_in_with_host(&app) {
+        return Err(host_signs_in_first());
     }
     blocking(move || app_auth_first_login(&app, payload)).await
 }
 
 pub(crate) async fn backend_app_auth_create_password(app: AppHandle, payload: CreatePasswordPayload) -> Result<serde_json::Value, BackendError> {
-    if crate::host_client::uses_host(&app) {
-        return crate::host_client::auth_create_password(&app, &payload.username, &payload.password).await;
+    if signs_in_with_host(&app) {
+        return Err(host_signs_in_first());
     }
     blocking(move || app_auth_create_password(&app, payload).and_then(to_value)).await
 }
 
+/// On a client the host changes first, so the copy and the host never
+/// disagree on the password; without connection it waits.
 pub(crate) async fn backend_app_auth_change_password(app: AppHandle, payload: ChangePasswordPayload) -> Result<serde_json::Value, BackendError> {
-    if crate::host_client::uses_host(&app) {
-        let ChangePasswordPayload { library_id, username, current, new } = payload;
-        return crate::host_client::auth_change_password(&app, &library_id, &username, &current, &new).await;
+    if crate::connection::is_client(&app) {
+        crate::host_client::change_password(&app, &payload.username, &payload.current, &payload.new)
+            .await
+            .map_err(|error| match error.code {
+                BackendErrorCode::ProviderUnavailable => BackendError::new(
+                    BackendErrorCode::ProviderUnavailable,
+                    "Para cambiar la contraseña hace falta conexión con el host: probá de nuevo cuando responda.",
+                    true,
+                ),
+                _ => error,
+            })?;
+        // Before the first copy there is no copy to change.
+        if signs_in_with_host(&app) {
+            return crate::host_client::auth_status(&app).await;
+        }
     }
     blocking(move || app_auth_change_password(&app, payload).and_then(to_value)).await
 }
 
 pub(crate) async fn backend_app_auth_logout(app: AppHandle, payload: AuthLibraryPayload) -> Result<serde_json::Value, BackendError> {
-    if crate::host_client::uses_host(&app) {
-        return crate::host_client::auth_logout(&app, payload.library_id.as_deref()).await;
+    if crate::connection::is_client(&app) {
+        crate::host_client::sign_out(&app);
     }
     blocking(move || app_auth_logout(&app, payload).and_then(to_value)).await
 }

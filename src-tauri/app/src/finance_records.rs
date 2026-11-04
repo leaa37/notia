@@ -467,6 +467,35 @@ pub fn finance_list_purchases(
     Ok(purchases)
 }
 
+/// The lines of a purchase (a ticket), for reading it by id.
+pub(crate) fn purchase_items(app: &crate::host::AppHandle, context: &FinanceContext, purchase_id: &str) -> FinanceCommandResult<Vec<serde_json::Value>> {
+    let connection = validate_context(context, app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT i.id,i.original_description,i.normalized_description,i.quantity,i.unit_price,i.discount_amount,i.line_total,i.currency,c.name,p.name FROM finance_purchase_items i LEFT JOIN finance_categories c ON c.id=i.category_id LEFT JOIN finance_products p ON p.id=i.product_id WHERE i.purchase_id=?1 ORDER BY i.rowid",
+        )
+        .map_err(|error| error.to_string())?;
+    let items = statement
+        .query_map(params![purchase_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "description": row.get::<_, String>(1)?,
+                "normalizedDescription": row.get::<_, Option<String>>(2)?,
+                "quantity": row.get::<_, Option<String>>(3)?,
+                "unitPrice": row.get::<_, Option<String>>(4)?,
+                "discountAmount": row.get::<_, Option<String>>(5)?,
+                "lineTotal": row.get::<_, String>(6)?,
+                "currency": row.get::<_, String>(7)?,
+                "category": row.get::<_, Option<String>>(8)?,
+                "product": row.get::<_, Option<String>>(9)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(items)
+}
+
 pub fn finance_list_price_history(
     app: crate::host::AppHandle,
     payload: ListPeriodPayload,

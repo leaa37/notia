@@ -1,18 +1,18 @@
-//! The copy a «Con copia» client keeps of its host's library.
+//! The copy a client keeps of its host's library, which is the library the
+//! client works on.
 //!
-//! - **Online**, every command runs on the host and this copy follows it:
-//!   a sync starts in the background as soon as a session with the host
-//!   opens, and the monitor of `host_client` repeats it every few seconds
-//!   (`sync_in_background`), with the rules of `mirror_sync` and the
-//!   commands of `host_sync`. The window never waits for it.
-//! - **Offline**, the window works on the copy as a library of this device
-//!   (`enter_offline_copy`): notes, files and the database can change, and
-//!   the AI and speech recognition are local. A ready copy opens at once
-//!   when the host does not answer (`copy_ready`).
-//! - **Back online**, the next sync reconciles both sides: the last
-//!   modified file wins, and in the database the last change of each row
-//!   wins (`row_sync`), whatever device made it. What changed on this
-//!   device travels first, so the host shows it as soon as possible.
+//! - **Always on the copy.** The window of a client opens the copy as a
+//!   library of this device (`open_copy`), whether the host answers or not:
+//!   notes, files and the database change here, and the AI and speech
+//!   recognition are local.
+//! - **Synced in the background** whenever the host answers and accepts
+//!   the Owner's session: the monitor of `host_client` starts a sync on
+//!   every check (`sync_in_background`), with the rules of `mirror_sync`
+//!   and the commands of `host_sync`. The window never waits for it.
+//! - **Both sides change**: the last modified file wins, and in the
+//!   database the last change of each row wins (`row_sync`), whatever
+//!   device made it. What changed on this device travels first. After a
+//!   sync that brought changes, the window is told to read them again.
 //!
 //! The database is copied whole once (a snapshot of the host); after that
 //! only the rows that changed travel, both ways, on every sync.
@@ -39,7 +39,6 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::backend::connection::ClientKind;
 use crate::backend::mirror_sync::{plan, FileStamp, SyncAction, SyncBase, COPY_MARK_PATH};
 use crate::backend::{BackendError, BackendErrorCode};
 use crate::host::{AppHandle, Emitter, Manager};
@@ -71,16 +70,17 @@ pub(crate) struct MirrorState {
     transferring: AtomicBool,
     /// Files done and to do of the running sync.
     progress: Mutex<Option<(usize, usize)>>,
-    offline: AtomicBool,
-    /// The copy was listed since this device last worked offline: on
-    /// Android, where listing a SAF folder is slow, later syncs trust the
-    /// record (only the sync writes the copy while online).
-    scanned: AtomicBool,
+    /// The copy is open as a library of this device.
+    open: AtomicBool,
+    /// Android, where listing a SAF folder is slow: how many library writes
+    /// this device had made when the copy was last listed. A sync lists it
+    /// again only after a new write; otherwise it trusts the record.
+    listed_at: Mutex<Option<u64>>,
     last: Mutex<Option<CopyStatus>>,
 }
 
-/// The copy the window works on offline: its database opens only when it
-/// holds the host's tables (`database::open_copy_database_file`).
+/// The copy the window works on: its database opens only when it holds
+/// the host's tables (`database::open_copy_database_file`).
 enum CopyLocation {
     #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
     Folder(PathBuf),
@@ -88,23 +88,23 @@ enum CopyLocation {
     Saf(String),
 }
 
-static OFFLINE_COPY: Mutex<Option<CopyLocation>> = Mutex::new(None);
+static OPEN_COPY: Mutex<Option<CopyLocation>> = Mutex::new(None);
 
 /// Whether the library at `library_path` is the copy the window works on
-/// offline (Windows and Linux).
+/// (Windows, Linux and macOS).
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
-pub(crate) fn database_is_offline_copy(library_path: &str) -> bool {
-    match OFFLINE_COPY.lock().ok().as_deref() {
+pub(crate) fn database_is_copy(library_path: &str) -> bool {
+    match OPEN_COPY.lock().ok().as_deref() {
         Some(Some(CopyLocation::Folder(root))) => std::fs::canonicalize(library_path).is_ok_and(|path| &path == root),
         _ => false,
     }
 }
 
 /// Whether the SAF library `tree_uri` is the copy the window works on
-/// offline (Android).
+/// (Android).
 #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
-pub(crate) fn database_uri_is_offline_copy(tree_uri: &str) -> bool {
-    matches!(OFFLINE_COPY.lock().ok().as_deref(), Some(Some(CopyLocation::Saf(uri))) if uri == tree_uri)
+pub(crate) fn database_uri_is_copy(tree_uri: &str) -> bool {
+    matches!(OPEN_COPY.lock().ok().as_deref(), Some(Some(CopyLocation::Saf(uri))) if uri == tree_uri)
 }
 
 /// Record of the copy of one library of the host.
@@ -127,15 +127,16 @@ struct CopyRecord {
     database_id: Option<String>,
     #[serde(default)]
     database_seq: i64,
-    /// The library of this device the copy opens as offline.
+    /// The library of this device the copy opens as.
     #[serde(default)]
     local_library_id: Option<String>,
-    /// The library selected on this device before working offline.
+    /// The library selected on this device before the copy opened, for
+    /// going back to it in Host mode.
     #[serde(default)]
     previous_selection: Option<String>,
 }
 
-/// The host library this device copies, kept for starting offline.
+/// The host library this device copies, kept for opening the copy at start.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CurrentCopy {
@@ -225,14 +226,15 @@ fn state(app: &AppHandle) -> Option<crate::host::State<'static, MirrorState>> {
     app.try_state::<MirrorState>()
 }
 
-/// Whether the window works on the copy, without the host.
-pub(crate) fn is_offline(app: &AppHandle) -> bool {
-    state(app).is_some_and(|state| state.offline.load(Ordering::SeqCst))
+/// Whether this device keeps a copy of its host's library: every client does.
+fn keeps_copy(app: &AppHandle) -> bool {
+    crate::connection::is_client(app)
 }
 
-/// Whether this device keeps a copy of its host's library.
-pub(crate) fn keeps_copy(app: &AppHandle) -> bool {
-    crate::connection::client_host(app).is_some_and(|(_, kind, _)| kind == ClientKind::Copy)
+/// Id and name of the host library this device copied last.
+pub(crate) fn copied_library(app: &AppHandle) -> Option<(String, String)> {
+    let current: CurrentCopy = read_json(&directory(app).ok()?.join(CURRENT_FILE));
+    (!current.library_id.is_empty()).then_some((current.library_id, current.library_name))
 }
 
 /// The last sync, for Settings and the window.
@@ -260,8 +262,8 @@ pub(crate) fn last_error(app: &AppHandle) -> Option<String> {
     last_status(app).and_then(|status| status.error)
 }
 
-/// Whether this device has a copy of its host's library that opens without
-/// the host: synced at least once with the saved host, with its database.
+/// Whether this device has a copy of its host's library to open: synced at
+/// least once with the saved host, with its database.
 pub(crate) fn copy_ready(app: &AppHandle) -> bool {
     if !keeps_copy(app) {
         return false;
@@ -443,9 +445,6 @@ pub(crate) async fn sync(app: &AppHandle) -> Result<CopyStatus, BackendError> {
     if !keeps_copy(app) {
         return Err(unavailable("Este equipo no guarda una copia de la biblioteca del host."));
     }
-    if is_offline(app) {
-        return Err(unavailable("La copia se sincroniza cuando vuelve la conexión con el host."));
-    }
     let state = state(app).ok_or_else(|| unavailable("La copia no está disponible."))?;
     let _guard = state.sync.lock().await;
     let (library_id, library_name) = crate::host_client::served_library(app)
@@ -463,14 +462,40 @@ pub(crate) async fn sync(app: &AppHandle) -> Result<CopyStatus, BackendError> {
         *last = Some(status.clone());
     }
     let _ = app.emit(COPY_EVENT, &status);
+    announce_changes(app, &status);
     crate::client_status::refresh(app);
     result
+}
+
+/// The window reads again what a sync changed in the copy it works on:
+/// the files of the explorer and the modules that show the database.
+fn announce_changes(app: &AppHandle, status: &CopyStatus) {
+    if !is_open(app) {
+        return;
+    }
+    if status.downloaded + status.deleted > 0 {
+        let _ = app.emit(crate::filesystem::watch::LIBRARY_TREE_CHANGED_EVENT, serde_json::Value::Null);
+    }
+    if status.rows_downloaded > 0 {
+        for event in [
+            crate::finance::FINANCE_DATA_CHANGED_EVENT,
+            crate::agenda_tools::AGENDA_DATA_CHANGED_EVENT,
+            crate::routine::ROUTINE_DATA_CHANGED_EVENT,
+        ] {
+            let _ = app.emit(event, ());
+        }
+    }
+}
+
+/// Whether the window works on the copy now.
+pub(crate) fn is_open(app: &AppHandle) -> bool {
+    state(app).is_some_and(|state| state.open.load(Ordering::SeqCst))
 }
 
 /// Starts a sync on its own thread, unless one already runs: the window
 /// and the monitor of the host never wait for it.
 pub(crate) fn sync_in_background(app: &AppHandle) {
-    if !keeps_copy(app) || is_offline(app) {
+    if !keeps_copy(app) {
         return;
     }
     let Some(state) = state(app) else {
@@ -495,8 +520,12 @@ pub(crate) fn sync_in_background(app: &AppHandle) {
 }
 
 async fn sync_library(app: &AppHandle, state: &MirrorState, library_id: &str, library_name: &str) -> Result<CopyStatus, BackendError> {
-    let payload = json!({ "payload": { "libraryId": library_id } });
-    let manifest: SyncManifest = crate::host_client::call_host(app, "host_sync_manifest", payload.clone()).await?;
+    // A computer tells the host how much it processes, for deciding which
+    // one runs the library's services (`device_role`); Android never does.
+    let device = cfg!(not(any(target_os = "android", target_os = "ios"))).then(|| crate::device_role::local_power(app));
+    let payload = json!({ "payload": { "libraryId": library_id, "device": device } });
+    let manifest: SyncManifest = crate::host_client::call_host(app, "host_sync_manifest", payload).await?;
+    crate::device_role::note_synced(app);
     let record_file = record_path(app, library_id)?;
     let mut record: CopyRecord = read_json(&record_file);
     // A library the host gave a new id goes on from its copy (see
@@ -517,8 +546,9 @@ async fn sync_library(app: &AppHandle, state: &MirrorState, library_id: &str, li
     }
 
     // The copy is listed when this device may have changed it (desktop
-    // always; Android after starting or working offline).
-    let scan = cfg!(not(target_os = "android")) || !state.scanned.load(Ordering::SeqCst);
+    // always; Android after a write of this device since the last listing).
+    let writes = saf::local_writes();
+    let scan = cfg!(not(target_os = "android")) || state.listed_at.lock().map_or(true, |listed| *listed != Some(writes));
     let local: BTreeMap<String, FileStamp> = if scan {
         store.list(app)?
     } else {
@@ -527,10 +557,9 @@ async fn sync_library(app: &AppHandle, state: &MirrorState, library_id: &str, li
     let remote: BTreeMap<String, FileStamp> = manifest.files.iter().map(|file| (file.path.clone(), file.stamp)).collect();
     let paths: BTreeSet<String> = record.files.keys().chain(local.keys()).chain(remote.keys()).cloned().collect();
 
-    // What changed on this device travels first: the window, already on
-    // the host, shows the offline work as soon as possible. Then the
-    // database (the copy opens offline only with it: the sign-in reads the
-    // Owner from it) and last what the host changed.
+    // What changed on this device travels first: the other devices see it
+    // as soon as possible. Then the database (the copy opens only with it:
+    // the sign-in reads the Owner from it) and last what the host changed.
     let mut plans: Vec<(String, SyncAction)> = paths
         .into_iter()
         .map(|path| {
@@ -575,8 +604,8 @@ async fn sync_library(app: &AppHandle, state: &MirrorState, library_id: &str, li
     pass.run(outgoing).await;
     if pass.failure.is_none() && host_database {
         match sync_database(app, &store, library_id, pass.record, &mut pass.status).await {
-            // With the database recorded, the copy opens offline even if
-            // the rest of this sync is cut short.
+            // With the database recorded, the copy opens even if the rest
+            // of this sync is cut short.
             Ok(()) => pass.save(),
             Err(error) if connection_lost(&error) => pass.failure = Some(error),
             // The files still travel; the database is tried again next time.
@@ -619,7 +648,11 @@ async fn sync_library(app: &AppHandle, state: &MirrorState, library_id: &str, li
         library_name: library_name.to_string(),
     };
     write_json(&directory(app)?.join(CURRENT_FILE), &current)?;
-    state.scanned.store(true, Ordering::SeqCst);
+    if scan {
+        if let Ok(mut listed) = state.listed_at.lock() {
+            *listed = Some(writes);
+        }
+    }
     status.at_ms = now_ms();
     Ok(status)
 }
@@ -627,7 +660,7 @@ async fn sync_library(app: &AppHandle, state: &MirrorState, library_id: &str, li
 /// When the host gives its library a new id (its catalog was made again:
 /// the library keeps its folder and its database), the copy made under the
 /// old id goes on under the new one, with what it had synced and what it
-/// changed offline, instead of being refused as another library's copy or
+/// changed meanwhile, instead of being refused as another library's copy or
 /// copied again from scratch. `current.json` says which library this
 /// device copied last, and the record of that copy says which host
 /// database it follows: the same database is the same library. A copy from
@@ -660,7 +693,7 @@ fn adopt_previous_record(
     *record = previous;
     write_json(record_file, record)?;
     let _ = std::fs::remove_file(&previous_file);
-    // Offline, the copy opens under the new id from now on.
+    // The copy opens under the new id from now on.
     let next = CurrentCopy { host_address, library_id: library_id.to_string(), library_name: current.library_name };
     write_json(&directory.join(CURRENT_FILE), &next)?;
     log::warn!("[notia:copy] the copy goes on under the new id the host gave the library");
@@ -1086,6 +1119,10 @@ mod saf {
         picker::mark_tree_mutated(picker_state(app), tree_uri);
     }
 
+    pub(super) fn local_writes() -> u64 {
+        picker::library_writes()
+    }
+
     /// The person picks the folder of the copy. It must be empty, or an
     /// earlier copy: other files would travel to the host as new ones.
     pub(super) fn pick_folder(app: &AppHandle) -> Result<crate::backend::connection::CopyFolder, BackendError> {
@@ -1155,6 +1192,11 @@ mod saf {
     }
 
     pub(super) fn changed(_app: &AppHandle, _tree_uri: &str) {}
+
+    /// Windows, Linux and macOS list the copy on every sync.
+    pub(super) fn local_writes() -> u64 {
+        0
+    }
 }
 
 /// Android: the person picks the folder of the copy (Configuraciones →
@@ -1171,7 +1213,9 @@ pub(crate) async fn pick_copy_folder(app: AppHandle) -> Result<(), BackendError>
         crate::connection::store(&app, &settings)?;
         // The new folder is listed on the next sync.
         if let Some(state) = state(&app) {
-            state.scanned.store(false, Ordering::SeqCst);
+            if let Ok(mut listed) = state.listed_at.lock() {
+                *listed = None;
+            }
         }
         Ok(())
     }
@@ -1182,18 +1226,11 @@ pub(crate) async fn pick_copy_folder(app: AppHandle) -> Result<(), BackendError>
     }
 }
 
-// ---------- Offline ----------
+// ---------- The copy as the library of this device ----------
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct OfflineCopy {
-    library_id: String,
-    library_name: String,
-}
-
-/// Opens the copy as a library of this device while the host does not
-/// answer: the window works on it until the connection comes back.
-pub(crate) fn enter_offline_copy(app: &AppHandle) -> Result<OfflineCopy, BackendError> {
+/// Opens the copy as the library of this device: the window works on it,
+/// and it syncs with the host in the background. Returns its id.
+pub(crate) fn open_copy(app: &AppHandle) -> Result<String, BackendError> {
     if !keeps_copy(app) {
         return Err(unavailable("Este equipo no guarda una copia de la biblioteca del host."));
     }
@@ -1219,20 +1256,19 @@ pub(crate) fn enter_offline_copy(app: &AppHandle) -> Result<OfflineCopy, Backend
     }
     let (library, location) = open_copy_library(app, &record).ok_or_else(never_synced)??;
     let previous = crate::library_catalog::select_library(app, Some(&library.id))?;
-    if previous.as_deref() != Some(library.id.as_str()) {
+    if previous.as_deref() != Some(library.id.as_str()) && record.local_library_id.as_deref() != previous.as_deref() {
         record.previous_selection = previous;
     }
     record.local_library_id = Some(library.id.clone());
     write_json(&record_file, &record)?;
-    if let Ok(mut copy) = OFFLINE_COPY.lock() {
+    if let Ok(mut copy) = OPEN_COPY.lock() {
         *copy = Some(location);
     }
     if let Some(state) = state(app) {
-        state.offline.store(true, Ordering::SeqCst);
+        state.open.store(true, Ordering::SeqCst);
     }
     crate::client_status::refresh(app);
-    crate::host_client::announce_move(app);
-    Ok(OfflineCopy { library_id: library.id, library_name: current.library_name })
+    Ok(library.id)
 }
 
 /// The copy as a library of this device (added to the catalog), or `None`
@@ -1260,23 +1296,18 @@ fn open_copy_library(
     Some(crate::library_catalog::add_android_library(app, &folder.uri).map(|library| (library, CopyLocation::Saf(folder.uri))))
 }
 
-/// The host answers again: the window goes back to it and the next sync
-/// reconciles what changed meanwhile.
-pub(crate) fn leave_offline_copy(app: &AppHandle) -> Result<(), BackendError> {
-    let Some(state) = state(app) else {
-        return Ok(());
-    };
-    if !state.offline.swap(false, Ordering::SeqCst) {
-        return Ok(());
+/// This device goes back to Host mode: the window opens the library it
+/// had before the copy. The copy stays for a later return to Client.
+pub(crate) fn close_copy(app: &AppHandle) -> Result<(), BackendError> {
+    if let Some(state) = state(app) {
+        state.open.store(false, Ordering::SeqCst);
+        if let Ok(mut listed) = state.listed_at.lock() {
+            *listed = None;
+        }
     }
-    // What changed offline is found by listing the copy again.
-    state.scanned.store(false, Ordering::SeqCst);
-    if let Ok(mut copy) = OFFLINE_COPY.lock() {
+    if let Ok(mut copy) = OPEN_COPY.lock() {
         *copy = None;
     }
-    crate::host_client::forget_failed_command(app);
-    crate::client_status::refresh(app);
-    crate::host_client::announce_move(app);
     let current: CurrentCopy = read_json(&directory(app)?.join(CURRENT_FILE));
     if current.library_id.is_empty() {
         return Ok(());
@@ -1467,116 +1498,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The window of a client always works on the copy: it opens at once,
+    /// with or without the host, changes there, and the sync takes the
+    /// changes both ways while it stays open.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     #[test]
-    fn without_the_host_the_copy_opens_and_the_owner_signs_in() {
+    fn the_window_works_on_the_copy_and_it_syncs_while_open() {
         use crate::backend::connection::{ConnectionSettings, RunMode};
         use crate::host::{AppPaths, HostPorts};
 
-        let root = std::env::temp_dir().join(format!("notia-offline-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("notia-open-copy-{}", uuid::Uuid::new_v4()));
         let (host, port, stop, library_id) = crate::host_client::test_host::start(&root);
-        std::fs::write(root.join("Biblioteca").join("nota.md"), "hola").expect("note");
+        let library = root.join("Biblioteca");
+        std::fs::write(library.join("nota.md"), "hola").expect("note");
         let client = crate::create_app(AppPaths::new(Some(root.join("client")), None), HostPorts::default());
         client.manage(crate::mobile_directory_picker::AndroidDirectoryPickerState::empty());
         let settings = ConnectionSettings { mode: RunMode::Client, host_address: format!("127.0.0.1:{port}"), ..ConnectionSettings::default() };
         crate::connection::store(&client, &settings).expect("settings");
+        let open = || {
+            let opened = crate::host::async_runtime::block_on(crate::connection::client_open(client.clone())).expect("open");
+            serde_json::to_value(&opened).expect("json")
+        };
+
+        // Without a copy, the window first signs in with the host.
+        assert_eq!(open()["opening"], "first-sync");
         crate::host::async_runtime::block_on(async {
             crate::host_client::auth_login(&client, &library_id, "owner", "contraseña-1", false, false).await.expect("login");
-            sync(&client).await.expect("sync");
+            sync(&client).await.expect("first copy");
         });
-
-        // The host closes: the window opens the copy without waiting for it.
-        stop.store(true, Ordering::SeqCst);
-        drop(host);
         assert!(copy_ready(&client));
-        let started = std::time::Instant::now();
-        let opened = crate::host::async_runtime::block_on(crate::connection::client_open(client.clone())).expect("open");
-        assert_eq!(serde_json::to_value(&opened).expect("json")["opening"], "copy");
-        assert!(started.elapsed() <= crate::host_client::HEALTH_TIMEOUT + std::time::Duration::from_secs(2));
-        assert!(is_offline(&client));
-        let offline = enter_offline_copy(&client).expect("offline copy");
-        assert!(!crate::host_client::uses_host(&client));
-        let status = |library_id: &str| {
-            let payload = serde_json::from_value(json!({ "libraryId": library_id })).expect("payload");
-            serde_json::to_value(crate::app_auth::app_auth_status(&client, payload).expect("status")).expect("json")
-        };
-        assert_eq!(status(&offline.library_id)["state"], "locked");
-        let login = serde_json::from_value(json!({
-            "libraryId": offline.library_id, "username": "owner", "password": "contraseña-1",
-        }))
-        .expect("login payload");
-        let signed_in = serde_json::to_value(crate::app_auth::app_auth_login(&client, login).expect("local sign-in")).expect("json");
-        assert_eq!(signed_in["state"], "unlocked");
-        assert!(crate::library_config::read_library_config(&client, &offline.library_id).is_ok());
 
-        // The copy's database takes changes offline; they wait for the host.
+        // The copy opens with the host answering, signed in with the
+        // session of the first copy.
+        assert_eq!(open()["opening"], "copy");
+        assert!(is_open(&client));
+        let copy_id = crate::library_catalog::selected_library(&client).expect("the copy is selected").id;
+        let payload = serde_json::from_value(json!({ "libraryId": copy_id })).expect("payload");
+        let status = serde_json::to_value(crate::app_auth::app_auth_status(&client, payload).expect("status")).expect("json");
+        assert_eq!(status["state"], "unlocked");
+
+        // The window changes the copy; the next sync takes it to the host,
+        // and what the host changed comes down.
         let record: CopyRecord = read_json(&record_path(&client, &library_id).expect("record"));
         let folder = record.folder.expect("copy folder");
+        std::fs::write(folder.join("nota.md"), "hola desde la copia").expect("edit");
         let database = crate::database::open_library_connection(&folder.to_string_lossy()).expect("copy database");
         database
-            .execute("INSERT INTO agenda_notes (id, owner_user_id, text, created_at, updated_at) VALUES ('n', 'user-owner', 'sin host', 'x', 'x')", [])
-            .expect("offline write");
-        assert!(crate::row_sync::has_pending(&database).expect("pending"));
+            .execute("INSERT INTO agenda_notes (id, owner_user_id, text, created_at, updated_at) VALUES ('n', 'user-owner', 'en la copia', 'x', 'x')", [])
+            .expect("write on the copy");
         drop(database);
-
-        leave_offline_copy(&client).expect("back");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The phone in the gym: the host stops answering while a command of
-    /// the window runs. The window goes to the copy at once, reopens on it
-    /// without asking the host again, and the failure is forgotten when it
-    /// leaves the copy.
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    #[test]
-    fn a_failed_command_moves_the_window_to_the_copy_at_once() {
-        use crate::backend::connection::{ConnectionSettings, RunMode};
-        use crate::host::{AppPaths, HostPorts};
-        use crate::registry::Dispatch;
-
-        let root = std::env::temp_dir().join(format!("notia-failed-command-{}", uuid::Uuid::new_v4()));
-        let (host, port, stop, library_id) = crate::host_client::test_host::start(&root);
-        let client = crate::create_app(AppPaths::new(Some(root.join("client")), None), HostPorts::default());
-        client.manage(crate::mobile_directory_picker::AndroidDirectoryPickerState::empty());
-        let settings = ConnectionSettings { mode: RunMode::Client, host_address: format!("127.0.0.1:{port}"), ..ConnectionSettings::default() };
-        crate::connection::store(&client, &settings).expect("settings");
-        let forwarded = |command: &str| {
-            let body = json!({ "command": command, "args": { "payload": { "libraryId": library_id } } });
-            match crate::registry::dispatch_app_invoke(&client, "main", &body) {
-                Dispatch::Pending(task) => crate::host::async_runtime::block_on(task),
-                Dispatch::Ready(reply) => reply,
-            }
-        };
+        std::fs::write(library.join("del-host.md"), "nuevo").expect("host file");
         crate::host::async_runtime::block_on(async {
-            crate::host_client::auth_login(&client, &library_id, "owner", "contraseña-1", false, false).await.expect("login");
-            sync(&client).await.expect("sync");
+            let status = sync(&client).await.expect("sync while open");
+            assert!(status.uploaded >= 1 && status.downloaded >= 1 && status.rows_uploaded >= 1, "{status:?}");
         });
-        assert!(forwarded("backend_library_catalog").is_ok());
-        assert!(!crate::host_client::copy_preferred(&client));
-        assert_eq!(crate::host_client::link_view(&client).move_to, None);
+        assert_eq!(std::fs::read_to_string(library.join("nota.md")).expect("host note"), "hola desde la copia");
+        assert_eq!(std::fs::read_to_string(folder.join("del-host.md")).expect("copy file"), "nuevo");
+        let host_db = crate::database::open_library_connection(&library.to_string_lossy()).expect("host database");
+        let text: String = host_db.query_row("SELECT text FROM agenda_notes WHERE id = 'n'", [], |row| row.get(0)).expect("row");
+        assert_eq!(text, "en la copia");
+        drop(host_db);
 
-        // The host goes away: the next command fails and the window may
-        // move now, not after the monitor's wait.
+        // The password changes on the host: the copy still has the old one,
+        // and signing in with the new one brings it before opening.
+        crate::app_auth::host_change_password(&host, "owner", "contraseña-1", "contraseña-2").expect("new password");
+        let library_payload = serde_json::from_value(json!({ "libraryId": copy_id })).expect("payload");
+        crate::app_auth::app_auth_logout(&client, library_payload).expect("sign out of the copy");
+        let login = serde_json::from_value(json!({ "libraryId": copy_id, "username": "owner", "password": "contraseña-2" })).expect("login");
+        let signed_in = crate::host::async_runtime::block_on(crate::app_auth::backend_app_auth_login(client.clone(), login)).expect("new password");
+        assert_eq!(signed_in["state"], "unlocked");
+
+        // Without the host the copy still opens at once.
         stop.store(true, Ordering::SeqCst);
         drop(host);
-        let failed = forwarded("backend_library_catalog").expect_err("the host is gone");
-        assert_eq!(failed["code"], "provider-unavailable");
-        assert!(crate::host_client::copy_preferred(&client));
-        assert_eq!(crate::host_client::link_view(&client).move_to, Some(crate::host_client::WindowMove::Copy));
-
-        // The window reopens on the copy without probing the host.
         let started = std::time::Instant::now();
-        let opened = crate::host::async_runtime::block_on(crate::connection::client_open(client.clone())).expect("open");
-        let opened = serde_json::to_value(&opened).expect("json");
-        assert_eq!(opened["opening"], "copy");
-        assert!(opened["message"].as_str().is_some_and(|message| message.contains("dejó de responder")), "{opened}");
-        assert!(started.elapsed() < crate::host_client::HEALTH_TIMEOUT);
-        assert!(is_offline(&client) && !crate::host_client::uses_host(&client));
-        // On the copy, the failure no longer asks for a move.
-        assert_eq!(crate::host_client::link_view(&client).move_to, None);
+        assert_eq!(open()["opening"], "copy");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
 
-        leave_offline_copy(&client).expect("back");
-        assert!(!crate::host_client::copy_preferred(&client));
+        // Back to Host mode, the copy closes.
+        close_copy(&client).expect("close");
+        assert!(!is_open(&client));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

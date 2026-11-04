@@ -114,8 +114,8 @@ pub fn open_mobile_library_connection(
     directory_uri: &str,
 ) -> Result<Connection, String> {
     let path = prepare_mobile_database(app, directory_uri)?;
-    // Offline, a client works on its copy of the host's database.
-    if crate::host_mirror::database_uri_is_offline_copy(directory_uri) {
+    // A client works on its copy of the host's database.
+    if crate::host_mirror::database_uri_is_copy(directory_uri) {
         return open_copy_database_file(Path::new(&path));
     }
     let connection = Connection::open(path)
@@ -163,7 +163,7 @@ fn prepare_mobile_database(app: &crate::host::AppHandle, directory_uri: &str) ->
 }
 
 /// Drops the temporary SQLite copies, so the next use copies the library's
-/// database again (the offline copy of a client got a new snapshot).
+/// database again (the copy of a client got a new snapshot).
 #[cfg(target_os = "android")]
 pub(crate) fn discard_mobile_database_copies(app: &crate::host::AppHandle) {
     let Some(state) = app.try_state::<LibraryDatabaseState>() else {
@@ -209,9 +209,9 @@ pub fn sync_mobile_library_connection(
     }
 }
 
-/// Opens the database of a client's copy at `path`, writable: offline the
-/// window works on it, and its changes reach the host row by row
-/// (`row_sync`) when the connection comes back.
+/// Opens the database of a client's copy at `path`, writable: the window
+/// works on it, and its changes reach the host row by row (`row_sync`) on
+/// the next sync.
 pub(crate) fn open_copy_database_file(path: &Path) -> Result<Connection, String> {
     if !path.is_file() {
         return Err(COPY_WITHOUT_DATABASE.to_string());
@@ -1328,8 +1328,8 @@ fn migrate_to(connection: &Connection, target: i64) -> Result<i64, rusqlite::Err
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn open_library_connection(library_path: &str) -> Result<Connection, String> {
     let path = database_path(library_path)?;
-    // Offline, a client works on its copy of the host's database.
-    if crate::host_mirror::database_is_offline_copy(library_path) {
+    // A client works on its copy of the host's database.
+    if crate::host_mirror::database_is_copy(library_path) {
         return open_copy_database_file(&path);
     }
     let connection =
@@ -1471,8 +1471,8 @@ pub fn initialize_library_database(
         if let Err(error) = fs::create_dir_all(parent) {
             return failure(format!("No se pudo crear .notia: {error}"));
         }
-        // The offline copy of a client opens only with its host's tables.
-        if crate::host_mirror::database_is_offline_copy(&payload.library_path) {
+        // The copy of a client opens only with its host's tables.
+        if crate::host_mirror::database_is_copy(&payload.library_path) {
             return match open_copy_database_file(&path) {
                 Ok(_) => InitializeLibraryDatabaseResult {
                     ok: true,

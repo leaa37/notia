@@ -31,7 +31,6 @@ export interface NotiaActions {
   /** New source of a text editor; without `documentPath` it belongs to the active tab. */
   textDocumentChange: (nextSource: string, documentPath?: string) => void
   /** A shared note changed and another editor saves it (nothing left to save here). */
-  sharedTextDocumentChange: (path: string, nextSource: string) => void
   chatWorkspaceTreeChanged: (pathHint?: string) => void
   windowAction: (action: NotiaWindowAction) => void
   coldPassOpenCredentialModal: () => void

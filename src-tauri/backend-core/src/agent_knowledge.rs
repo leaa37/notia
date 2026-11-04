@@ -13,7 +13,7 @@ use crate::agent_workspace::{
     dedupe_items, parse_person_entry, stamp_thought, thought_text, Biography, ImprovementKind, ItemBudget,
     BIOGRAPHY_STORY_LIMIT, BIOGRAPHY_STORY_TARGET, MAX_BIOGRAPHY_NOTE_CHARS, MAX_IMPROVEMENT_CHARS, MAX_RULE_CHARS,
     MAX_THOUGHT_CHARS, MEMORY_LIMIT, MEMORY_TARGET, PEOPLE, RULES_LIMIT, RULES_TARGET, TALK, THOUGHTS_LIMIT,
-    THOUGHTS_TARGET,
+    THOUGHTS_TARGET, without_oldest,
 };
 
 const MAX_TITLE_CHARS: usize = 80;
@@ -355,7 +355,10 @@ fn apply_operations(ops: &[Value], files: &AgentFiles, now_stamp: &str) -> Optio
             }
         }
         next.extend(appended.remove(&file).unwrap_or_default());
-        let next = dedupe_items(next);
+        let mut next = dedupe_items(next);
+        if matches!(file, ListFile::Thoughts | ListFile::Talk) {
+            next = without_oldest(next, file.budget(items)).0;
+        }
         if !file.budget(items).fits(&next) {
             return None;
         }
@@ -732,8 +735,13 @@ mod tests {
 
         let full = AgentFiles { talk: (0..TALK.target.items + 1).map(|index| format!("Rasgo {index}")).collect(), ..AgentFiles::default() };
         let organized = |ops: &str| parse_organization(&format!("{{\"ops\": {ops}}}"), &full, "2026-09-27 12:00").expect("object").lists;
-        assert_eq!(organized("[]"), None, "a file past its target must come back within it");
         assert_eq!(organized(r#"[{"op": "merge", "ids": ["h1", "h2"], "file": "talk", "text": "Rasgos 0 y 1"}]"#).map(|lists| lists.talk.len()), Some(TALK.target.items));
+        // Talk traits the model left past the target lose the oldest ones,
+        // so a new trait always finds room; facts about people never do.
+        let talk = organized("[]").expect("trimmed").talk;
+        assert_eq!((talk.len(), talk[0].as_str()), (TALK.target.items, "Rasgo 1"));
+        let people = AgentFiles { people: (0..PEOPLE.target.items + 1).map(|index| format!("Persona {index} — vecina")).collect(), ..AgentFiles::default() };
+        assert_eq!(parse_organization(r#"{"ops": []}"#, &people, "2026-09-27 12:00").expect("object").lists, None, "a file past its target must come back within it");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { memo, Suspense, useCallback, useMemo, lazy } from 'react'
+import { memo, Suspense, useCallback, lazy } from 'react'
 import { isTextFileDocument, type OpenFileDocument } from '../../../types/views/fileDocument'
 import type { MarkdownWikiLinkTarget } from '../../../types/views/markdownWikiLink'
 import type { MarkdownDocumentUpdate, MarkdownSelectionContext } from '../../../types/views/markdownSelection'
@@ -35,7 +35,6 @@ interface FileViewHostProps {
   /** New source; the Markdown editor names its note (`documentPath`), the others write the active tab. */
   onTextSourceChange: (nextSource: string, documentPath?: string) => void
   /** A shared note changed and another editor saves it. */
-  onSharedTextSourceChange?: (path: string, nextSource: string) => void
   wikiLinkTargets: MarkdownWikiLinkTarget[]
   onOpenLinkedFile: (filePath: string) => void
   /** Creates a note next to the open one from a link property; resolves to an error message or `null`. */
@@ -56,7 +55,6 @@ function ignoreSourceChange() {}
 function FileViewHostComponent({
   document,
   onTextSourceChange,
-  onSharedTextSourceChange,
   wikiLinkTargets,
   onOpenLinkedFile,
   onCreateLinkedNote,
@@ -72,11 +70,6 @@ function FileViewHostComponent({
   const handleMermaidSourcePersist = useCallback(async (nextSource: string) => {
     onTextSourceChange(nextSource)
   }, [onTextSourceChange])
-  const documentPath = document.path
-  const handleSharedSourceChange = useMemo(
-    () => (onSharedTextSourceChange ? (nextSource: string) => onSharedTextSourceChange(documentPath, nextSource) : undefined),
-    [documentPath, onSharedTextSourceChange],
-  )
   if (document.viewKind === 'image') {
     return <ImageView imageUrl={document.imageUrl} alt={document.name} />
   }
@@ -115,7 +108,6 @@ function FileViewHostComponent({
           readOnly={document.readOnly}
           libraryId={libraryId}
           onSourceChange={onMarkdownSourceChange}
-          onSharedSourceChange={handleSharedSourceChange}
           wikiLinkTargets={wikiLinkTargets}
           onOpenLinkedFile={onOpenLinkedFile}
           onCreateLinkedNote={onCreateLinkedNote}

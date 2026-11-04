@@ -145,6 +145,9 @@ fn reserved_ports(app: &AppHandle) -> Vec<(u16, &'static str)> {
     if let Some(port) = crate::device_preferences::section(app, "taskManagerPublication")["port"].as_u64().and_then(|port| u16::try_from(port).ok()) {
         reserved.push((port, "el tablero publicado"));
     }
+    if let Some(port) = crate::webhooks::listening_port(app) {
+        reserved.push((port, "el webhook"));
+    }
     reserved
 }
 

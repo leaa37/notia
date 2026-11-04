@@ -167,7 +167,9 @@ pub(crate) fn execute_backend_mutation_tool(
     if receipt.changed {
         announce_task_manager_change(app, library_id);
     }
-    Ok(json!({ "tool": name, "preview": preview, "receipt": receipt }))
+    // The preview is what was applied, not a change waiting for approval.
+    let status = if receipt.changed { "Aplicado: el cambio ya quedó guardado; no hace falta confirmar nada más." } else { "Sin cambios: ya estaba así." };
+    Ok(json!({ "tool": name, "applied": receipt.changed, "status": status, "preview": preview, "receipt": receipt }))
 }
 
 /// What a board tool will do, in the words of its confirmation. It names

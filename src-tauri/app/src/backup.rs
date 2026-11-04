@@ -423,8 +423,8 @@ pub(crate) mod service {
                     let app = app.clone();
                     std::thread::spawn(move || loop {
                         std::thread::sleep(SCHEDULER_TICK);
-                        // The host backs up a client's library.
-                        if !crate::connection::is_client(&app) {
+                        // Only the computer that runs the library's services backs it up.
+                        if crate::device_role::runs_services(&app) {
                             run_due_backup(&app);
                         }
                     });

@@ -6589,54 +6589,6 @@ table { width: 100%; border-collapse: collapse; } th, td { padding: 11px 8px; te
   box-sizing: border-box;
 }
 
-/* The notice of a client window (Windows and Linux; Android uses its
-   notification): drawn outside the app, it takes the shell's theme tokens
-   without its layout and sits in a corner instead of over the top bar. */
-.notia-app-shell.notia-client-notice {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  z-index: 1000;
-  display: block;
-  height: auto;
-  max-width: min(440px, calc(100vw - 32px));
-  padding: 0;
-  overflow: visible;
-  background: transparent;
-}
-
-.notia-client-notice .notia-remote-banner {
-  position: static;
-  transform: none;
-  max-width: 100%;
-  font-size: 13px;
-  line-height: 1.4;
-}
-
-/* A client window while its host does not answer. */
-.notia-client-banner { border-color: color-mix(in srgb, var(--color-coral) 45%, var(--color-border-soft)); }
-.notia-client-banner[data-tone='online'] { border-color: color-mix(in srgb, var(--color-sage) 45%, var(--color-border-soft)); }
-
-.notia-client-banner-action {
-  flex-shrink: 0;
-  min-height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--color-border-soft);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--color-accent-text);
-  font: inherit;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.notia-client-banner-action:focus-visible { outline: 2px solid var(--color-accent-text); outline-offset: 2px; }
-
-@media (pointer: coarse) {
-  .notia-client-banner-action { min-height: 44px; }
-}
-
 .notia-client-address { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Consolas, monospace; }
 
 /* ── Chat workspace: history · conversation · context ───── */

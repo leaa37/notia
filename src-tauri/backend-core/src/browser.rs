@@ -308,11 +308,17 @@ impl BrowserCommand {
     /// Whether what the command points at is still there: its reference in
     /// the last snapshot, its cells in the last grid. Otherwise the call
     /// goes back to the model before asking the person.
-    pub fn check_pointers(&self, page: Option<&BrowserPage>, grid: Option<&GridSpec>) -> Result<(), BackendError> {
+    pub fn check_pointers(&self, seen: &SeenPages, grid: Option<&GridSpec>) -> Result<(), BackendError> {
         if let Some(target) = self.target() {
-            check_reference(page, &target.reference)?;
+            check_reference(seen, &target.reference)?;
         }
         self.points(grid).map(|_| ())
+    }
+
+    /// The element as a snapshot shows it (`button "Enviar"`), for the
+    /// Playwright process to find it again if the page drew it again.
+    pub fn described_target(&self, seen: &SeenPages) -> Option<String> {
+        self.target().and_then(|target| seen.describe(&target.reference)).filter(|described| named(described))
     }
 
     /// The page points of the command's cells.
@@ -421,11 +427,12 @@ impl BrowserCommand {
 
     /// What the confirmation shows whole: the page, the element as the last
     /// snapshot shows it and what goes into it.
-    pub fn detail(&self, page: Option<&BrowserPage>) -> String {
+    pub fn detail(&self, seen: &SeenPages) -> String {
+        let page = seen.last.as_ref();
         let mut lines = Vec::new();
         if let Some(target) = self.target() {
             lines.push(format!("Elemento: {}", target.element.trim()));
-            if let Some(described) = page.and_then(|page| describe_reference(&page.snapshot, &target.reference)) {
+            if let Some(described) = seen.describe(&target.reference) {
                 lines.push(format!("En la página: {described}"));
             }
         }
@@ -631,6 +638,14 @@ pub struct BrowserPage {
     /// and what was done with them.
     #[serde(default)]
     pub dialogs: Vec<String>,
+    /// What the process did on its own during the action: an element found
+    /// again after the page drew it again, accessibility turned on.
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// The page shows a password field: the site asks to sign in, so the
+    /// session of Notia's profile is not active there.
+    #[serde(default)]
+    pub sign_in: bool,
 }
 
 /// One answer of the Playwright process: the page, or why the action failed.
@@ -676,13 +691,52 @@ pub fn describe_reference(snapshot: &str, reference: &str) -> Option<String> {
     (!described.is_empty()).then(|| one_line(described, 200))
 }
 
-/// Whether `reference` is in the last snapshot: an action on another one
-/// goes back to the model before asking the person.
-pub fn check_reference(page: Option<&BrowserPage>, reference: &str) -> Result<(), BackendError> {
-    let Some(page) = page else {
+/// Earlier snapshots kept besides the last one: a reference of one of them
+/// whose element the page drew again is found by its role and name.
+const EARLIER_SNAPSHOTS: usize = 3;
+
+/// The pages the model saw: the last whole snapshot and a few before it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeenPages {
+    pub last: Option<BrowserPage>,
+    pub earlier: Vec<String>,
+}
+
+impl SeenPages {
+    /// A new whole snapshot; the one it replaces becomes an earlier one.
+    pub fn remember(&mut self, page: BrowserPage) {
+        if let Some(previous) = self.last.take() {
+            self.earlier.insert(0, previous.snapshot);
+            self.earlier.truncate(EARLIER_SNAPSHOTS);
+        }
+        self.last = Some(page);
+    }
+
+    /// How the newest snapshot that has `reference` shows its element.
+    pub fn describe(&self, reference: &str) -> Option<String> {
+        self.last
+            .iter()
+            .map(|page| page.snapshot.as_str())
+            .chain(self.earlier.iter().map(String::as_str))
+            .find_map(|snapshot| describe_reference(snapshot, reference))
+    }
+}
+
+/// Whether the element is named (`button "Enviar"`): only a named one can
+/// be found again by its role and name once the page drew it again.
+fn named(described: &str) -> bool {
+    described.contains('"')
+}
+
+/// Whether `reference` can be acted on: it is in the last snapshot, or an
+/// earlier one shows a named element, which the Playwright process finds
+/// again on the page by its role and name. Otherwise the action goes back
+/// to the model before asking the person.
+pub fn check_reference(seen: &SeenPages, reference: &str) -> Result<(), BackendError> {
+    let Some(page) = seen.last.as_ref() else {
         return Err(BackendError::invalid_input("El navegador no tiene una página abierta: abrí una con browser_navigate."));
     };
-    if page.snapshot.contains(&format!("[ref={reference}]")) {
+    if page.snapshot.contains(&format!("[ref={reference}]")) || seen.describe(reference).is_some_and(|described| named(&described)) {
         Ok(())
     } else {
         Err(BackendError::invalid_input(format!(
@@ -716,8 +770,17 @@ pub fn tool_result(page: &BrowserPage, offset: usize) -> Value {
     if !page.dialogs.is_empty() {
         result["dialogs"] = json!(page.dialogs.iter().map(|dialog| one_line(dialog, MAX_DIALOG_CHARS)).collect::<Vec<_>>());
     }
+    if !page.notes.is_empty() {
+        result["notes"] = json!(page.notes.iter().map(|note| one_line(note, MAX_DIALOG_CHARS)).collect::<Vec<_>>());
+    }
+    if page.sign_in {
+        result["session"] = json!(SIGN_IN_NOTE);
+    }
     result
 }
+
+/// What a page with a password field tells the model.
+const SIGN_IN_NOTE: &str = "La página pide iniciar sesión (muestra un campo de contraseña): la sesión del perfil de Notia no está activa en este sitio. No vuelvas a navegar ni reintentes: pedile a la persona los datos o que inicie sesión ella en la ventana.";
 
 /// What the model reads after a screenshot: the page, its tabs, the grid
 /// and whether the person gets it too; the image (JPEG, base64) goes to the
@@ -846,26 +909,37 @@ mod tests {
         assert_eq!(describe_reference(SNAPSHOT, "e3").as_deref(), Some("heading \"Example Domain\" [level=1]"));
         assert_eq!(describe_reference(SNAPSHOT, "e1").as_deref(), Some("generic [active]"));
         assert_eq!(describe_reference(SNAPSHOT, "e99"), None);
-        let page = page(SNAPSHOT);
+        let page = SeenPages { last: Some(page(SNAPSHOT)), earlier: Vec::new() };
         let click = BrowserCommand::from_call(CLICK_TOOL, &json!({ "ref": "e13", "element": "Enlace «Learn more»", "acceptDialog": true })).expect("click");
         assert_eq!(click.summary(), "Clic en el navegador: Enlace «Learn more»");
         assert_eq!(
-            click.detail(Some(&page)),
+            click.detail(&page),
             "Elemento: Enlace «Learn more»\nEn la página: link \"Learn more\"\nSi la página pide confirmar, acepta.\nPágina: Example Domain (https://example.com/)"
         );
         let typed = BrowserCommand::from_call(TYPE_TOOL, &json!({ "ref": "e13", "element": "Buscador", "text": "hola", "submit": true })).expect("type");
         assert_eq!(typed.summary(), "Escribir en el navegador: Buscador y enviar");
-        assert!(typed.detail(Some(&page)).contains("Texto: hola\nDespués presiona Enter."));
+        assert!(typed.detail(&page).contains("Texto: hola\nDespués presiona Enter."));
     }
 
     #[test]
     fn an_unknown_reference_or_no_page_goes_back_to_the_model() {
-        let page = page(SNAPSHOT);
-        assert!(check_reference(Some(&page), "e13").is_ok());
-        assert_eq!(check_reference(Some(&page), "e1").map_err(|error| error.code), Ok(()));
-        let unknown = check_reference(Some(&page), "e130").expect_err("unknown");
+        let mut seen = SeenPages::default();
+        seen.remember(page(SNAPSHOT));
+        assert!(check_reference(&seen, "e13").is_ok());
+        assert_eq!(check_reference(&seen, "e1").map_err(|error| error.code), Ok(()));
+        let unknown = check_reference(&seen, "e130").expect_err("unknown");
         assert_eq!(unknown.code, crate::error::BackendErrorCode::InvalidInput);
-        assert_eq!(check_reference(None, "e13").expect_err("no page").code, crate::error::BackendErrorCode::InvalidInput);
+        assert_eq!(check_reference(&SeenPages::default(), "e13").expect_err("no page").code, crate::error::BackendErrorCode::InvalidInput);
+
+        // The page drew the link again with another reference: the old one,
+        // named in an earlier snapshot, is still accepted and goes with its
+        // role and name so the process finds it again.
+        seen.remember(page("- link \"Learn more\" [ref=e40]"));
+        assert!(check_reference(&seen, "e13").is_ok());
+        assert!(check_reference(&seen, "e1").is_err(), "an unnamed element is not found again");
+        let click = BrowserCommand::from_call(CLICK_TOOL, &json!({ "ref": "e13", "element": "Learn more" })).expect("click");
+        assert_eq!(click.described_target(&seen).as_deref(), Some("link \"Learn more\""));
+        assert!(click.detail(&seen).contains("En la página: link \"Learn more\""));
     }
 
     #[test]
@@ -882,7 +956,9 @@ mod tests {
         assert!(last["snapshot"].as_str().expect("part").ends_with("[ref=e999]"));
         assert_eq!(last["snapshotPart"]["nextOffset"], Value::Null);
         let short = tool_result(&BrowserPage { snapshot: SNAPSHOT.into(), ..BrowserPage::default() }, 0);
-        assert!(short.get("snapshotPart").is_none() && short.get("dialogs").is_none());
+        assert!(short.get("snapshotPart").is_none() && short.get("dialogs").is_none() && short.get("session").is_none());
+        let login: BrowserPage = serde_json::from_value(json!({ "url": "https://www.mercadolibre.com.ar/jms/arg/lgz/login", "signIn": true })).expect("page");
+        assert!(tool_result(&login, 0)["session"].as_str().expect("note").contains("pide iniciar sesión"));
     }
 
     #[test]
@@ -924,10 +1000,10 @@ mod tests {
     fn cells_are_clicked_or_dragged_only_on_the_last_grid() {
         let click = BrowserCommand::from_call(CLICK_TOOL, &json!({ "cells": ["a1", "B2"], "element": "Imágenes con semáforos" })).expect("cells");
         assert_eq!(click.summary(), "Clic en el navegador en A1, B2: Imágenes con semáforos");
-        assert!(click.detail(None).contains("Casillas de la grilla de la última captura: A1, B2"));
-        let missing = click.check_pointers(None, None).expect_err("no grid");
+        assert!(click.detail(&SeenPages::default()).contains("Casillas de la grilla de la última captura: A1, B2"));
+        let missing = click.check_pointers(&SeenPages::default(), None).expect_err("no grid");
         assert_eq!(missing.code, crate::error::BackendErrorCode::InvalidInput);
-        assert!(click.check_pointers(None, Some(&grid())).is_ok());
+        assert!(click.check_pointers(&SeenPages::default(), Some(&grid())).is_ok());
         assert_eq!(
             click.agent_request(3, Some(&grid())).expect("request"),
             json!({ "id": 3, "op": "clickPoints", "points": [[60.0, 70.0], [160.0, 170.0]], "double": false, "button": "left", "acceptDialog": false })
@@ -935,7 +1011,7 @@ mod tests {
         let drag = BrowserCommand::from_call(DRAG_TOOL, &json!({ "from": "A1", "to": "A4", "element": "Deslizador del captcha" })).expect("drag");
         assert_eq!(drag.summary(), "Arrastrar en el navegador de A1 a A4: Deslizador del captcha");
         assert_eq!(drag.agent_request(4, Some(&grid())).expect("request"), json!({ "id": 4, "op": "drag", "from": [60.0, 70.0], "to": [335.0, 70.0] }));
-        assert!(drag.check_pointers(None, Some(&GridSpec { columns: 2, ..grid() })).is_err());
+        assert!(drag.check_pointers(&SeenPages::default(), Some(&GridSpec { columns: 2, ..grid() })).is_err());
         assert!(BrowserCommand::from_call(DRAG_TOOL, &json!({ "from": "A1", "element": "x" })).is_err());
         assert!(BrowserCommand::from_call(CLICK_TOOL, &json!({ "cells": ["A1"], "ref": "e3", "element": "x" })).is_err());
         assert!(BrowserCommand::from_call(CLICK_TOOL, &json!({ "cells": ["casilla"], "element": "x" })).is_err());
