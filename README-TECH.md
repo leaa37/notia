@@ -348,13 +348,13 @@ En Linux el binario solo servidor no necesita D-Bus ni WebKit. Si no hay un comp
 
 `--resource-dir` indica dónde están los modelos de voz y los runtimes; por defecto, la carpeta del ejecutable. Sin `--static-dir`, se usa `dist/` junto al ejecutable si existe.
 
-### Servidor en Docker y carpeta única de datos (`--data-root`)
+### Servidor con carpeta única de datos (`--data-root`)
 
-Objetivo: que todo lo que el servidor headless persiste quede bajo una sola carpeta, para montarla como volumen de Docker. Solo cambia el modo `--headless`; la ventana de Windows y Android sigue usando su carpeta de datos de siempre.
+Objetivo: que todo lo que el servidor headless persiste quede bajo una sola carpeta, para respaldarla, moverla o conservarla entre reinstalaciones. Solo cambia el modo `--headless`; la ventana de Windows y Android sigue usando su carpeta de datos de siempre.
 
 ```bash
-notia --headless --data-root /app/data --set-owner-password
-notia --headless --data-root /app/data
+notia --headless --data-root /srv/notia --set-owner-password
+notia --headless --data-root /srv/notia
 ```
 
 - **`--data-root <carpeta>`** (`app/src/server/headless.rs`):
@@ -367,7 +367,7 @@ notia --headless --data-root /app/data
   - Si falla una biblioteca, se informa por stderr y el resto sigue. Si no se puede crear o leer `bibliotecas/`, el servidor no arranca.
 - **Exclusiones:** `--data-root` no se combina con `--data-dir` ni con `--add-library` (error de uso, código 2). En el navegador no se pueden agregar bibliotecas (el selector es un comando local), así que con `--data-root` el catálogo solo recibe carpetas de `bibliotecas/`. Para sumar una, se crea la carpeta y se reinicia el servidor.
 - **Lo que no queda en la carpeta, a propósito:**
-  - los recursos empaquetados de `--resource-dir` (modelos de voz y runtimes, de solo lectura, parte de la imagen) y `dist/`;
+  - los recursos empaquetados de `--resource-dir` (modelos de voz y runtimes, de solo lectura, junto al ejecutable) y `dist/`;
   - los temporales del sistema (audio del dictado, que se borra al terminar);
   - la caché de npm (`~/.npm`), que se rehace.
 - **Corrección incluida:**
@@ -375,34 +375,20 @@ notia --headless --data-root /app/data
   - **Causa:** `open_library_connection` no crea la carpeta padre, y en el servidor nadie llamaba a `initialize_library_database`.
   - **Arreglo:** `--add-library` y el registro de `--data-root` pasan por `register_library`, que agrega la carpeta al catálogo y crea `.notia/` con la base migrada. `initialize_desktop_library_database` (`app/src/database.rs`) es el cuerpo de escritorio de `initialize_library_database`, extraído sin cambios para reutilizarlo.
 - **Mensaje sin contraseña de dueño:** ahora pide correr el mismo comando con `--set-owner-password`, que también vale con `--data-root`.
-
-**Imagen Docker** (`Dockerfile`, `compose.yaml`, `.dockerignore`):
-
-| Etapa | Base | Qué hace |
-|---|---|---|
-| `web` | `node:22-trixie-slim` | `npm ci` y `npm run build` (`dist/` con las cuatro entradas de Vite). |
-| `server` | `rust:1.97-trixie` | `cargo build --release --locked --no-default-features`, con cachés de BuildKit para el registro y `target/`. |
-| final | `node:22-trixie-slim` | Agrega `ca-certificates` y `python3`. Node queda para WhatsApp (Baileys) y Python para `.agent/scripts`. Copia `/app/notia` y `/app/dist`; `VOLUME /app/data`, `EXPOSE 52480`, `HEALTHCHECK` contra `GET /api/health` y `ENTRYPOINT ["/app/notia", "--headless", "--data-root", "/app/data"]`. |
-
-- Los argumentos del contenedor se suman al `ENTRYPOINT`: `--set-owner-password`, `--bind`, `--static-dir` o `--resource-dir`.
-- `compose.yaml` monta `./data` en `/app/data` y publica 52480. `/data/` está en `.gitignore`. Si se habilita el webhook (52485) u otro puerto propio, hay que publicarlo también.
-- El proceso corre como root dentro del contenedor, para evitar problemas de permisos con el bind mount. La terminal del asistente, si se usa, opera dentro del contenedor.
-- **Límites en Linux:** no hay voz ni Meeting (en esta rama no hay reconocedor para Linux) ni generación de imágenes (`sd-cli` es de Windows). El navegador del asistente necesita Chrome o Edge, que la imagen no trae.
+- **glibc en Linux:** el binario pide la glibc del sistema donde se compiló, o una más nueva. Compilado en Debian 13 requiere `GLIBC_2.39` y no arranca en Debian 12 (`version 'GLIBC_2.38' not found`); compilado en Debian 12 requiere como máximo `GLIBC_2.34`. Hay que compilarlo en la misma versión de la distribución donde va a correr, o en una anterior.
+- **Límites en Linux:** no hay voz ni Meeting (en esta rama no hay reconocedor para Linux) ni generación de imágenes (`sd-cli` es de Windows). WhatsApp necesita Node.js 20 o más en el sistema, y los scripts del asistente, Python 3.
 
 **Validaciones (2026-11-11, Linux):**
 - `cargo test -p notia-app server::headless`: 4 aprobados. Los nuevos son `the_data_root_holds_the_data_and_the_libraries` y `the_folders_of_the_data_root_become_ready_libraries`; este último incluye el estado de inicio de sesión del Owner (`setup`) sobre una biblioteca recién creada, que antes fallaba.
 - `cargo test -p notia-app`: 465 aprobados y 2 fallidos, 7 ignorados. Los mismos 2 fallan sin este cambio (463 aprobados y 2 fallidos en dos corridas): `meeting::tests::a_meeting_whose_session_is_gone_finishes_with_its_lines` falla siempre, y `services::telegram_service::tests::endpoint_accepts_standard_bot_token_shape` falla solo con la suite completa (pasa solo).
-- `docker build`: la imagen se armó y se probó con estos resultados:
-  - unos 11 minutos para la etapa `server` con 4 núcleos y 55 s para la etapa `web`; imagen final de 407 MB (sin `python3`, ver abajo).
-  - **Prueba con un bind mount:**
-    1. `--set-owner-password` (por `NOTIA_OWNER_PASSWORD`).
-    2. Arranque: crea y registra `bibliotecas/Biblioteca`.
-    3. Con Playwright: ingreso al servidor, primer inicio del Owner, ingreso y alta de una nota desde la interfaz.
-    4. `docker rm -f` y un contenedor nuevo sobre la misma carpeta: el mismo certificado TLS (SHA-256), el mismo `libraryId`, ingreso del Owner con la contraseña creada antes, y la nota en el explorador y en el disco.
-  - Una carpeta nueva en `bibliotecas/` quedó registrada al reiniciar. `HEALTHCHECK` en `healthy`.
-  - Sin contraseña, el contenedor termina con código 2 y el mensaje nuevo. `docker compose config` valida `compose.yaml`.
+- **Prueba de punta a punta** con el binario compilado en release (`--no-default-features`), en Debian 13 y en Debian 12:
+  1. `--set-owner-password` (por `NOTIA_OWNER_PASSWORD`).
+  2. Arranque con `--data-root`: crea y registra `bibliotecas/Biblioteca`.
+  3. Con Playwright: ingreso al servidor, primer inicio del Owner, ingreso y alta de una nota desde la interfaz.
+  4. Fin del proceso y un proceso nuevo sobre la misma carpeta: el mismo certificado TLS (SHA-256), el mismo `libraryId`, ingreso del Owner con la contraseña creada antes, y la nota en el explorador y en el disco.
+  - Una carpeta nueva en `bibliotecas/` quedó registrada al reiniciar.
+  - Sin contraseña, el servidor termina con código 2 y el mensaje nuevo.
 - No probado:
-  - el paso `apt-get` de la imagen final (en el entorno de validación los espejos de Debian están bloqueados por la red; la imagen se armó con los certificados copiados de la etapa `server`);
   - la ventana de Windows y Android, que no cambian;
   - `cargo check` para Android: `initialize_desktop_library_database` está bajo `#[cfg(not(target_os = "android"))]`, como el código del que se extrajo.
 
