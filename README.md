@@ -1009,6 +1009,30 @@ Si el navegador pierde la conexión, se reconecta solo y recibe los cambios que 
 
 En Linux, el servidor se compila desde `src-tauri` con `cargo build --release --no-default-features`. Allí no hay dictado ni Bluetooth.
 
+**Todo en una carpeta (`--data-root`).** Con `notia --headless --data-root <carpeta>`, todo lo que el servidor guarda queda dentro de esa carpeta:
+- `<carpeta>/app`: los datos de Notia (bibliotecas registradas, contraseña del servidor, certificado, sesiones, Telegram, WhatsApp, modelos descargados).
+- `<carpeta>/bibliotecas`: una subcarpeta por biblioteca, con sus notas, su base de datos (`.notia/notia.db`), `.agent/`, chats y tableros.
+
+Cada subcarpeta de `bibliotecas` se agrega sola al arrancar y, si no hay ninguna, Notia crea `Biblioteca`. Para sumar otra, creá la carpeta y reiniciá el servidor. En este modo no se usan `--data-dir` ni `--add-library`, así nada queda afuera. Respaldar o mover la carpeta alcanza para llevarse todo.
+
+**Con Docker.** El repositorio trae `Dockerfile` y `compose.yaml`: el contenedor corre el servidor con `--data-root /app/data`, y `compose.yaml` guarda esa carpeta en `./data`, junto al archivo. Recrear o actualizar el contenedor no borra nada mientras conserves `./data`.
+
+1. Definí la contraseña del servidor; la pide por teclado y termina:
+
+   ```bash
+   docker compose run --rm notia --set-owner-password
+   ```
+
+2. Arrancá el servidor:
+
+   ```bash
+   docker compose up -d
+   ```
+
+3. Abrí `https://<IP de la computadora>:52480/`, aceptá el certificado autofirmado e ingresá la contraseña del servidor. Después, en la biblioteca, el primer inicio con el usuario `Owner` crea su contraseña.
+
+El primer `docker compose up` compila la interfaz y el servidor, y tarda varios minutos. Si activás el webhook (puerto 52485) u otro puerto, agregalo en `ports` de `compose.yaml`. En el contenedor no hay dictado, Meeting ni generación de imágenes.
+
 ### Búsqueda de Archivos
 
 | Campo | Descripción |

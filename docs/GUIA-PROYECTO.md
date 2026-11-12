@@ -10,12 +10,12 @@
 - **Qué es:** una app de notas y "segundo cerebro" *local-first* (estilo Obsidian) que fue creciendo hasta ser casi un sistema operativo personal: notas Markdown, Task Manager con Gantt, finanzas, salud, gimnasio, recetas, agenda, gestor de contraseñas, grabación y transcripción de reuniones, y un asistente de IA con unas 240 herramientas que opera todo eso desde la app, Telegram, WhatsApp o un webhook.
 - **Con qué está hecha:** Tauri 2. Usa React 19 + TypeScript como "cáscara visual" y Rust para **toda** la lógica. Son unas 196.000 líneas de Rust, unas 112.000 de TypeScript y 40.000 de CSS. El backend expone 277 comandos.
 - **Plataformas reales:** Windows (escritorio) y Android. El backend también corre como **servidor sin ventana** (`notia --headless`) en Windows y Linux, y se usa desde el navegador. Que diga "soporta macOS y Linux" es más una aspiración que un hecho: la ventana de escritorio en Linux o macOS **no compila con un clone recién hecho** (ver [§6.7](#67-ventana-en-linux-o-macos-por-qué-no-anda-de-fábrica)).
-- **La forma más rápida de verlo andando:** el servidor headless más el navegador. Lo levanté en Linux de punta a punta, con un *workaround* para un bug ([§6.4](#64-camino-b-servidor-headless--navegador-verificado-en-linux)).
+- **La forma más rápida de verlo andando:** el servidor headless más el navegador, a mano o con Docker (`docker compose up`, todo lo que guarda queda en `./data`). Lo levanté en Linux de punta a punta ([§6.4](#64-camino-b-servidor-headless--navegador-verificado-en-linux)).
 - **La forma "oficial" (ventana en Windows):** pide bajar unos 2 GB de modelos de voz y compilar dos runtimes nativos en C++ con el Vulkan SDK. Sin eso, el build de Rust falla a propósito.
 - **Lo que encontré roto** (detalle en [§9](#9-problemas-e-inconsistencias-que-encontré)):
   - `npm run lint` falla con 4 errores.
   - Falla 1 test de Rust: el filtro que debería bloquear imágenes sexuales de menores **no existe**, y el modelo de imágenes es una versión "uncensored". Es serio.
-  - El servidor headless no puede abrir una biblioteca nueva.
+  - El servidor headless no podía abrir una biblioteca nueva (ya corregido).
   - La documentación tiene datos desactualizados: URL de IA por defecto, versión, cantidad de comandos y pasos de Android que faltan.
 
 ---
@@ -189,7 +189,7 @@ Nada de esto hace falta para abrir la app y editar notas.
 | Camino | Para qué | SO | Dificultad | ¿Lo probé? |
 |---|---|---|---|---|
 | **A. Build y tests del frontend** | Ver si compila, correr tests, tocar UI | Cualquiera | Baja | ✅ Verificado |
-| **B. Servidor headless + navegador** | **Ver la app andando rápido**, con casi todas las funciones | Linux o Windows | Media | ✅ Verificado en Linux |
+| **B. Servidor headless + navegador** (a mano o con Docker) | **Ver la app andando rápido**, con casi todas las funciones | Linux, Windows o Docker | Media | ✅ Verificado en Linux y en Docker (salvo el `apt-get` de la imagen) |
 | **C. Ventana de escritorio en Windows** | La experiencia completa (voz, Meeting, bandeja, publicación) | Windows | **Alta** | ❌ Deducido del código y los scripts |
 | **D. Android** | La app en el teléfono o la tablet | Windows como máquina de build (en la práctica) | **Muy alta** | ❌ Deducido |
 | E. Ventana en Linux o macOS | — | — | No anda de fábrica | ❌ Ver §6.7 |
@@ -276,27 +276,43 @@ NOTIA_OWNER_PASSWORD='una-contraseña-larga' ./target/debug/notia --headless --s
 ./target/debug/notia --headless --add-library /ruta/a/MiBiblioteca
 ```
 
-**4. ⚠️ Workaround obligatorio para una carpeta nueva.** Si la carpeta nunca fue abierta por Notia, el login falla con *"No se pudo abrir SQLite: unable to open database file …/.notia/notia.db"*, porque nadie crea la carpeta `.notia/` en este flujo (es un bug, ver §9). Creala a mano:
+Agregar la carpeta ya crea su `.notia/` con la base de datos. Antes, una carpeta que Notia nunca había abierto fallaba en el primer login; está corregido, ver §9.
 
-```bash
-mkdir -p /ruta/a/MiBiblioteca/.notia
-```
-
-**5. Arrancar el servidor sirviendo la interfaz:**
+**4. Arrancar el servidor sirviendo la interfaz:**
 
 ```bash
 ./target/debug/notia --headless --static-dir ../dist --bind 127.0.0.1:52480
 ```
 
-Para usarlo desde otros equipos de la red, cambiá la dirección por `--bind 0.0.0.0:52480`, que es el valor por defecto. Las opciones completas se ven con `--help`: `--data-dir`, `--resource-dir`, `--static-dir`, `--bind`, `--set-owner-password` y `--add-library`.
+Para usarlo desde otros equipos de la red, cambiá la dirección por `--bind 0.0.0.0:52480`, que es el valor por defecto. Las opciones completas se ven con `--help`: `--data-root`, `--data-dir`, `--resource-dir`, `--static-dir`, `--bind`, `--set-owner-password` y `--add-library`.
 
-**6. Abrir `https://127.0.0.1:52480/`.** El certificado es autofirmado, así que hay que aceptar la excepción del navegador. Después hay **dos logins seguidos**:
+> **Todo en una carpeta:** con `--data-root <carpeta>` en lugar de `--data-dir` y `--add-library`, los datos de Notia van a `<carpeta>/app` y cada subcarpeta de `<carpeta>/bibliotecas` es una biblioteca, que se registra sola al arrancar (si no hay ninguna, crea `Biblioteca`).
+
+**5. Abrir `https://127.0.0.1:52480/`.** El certificado es autofirmado, así que hay que aceptar la excepción del navegador. Después hay **dos logins seguidos**:
 1. **"Contraseña del dueño"**: la del paso 2 (es la del servidor).
 2. **"Iniciar sesión" de la biblioteca**: la primera vez dejá activado **"Primer inicio"**, escribí el usuario **`Owner`**, tocá **Continuar** y creá su contraseña (mínimo 8 caracteres, **sin recuperación**). Después entrás con `Owner` y esa contraseña.
 
 Con eso ves el shell completo: explorador, editor, chat, Task Manager, Finanzas, etc. Lo verifiqué con Playwright: tanto el login como la pantalla principal cargan sin errores de JavaScript.
 
 **Qué NO hay en modo navegador:** Meeting, Bluetooth de ColdPass, importar un vault CSV, elegir la carpeta de backups y agregar bibliotecas con selector (se hace con `--add-library`). En Linux tampoco hay dictado ni transcripción de audios de Telegram, porque no hay reconocedor de voz compilado.
+
+#### Con Docker (lo mismo, empaquetado)
+
+El repo trae `Dockerfile` y `compose.yaml`. El contenedor corre el servidor con `--data-root /app/data`, y compose guarda esa carpeta en `./data`: notas, bases SQLite, configuración, certificado, sesiones y paquetes descargados quedan ahí. Recrear o actualizar el contenedor no pierde nada.
+
+Primero definí la contraseña del servidor (la pide por teclado y termina):
+
+```bash
+docker compose run --rm notia --set-owner-password
+```
+
+Después arrancá el servidor:
+
+```bash
+docker compose up -d
+```
+
+Abrí `https://<IP>:52480/` y seguí con los dos logins del paso 5. El primer build compila la interfaz y Rust en modo release, y tarda varios minutos. Para sumar una biblioteca, creá una carpeta en `./data/bibliotecas/` y reiniciá el contenedor.
 
 ### 6.5 Camino C: ventana de escritorio en Windows (el camino "oficial")
 
@@ -423,7 +439,7 @@ resources/speech/models/whisper-large-v3/**/*
 | `npm run lint` | ❌ 4 errores |
 | `cargo build --no-default-features` (servidor) | ✅ 141 warnings en `notia-app` |
 | `cargo test -p notia-backend-core` | ❌ 817 aprobados, **1 fallido**, 7 ignorados |
-| Servidor headless + Playwright (login del servidor, primer inicio del Owner, pantalla principal) | ✅ con el workaround de `.notia/` |
+| Servidor headless + Playwright (login del servidor, primer inicio del Owner, pantalla principal) | ✅ (al principio, con el workaround de `.notia/`; después se corrigió el bug) |
 | Ventana de escritorio (cualquier SO) | No ejecutada: este entorno no tiene WebKitGTK ni es Windows |
 | `cargo test -p notia-app` | No ejecutado |
 | Android | No ejecutado |
@@ -435,7 +451,7 @@ resources/speech/models/whisper-large-v3/**/*
 Ordenados por gravedad.
 
 1. **🔴 La generación de imágenes no tiene ningún filtro contra contenido sexual con menores.** El test `image_generation::tests::only_sexual_content_with_minors_is_refused` (`src-tauri/backend-core/src/image_generation.rs`) espera que prompts como "niña desnuda" se rechacen con `Forbidden`, pero `generate_job` y `edit_job` **no validan nada**: el test falla con el primer caso. La función `fold` que seguramente iba a usarse para normalizar el texto quedó sin uso (el compilador avisa `fn fold is never used`). Y el modelo que se descarga es `Qwen-Image-2.1-Turbo-Abliterated-Uncensored`. En criollo: el único freno que el propio autor quiso poner **no está implementado**, y el test que lo dice está en rojo. Esto hay que arreglarlo antes de cualquier otra cosa.
-2. **🟠 El servidor headless no inicializa una biblioteca nueva.** `--add-library` registra la carpeta pero no crea `.notia/`, y el login llama a `open_library_connection`, que no crea la carpeta padre. Resultado: *"No se pudo abrir SQLite: unable to open database file"*. Workaround: `mkdir .notia` (§6.4).
+2. **✅ Corregido el 2026-11-11: el servidor headless no inicializaba una biblioteca nueva.** `--add-library` registraba la carpeta pero no creaba `.notia/`, y el login llama a `open_library_connection`, que no crea la carpeta padre. Resultado: *"No se pudo abrir SQLite: unable to open database file"*. Ahora registrar una biblioteca deja su base lista (ver «Servidor en Docker y carpeta única de datos» en `README-TECH.md`).
 3. **🟠 `npm run lint` falla** con 4 errores, aunque `README-TECH.md` registra validaciones en verde:
    - `react-refresh/only-export-components` en `MeetingCompletedPanel.tsx:427` y `MermaidCodePane.tsx:46`;
    - `react-hooks/refs` ("Cannot access refs during render") en `useMeetingAiContext.ts:38` y `MermaidStage.tsx:88`.

@@ -1461,42 +1461,51 @@ pub fn initialize_library_database(
     #[cfg(not(target_os = "android"))]
     {
         let _ = (app, state);
-        let path = match database_path(&payload.library_path) {
-            Ok(path) => path,
-            Err(error) => return failure(error),
+        return initialize_desktop_library_database(&payload.library_path);
+    }
+}
+
+/// Creates `.notia/` in the desktop library at `library_path` and leaves its
+/// database with the current schema (a client's copy only opens). The window
+/// calls it through `initialize_library_database`; the headless server, when
+/// it registers a library.
+#[cfg(not(target_os = "android"))]
+pub(crate) fn initialize_desktop_library_database(library_path: &str) -> InitializeLibraryDatabaseResult {
+    let path = match database_path(library_path) {
+        Ok(path) => path,
+        Err(error) => return failure(error),
+    };
+    let Some(parent) = path.parent() else {
+        return failure("No se pudo resolver el directorio .notia.".to_string());
+    };
+    if let Err(error) = fs::create_dir_all(parent) {
+        return failure(format!("No se pudo crear .notia: {error}"));
+    }
+    // The copy of a client opens only with its host's tables.
+    if crate::host_mirror::database_is_copy(library_path) {
+        return match open_copy_database_file(&path) {
+            Ok(_) => InitializeLibraryDatabaseResult {
+                ok: true,
+                database_path: Some(path.to_string_lossy().into_owned()),
+                schema_version: Some(CURRENT_SCHEMA_VERSION),
+                error: None,
+            },
+            Err(error) => failure(error),
         };
-        let Some(parent) = path.parent() else {
-            return failure("No se pudo resolver el directorio .notia.".to_string());
-        };
-        if let Err(error) = fs::create_dir_all(parent) {
-            return failure(format!("No se pudo crear .notia: {error}"));
-        }
-        // The copy of a client opens only with its host's tables.
-        if crate::host_mirror::database_is_copy(&payload.library_path) {
-            return match open_copy_database_file(&path) {
-                Ok(_) => InitializeLibraryDatabaseResult {
-                    ok: true,
-                    database_path: Some(path.to_string_lossy().into_owned()),
-                    schema_version: Some(CURRENT_SCHEMA_VERSION),
-                    error: None,
-                },
-                Err(error) => failure(error),
-            };
-        }
-        let connection = match Connection::open(&path) {
-            Ok(connection) => connection,
-            Err(error) => return failure(format!("No se pudo abrir la base SQLite: {error}")),
-        };
-        let schema_version = match migrate(&connection) {
-            Ok(version) => version,
-            Err(error) => return failure(format!("No se pudo migrar la base SQLite: {error}")),
-        };
-        return InitializeLibraryDatabaseResult {
-            ok: true,
-            database_path: Some(path.to_string_lossy().into_owned()),
-            schema_version: Some(schema_version),
-            error: None,
-        };
+    }
+    let connection = match Connection::open(&path) {
+        Ok(connection) => connection,
+        Err(error) => return failure(format!("No se pudo abrir la base SQLite: {error}")),
+    };
+    let schema_version = match migrate(&connection) {
+        Ok(version) => version,
+        Err(error) => return failure(format!("No se pudo migrar la base SQLite: {error}")),
+    };
+    InitializeLibraryDatabaseResult {
+        ok: true,
+        database_path: Some(path.to_string_lossy().into_owned()),
+        schema_version: Some(schema_version),
+        error: None,
     }
 }
 

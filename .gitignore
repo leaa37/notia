@@ -11,6 +11,8 @@ node_modules
 dist
 dist-ssr
 builds/
+# Volume of the Docker server (compose.yaml): private data, never versioned.
+/data/
 *.local
 *.jks
 *.keystore
