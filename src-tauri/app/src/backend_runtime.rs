@@ -979,6 +979,7 @@ fn compose_request_system_prompt(
     app: &AppHandle,
     request: &AgentRequest,
     visible_tools: &[notia_backend_core::ToolDefinition],
+    auto_confirm: &notia_backend_core::auto_confirm::AutoConfirm,
 ) -> Result<String, BackendError> {
     let repository = TauriAgentStateRepository { app: app.clone() };
     let mut parts = notia_backend_core::load_prompt_parts_with_request(
@@ -1032,6 +1033,12 @@ fn compose_request_system_prompt(
     if !guidance.is_empty() {
         system.push_str("\n\n");
         system.push_str(&guidance);
+    }
+    // After the scope guidance: it makes the records an exception to its
+    // plans and confirmations.
+    if let Some(records) = auto_confirm.guidance() {
+        system.push_str("\n\n");
+        system.push_str(&records);
     }
     let tool_names = visible_tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
     if let Some(mail) = crate::mail_tools::guidance(app, &request.context.library_id, &tool_names) {
@@ -5239,6 +5246,7 @@ pub(crate) fn execute_backend_request(
         &auto_confirm_areas(app, &request.context.library_id),
         &request,
     );
+    let auto_confirm = options.auto_confirm.clone();
     options.projection = if matches!(request.context.persistence_policy, PersistencePolicy::PublishedNoMemory)
     {
         ToolCatalogProjection::PublishedTaskManager
@@ -5249,7 +5257,7 @@ pub(crate) fn execute_backend_request(
     };
     let provider = AuthoritativePromptProvider {
         inner: &provider,
-        compose: Box::new(|tools| compose_request_system_prompt(app, &request, tools)),
+        compose: Box::new(|tools| compose_request_system_prompt(app, &request, tools, &auto_confirm)),
         composed: Mutex::new(None),
     };
     // The run works until the task is done: no overall deadline. Each model

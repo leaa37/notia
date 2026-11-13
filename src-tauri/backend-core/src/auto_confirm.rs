@@ -73,12 +73,48 @@ impl AutoConfirm {
     pub fn covers(&self, tool_name: &str) -> bool {
         self.areas.iter().any(|area| records_of(*area).contains(&tool_name))
     }
+
+    /// What the model must know: without it, it asks on its own before a
+    /// record (in its text, with `request_user_confirmation` or with a plan
+    /// for two or more changes), and the person confirms anyway.
+    pub fn guidance(&self) -> Option<String> {
+        if self.areas.is_empty() {
+            return None;
+        }
+        let modules = self.areas.iter().map(|area| area_label(*area)).collect::<Vec<_>>().join(", ");
+        let tools = self.areas.iter().flat_map(|area| records_of(*area).iter().copied()).collect::<Vec<_>>().join(", ");
+        Some(format!(
+            "«Registrar sin confirmar» está activo en esta biblioteca para {modules}: {tools} se guardan apenas los llamás, sin que la persona confirme. Cuando pida uno de esos registros, llamá la herramienta enseguida: no preguntes si querés registrarlo, no uses request_user_confirmation y no armes un plan, aunque sean varios registros en el mismo mensaje (llamalas una tras otra). Si el mensaje mezcla registros con otros cambios, el plan es solo para los otros cambios. Si falta un dato sin el cual no se puede registrar, pedilo con request_user_clarification. Al terminar, contá en una línea qué registraste."
+        ))
+    }
+}
+
+fn area_label(area: ToolArea) -> &'static str {
+    match area {
+        ToolArea::Health => "Salud",
+        ToolArea::Gym => "Gimnasio",
+        ToolArea::Routine => "Rutina",
+        _ => "otros módulos",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::{tool_policy, ToolPolicy};
+
+    /// The model is told which records save by themselves and not to ask,
+    /// plan or confirm for them; with nothing on, it is told nothing.
+    #[test]
+    fn the_model_is_told_not_to_ask_for_records_that_save_by_themselves() {
+        assert_eq!(AutoConfirm::default().guidance(), None);
+        let on = AutoConfirm { areas: vec![ToolArea::Health, ToolArea::Gym] };
+        let text = on.guidance().expect("guidance");
+        assert!(text.contains("Salud, Gimnasio"), "{text}");
+        assert!(text.contains("log_water") && text.contains("log_gym_workout"), "{text}");
+        assert!(!text.contains("set_routine_task_status"), "{text}");
+        assert!(text.contains("no uses request_user_confirmation") && text.contains("no armes un plan"), "{text}");
+    }
 
     #[test]
     fn only_records_of_the_three_modules_are_offered_and_none_deletes() {
