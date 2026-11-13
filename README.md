@@ -251,7 +251,7 @@ El token se guarda en `.notia/notiaConfig.json`, cifrado con la contraseña del 
 
 ### Inicio
 
-El acceso **Inicio** (el ícono de la casa) es el primero de la barra izquierda, separado de los módulos. Abre un tablero que junta los datos de los otros módulos de la biblioteca abierta; cada tarjeta lleva a su módulo con **Abrir**.
+El acceso **Inicio** (el ícono de la casa) es el primero de la barra izquierda, separado de los módulos. Abre un tablero que junta los datos de los otros módulos de la biblioteca abierta; cada tarjeta lleva a su módulo con **Abrir**. Notia arranca siempre en **Inicio**, también al cambiar de biblioteca; si hay un entrenamiento en curso, abre **Gimnasio** para seguirlo.
 
 - **Encabezado**: el día, un saludo y un resumen (eventos de la semana, hábitos pendientes y tareas urgentes).
 - **Clima**: junto al saludo, un chip con la temperatura, el estado del cielo, la máxima y la mínima de hoy y los próximos tres días. Al tocarlo se abre el pronóstico: sensación térmica, humedad y viento, las próximas horas (ahora y cada tres horas, con probabilidad de lluvia y luna de noche) y los próximos 7 días con su rango de temperaturas; se cierra con la X, con Escape o tocando afuera. Los datos son de Open-Meteo, se renuevan cada 15 minutos y son del lugar que elegís en **Configuraciones → Clima** (Buenos Aires hasta que elijas otro). Sin conexión, el chip dice «Clima no disponible · Reintentar». El cuadro **Preguntale al asistente** manda la pregunta al chat lateral, en un chat nuevo, con el agente del chip (tocá el chip para cambiarlo; es el mismo agente del chat lateral). `Ctrl + K` lleva el cursor al cuadro. **Nueva nota** crea una nota en el explorador y **Grabar** empieza a grabar una reunión con el micrófono y, en Windows, el audio de la computadora (`Ctrl + Shift + R`); la grabación sigue en **Transcribir meeting**. Si hay una reunión terminada sin guardar, el botón lleva a Meeting para que decidas qué hacer con ella.
@@ -266,6 +266,8 @@ El acceso **Inicio** (el ícono de la casa) es el primero de la barra izquierda,
 ### Librerías y Explorador de Archivos
 
 El corazón de Notia son las **librerías**: carpetas locales del filesystem que la app indexa y presenta como un árbol jerárquico interactivo.
+
+El Explorador arranca oculto: lo abrís con el botón del menú (arriba a la izquierda) y lo cerrás con el mismo botón.
 
 Desde el panel izquierdo (Explorador) podés:
 - Navegar carpetas y archivos en forma de árbol expandible. El nombre se muestra separado del formato, que se conserva al renombrar.

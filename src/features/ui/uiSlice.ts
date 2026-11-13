@@ -3,7 +3,8 @@ import type { UiState } from './uiTypes'
 
 const initialState: UiState = {
   activeView: 'documents',
-  isSidebarOpen: true,
+  // The explorer starts hidden; the menu button opens it.
+  isSidebarOpen: false,
   isRightChatPanelOpen: false,
   isRightPanelChatMounted: false,
   isSearchMenuOpen: false,

@@ -21,9 +21,10 @@ const HOME_WORKSPACE_TAB_PATH = '__workspace_home__'
 
 export { GRAPH_WORKSPACE_TAB_PATH, CHAT_WORKSPACE_TAB_PATH, TASK_MANAGER_WORKSPACE_TAB_PATH, COLDPASS_WORKSPACE_TAB_PATH, MEETING_WORKSPACE_TAB_PATH, FINANCE_WORKSPACE_TAB_PATH, AGENDA_WORKSPACE_TAB_PATH, ROUTINE_WORKSPACE_TAB_PATH, AI_ACTIONS_WORKSPACE_TAB_PATH, AI_TASKS_WORKSPACE_TAB_PATH, RECIPES_WORKSPACE_TAB_PATH, HEALTH_WORKSPACE_TAB_PATH, GYM_WORKSPACE_TAB_PATH, HOME_WORKSPACE_TAB_PATH }
 
+/** With nothing open, the workspace shows Inicio: at start and after a library loads. */
 const initialState: DocumentsState = {
   openTabs: [],
-  activeTabPath: null,
+  activeTabPath: HOME_WORKSPACE_TAB_PATH,
   specialTabs: {
     graph: false,
     chat: false,
@@ -38,7 +39,7 @@ const initialState: DocumentsState = {
     recipes: false,
     health: false,
     gym: false,
-    home: false,
+    home: true,
   },
   treeNodes: [],
   searchQuery: '',
@@ -169,8 +170,8 @@ const documentsSlice = createSlice({
     },
     resetTabs(state) {
       state.openTabs = []
-      state.activeTabPath = null
-       state.specialTabs = { graph: false, chat: false, taskManager: false, coldPass: false, meeting: false, finance: false, agenda: false, routine: false, aiActions: false, aiTasks: false, recipes: false, health: false, gym: false, home: false }
+      state.activeTabPath = HOME_WORKSPACE_TAB_PATH
+      state.specialTabs = { graph: false, chat: false, taskManager: false, coldPass: false, meeting: false, finance: false, agenda: false, routine: false, aiActions: false, aiTasks: false, recipes: false, health: false, gym: false, home: true }
       state.pendingCreation = null
       state.renamingPath = null
       state.contextMenu = null

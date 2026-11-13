@@ -13489,3 +13489,13 @@ Pedido del usuario: que registrar agua, una comida o una serie no pida confirmac
 - `cargo test -p notia-app`: 468 aprobados y los 2 fallidos de antes (`meeting::tests::a_meeting_whose_session_is_gone_finishes_with_its_lines` y `services::telegram_service::tests::endpoint_accepts_standard_bot_token_shape`).
 - Frontend: `tsc` sin errores, eslint de los archivos tocados sin errores y `vitest` con 755 aprobados.
 - **No probado:** con un modelo real ni con Telegram real, en Windows ni en Android. Los cambios están en código común, sin `cfg` de plataforma.
+
+## Inicio al abrir y Explorador oculto (2026-11-13)
+
+Pedido del usuario: que el Explorador no se abra solo al entrar y que Notia arranque siempre en Inicio.
+
+- **Explorador** (`features/ui/uiSlice.ts`): `isSidebarOpen` empieza en `false`. El botón del menú de la barra superior (`toggleSidebar`) lo abre y lo cierra; las acciones que necesitan el árbol (buscar, abrir una carpeta desde Inicio) siguen abriéndolo (`setSidebarOpen(true)`). Con el Explorador cerrado, el árbol no se refresca periódicamente (`shouldRefreshActiveLibraryTree` en `useLibraryTreeSync`), igual que antes al ocultarlo.
+- **Inicio** (`features/documents/documentsSlice.ts`): el estado inicial y `resetTabs` dejan abierta la pestaña especial de Inicio (`specialTabs.home: true`, `activeTabPath: HOME_WORKSPACE_TAB_PATH`) en lugar de ninguna. `resetTabs` corre al cargar cada biblioteca (`useLibraryTreeSync`), así que también al cambiar de biblioteca se ve Inicio. `useTabManager.resetTabs` ya no fuerza `activeTabPath` a `null`.
+- **Entrenamiento en curso**: `useResumeWorkout` sigue abriendo Gimnasio si Rust informa un entrenamiento reciente y la pantalla está en Inicio o sin pestaña.
+- Es estado de presentación: no cambia contratos con Rust ni datos persistidos.
+- **Validaciones**: `npx vitest run` (150 archivos, 757 pruebas) con `documentsSlice.test.ts` nuevo (Inicio al iniciar y tras `resetTabs`; Explorador oculto) y `useResumeWorkout.test.tsx` ajustado (sin entrenamiento queda en Inicio); `tsc --noEmit -p tsconfig.app.json` y `eslint` de los archivos cambiados sin errores.

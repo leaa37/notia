@@ -369,3 +369,4 @@
 [2026-11-13 13:39:37 -03:00] Gimnasio: el panel informa `nextIsToday` (la próxima rutina es la de hoy y hoy todavía no se entrenó) para que los clientes recomienden empezarla; la web no cambia.
 [2026-11-13 14:21:56 -03:00] IA: con «Registrar sin confirmar» encendido, el prompt le avisa al modelo qué registros se guardan solos y que no pregunte, no use request_user_confirmation ni arme un plan por ellos; antes Telegram seguía pidiendo aprobación por el plan o la confirmación del propio modelo.
 [2026-11-13 16:20:57 -03:00] IA: con «Registrar sin confirmar» encendido, el plan y la confirmación que pide el propio modelo ya no frenan el pedido (siguen como con «Confirmar todos», el plan como nota); cada cambio que no es un registro de los módulos elegidos sigue pidiendo su confirmación.
+[2026-11-13 16:38:46 -03:00] Interfaz: Notia arranca siempre en Inicio (también al cambiar de biblioteca) y con el Explorador oculto; el botón del menú lo muestra.

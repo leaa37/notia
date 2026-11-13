@@ -488,10 +488,10 @@ export function useTabManager({
     dispatch(updateTabSavedSource({ path: targetPath, source: nextSource, revision: nextRevision }))
   }, [clearPendingTextSaveByPath, dispatch])
 
+  // The reset leaves Inicio open (see `resetTabs` in documentsSlice).
   const resetTabs = useCallback(() => {
     dispatch(resetTabsAction())
     resetColdPassSession()
-    dispatch(setActiveTabPath(null))
   }, [dispatch, resetColdPassSession])
 
   return {
