@@ -41,7 +41,7 @@ import { toggleTheme, setAiSettings, setInkMathPreferences, setExplorerRefreshIn
 import { selectTheme, selectAiSettings, selectInkMathPreferences, selectExplorerRefreshIntervalMs, selectTelegramSettings, selectTaskManagerPublicationPreferences } from '../../features/preferences/preferencesSelectors'
 import { setSelectedLibraryId } from '../../features/library/librarySlice'
 import { selectSelectedLibraryId, selectActiveLibrary } from '../../features/library/librarySelectors'
-import { setActiveTabPath, COLDPASS_WORKSPACE_TAB_PATH } from '../../features/documents/documentsSlice'
+import { activateSpecialTab, setActiveTabPath, COLDPASS_WORKSPACE_TAB_PATH, HOME_WORKSPACE_TAB_PATH } from '../../features/documents/documentsSlice'
 import { selectTreeNodes, selectActiveDocument, selectActiveWorkspaceView, selectFlatFileList } from '../../features/documents/documentsSelectors'
 import { notiaTimer } from '../../services/runtime/notiaLogger'
 import { saveAiPreferences } from '../../services/preferences/aiSettingsStorage'
@@ -154,9 +154,11 @@ function NotiaMenuComponent() {
   // resetTabs from useTabManager is needed by useLibraryTreeSync,
   // but bumpLibraryIndexRevision from useLibraryTreeSync is needed by useTabManager.
   // Break the cycle: useTabManager takes bumpLibraryIndexRevision via ref.
+  // A library that loads opens on Inicio.
   const resetTabsActionCallback = useCallback(() => {
     resetColdPassSession()
-    dispatch(setActiveTabPath(null))
+    dispatch(activateSpecialTab('home'))
+    dispatch(setActiveTabPath(HOME_WORKSPACE_TAB_PATH))
   }, [dispatch, resetColdPassSession])
 
   const {
