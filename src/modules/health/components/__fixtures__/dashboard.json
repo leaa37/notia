@@ -1088,7 +1088,9 @@
         "label": "Muy alto (trabajo físico o doble turno)",
         "selected": false
       }
-    ]
+    ],
+    "waterGoalLiters": null,
+    "waterGoalAutoLabel": "3,05 L"
   },
   "mealForm": {
     "suggestedCategory": "almuerzo",

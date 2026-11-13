@@ -93,6 +93,9 @@ pub struct Profile {
     pub sex: Sex,
     pub height_cm: f64,
     pub activity: f64,
+    /// Meta diaria de agua que eligió la persona; sin ella se calcula.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub water_goal_ml: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -669,7 +672,10 @@ pub struct Vitals {
     pub bmr: Option<f64>,
     pub bmr_from_scale: bool,
     pub tdee: Option<f64>,
+    /// La meta de agua que rige: la elegida en el perfil o la calculada.
     pub water_goal_ml: Option<i64>,
+    /// La calculada por altura y peso, aunque rija la elegida.
+    pub water_goal_auto_ml: Option<i64>,
     /// Plan de mantenimiento, el objetivo cuando no hay plan guardado.
     pub maintenance: Option<Plan>,
 }
@@ -686,7 +692,8 @@ pub fn vitals(data: &HealthData, today: Date) -> Vitals {
         Some(bmr_mifflin(current_kg?, profile.height_cm, age?, profile.sex))
     });
     let tdee = profile.zip(bmr).map(|(profile, bmr)| (bmr * profile.activity).round());
-    let water_goal_ml = profile.zip(current_kg).map(|(profile, kg)| water_goal_ml(kg, profile.height_cm));
+    let water_goal_auto_ml = profile.zip(current_kg).map(|(profile, kg)| water_goal_ml(kg, profile.height_cm));
+    let water_goal_ml = profile.and_then(|profile| profile.water_goal_ml).or(water_goal_auto_ml);
     let maintenance = match (profile, current_kg, tdee, bmr) {
         (Some(profile), Some(kg), Some(tdee), Some(bmr)) => Some(calculate_plan(
             PlanInput { current_kg: kg, target_kg: kg, pace: 0.0, tdee, bmr, sex: profile.sex },
@@ -694,7 +701,7 @@ pub fn vitals(data: &HealthData, today: Date) -> Vitals {
         )),
         _ => None,
     };
-    Vitals { age, current_kg, bmi, bmr, bmr_from_scale: scale_bmr.is_some(), tdee, water_goal_ml, maintenance }
+    Vitals { age, current_kg, bmi, bmr, bmr_from_scale: scale_bmr.is_some(), tdee, water_goal_ml, water_goal_auto_ml, maintenance }
 }
 
 /// El plan que rige: el guardado o el de mantenimiento.
@@ -764,7 +771,13 @@ pub struct ProfileInput {
     pub height_cm: Option<f64>,
     pub activity: Option<f64>,
     pub weight_kg: Option<f64>,
+    /// Meta de agua propia en litros; vacía o 0, la calculada.
+    #[serde(default)]
+    pub water_goal_liters: Option<f64>,
 }
+
+/// La meta de agua propia permitida, en litros.
+const WATER_GOAL_LITERS: std::ops::RangeInclusive<f64> = 0.5..=6.0;
 
 pub fn validate_profile(input: &ProfileInput, today: Date) -> Result<(Profile, Option<f64>), Vec<FieldError>> {
     let mut errors = Vec::new();
@@ -792,6 +805,15 @@ pub fn validate_profile(input: &ProfileInput, today: Date) -> Result<(Profile, O
     if input.weight_kg.is_some() {
         check_weight("weightKg", input.weight_kg, &mut errors);
     }
+    // De a 50 ml, como la calculada.
+    let water_goal_ml = match input.water_goal_liters.filter(|liters| *liters != 0.0) {
+        None => None,
+        Some(liters) if WATER_GOAL_LITERS.contains(&liters) => Some(((liters * 1000.0 / 50.0).round() * 50.0) as i64),
+        Some(_) => {
+            errors.push(field_error("waterGoalLiters", "La meta de agua tiene que estar entre 0,5 y 6 litros. Dejala vacía para que se calcule."));
+            None
+        }
+    };
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -801,6 +823,7 @@ pub fn validate_profile(input: &ProfileInput, today: Date) -> Result<(Profile, O
             sex: sex.unwrap_or(Sex::Male),
             height_cm: round1(input.height_cm.unwrap_or_default()),
             activity,
+            water_goal_ml,
         },
         input.weight_kg.map(round1),
     ))

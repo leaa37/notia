@@ -426,6 +426,10 @@ pub struct ProfileForm {
     pub activity: f64,
     pub weight_kg: Option<f64>,
     pub activities: Vec<Choice>,
+    /// La meta de agua elegida, en litros; vacía si se calcula.
+    pub water_goal_liters: Option<f64>,
+    /// La que se calcula con altura y peso («3,3 L»), si hay datos.
+    pub water_goal_auto_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1050,7 +1054,11 @@ fn water_panel(data: &HealthData, vitals: &Vitals, today: Date) -> Option<WaterP
         percent_label: format!("{}%", (ratio * 100.0).round()),
         liters_label: liters(ml),
         goal_label: format!("de {}", liters(goal)),
-        basis_label: "Según tu altura y peso".to_string(),
+        basis_label: if data.profile.as_ref().is_some_and(|profile| profile.water_goal_ml.is_some()) {
+            "Meta elegida en tu perfil".to_string()
+        } else {
+            "Según tu altura y peso".to_string()
+        },
         aria_label: format!("{ml} de {goal} ml"),
         week: (0..7)
             .rev()
@@ -1152,6 +1160,8 @@ fn profile_form(data: &HealthData, vitals: &Vitals) -> ProfileForm {
         height_cm: profile.map(|profile| profile.height_cm),
         activity,
         weight_kg: vitals.current_kg,
+        water_goal_liters: profile.and_then(|profile| profile.water_goal_ml).map(|ml| ml as f64 / 1000.0),
+        water_goal_auto_label: vitals.water_goal_auto_ml.map(liters),
         activities: ACTIVITIES
             .iter()
             .map(|(value, label)| Choice { value: value.to_string(), label: label.to_string(), selected: activity_label(activity) == Some(label) })

@@ -17,7 +17,7 @@ fn ids() -> NewIds {
 }
 
 fn profile(sex: Sex, age: i16, height: f64, activity: f64) -> Profile {
-    Profile { birth_date: format!("{}-03-15", 2026 - age), sex, height_cm: height, activity }
+    Profile { birth_date: format!("{}-03-15", 2026 - age), sex, height_cm: height, activity, water_goal_ml: None }
 }
 
 fn meal(id: &str, date: &str, category: MealCategory, name: &str, kcal: f64, created: i64) -> Meal {
@@ -108,7 +108,7 @@ fn the_calculated_plan_follows_the_pace_the_ceiling_and_the_floor() {
 
 #[test]
 fn forms_are_validated_field_by_field() {
-    let young = ProfileInput { birth_date: "2015-01-01".into(), sex: "x".into(), height_cm: Some(90.0), activity: Some(1.3), weight_kg: Some(10.0) };
+    let young = ProfileInput { birth_date: "2015-01-01".into(), sex: "x".into(), height_cm: Some(90.0), activity: Some(1.3), weight_kg: Some(10.0), water_goal_liters: None };
     let fields = validate_profile(&young, TODAY).unwrap_err().into_iter().map(|error| error.field).collect::<Vec<_>>();
     assert_eq!(fields, ["birthDate", "sex", "heightCm", "activity", "weightKg"]);
     assert!(validate_weight("2026-09-29", Some(80.0), TODAY).is_err());
@@ -130,7 +130,7 @@ fn forms_are_validated_field_by_field() {
 #[test]
 fn changes_write_what_the_summary_says() {
     let data = overweight();
-    let input = ProfileInput { birth_date: "1992-03-15".into(), sex: "masculino".into(), height_cm: Some(178.0), activity: Some(1.55), weight_kg: Some(82.0) };
+    let input = ProfileInput { birth_date: "1992-03-15".into(), sex: "masculino".into(), height_cm: Some(178.0), activity: Some(1.55), weight_kg: Some(82.0), water_goal_liters: None };
     let saved = plan_change(&data, &HealthMutation::SaveProfile { input: input.clone() }, TODAY, &ids()).expect("profile");
     assert_eq!(saved.ops.len(), 2);
     assert!(saved.summary.contains("Moderado") && saved.summary.contains("82 kg"));
@@ -501,4 +501,41 @@ fn a_meal_is_scaled_from_its_recipe() {
     let input = MealInput { date: "2026-09-28".into(), category: "almuerzo".into(), name: "Guiso".into(), kcal: Some(500.0), ..MealInput::default() };
     let edited = plan_change(&data, &HealthMutation::SaveMeal { id: Some("m1".into()), input }, TODAY, &ids()).expect("edit");
     assert!(matches!(&edited.ops[0], StoreOp::PutMeal(meal) if meal.recipe_id.as_deref() == Some("r1")));
+}
+
+/// A water goal chosen in the profile replaces the calculated one: empty or
+/// 0 goes back to it, out of range is refused, the cards say which one
+/// rules, and the assistant keeps it when it changes something else.
+#[test]
+fn a_chosen_water_goal_replaces_the_calculated_one() {
+    let mut data = overweight();
+    let calculated = vitals(&data, TODAY);
+    assert_eq!((calculated.water_goal_ml, calculated.water_goal_auto_ml), (Some(3050), Some(3050)));
+
+    let input = ProfileInput { birth_date: "1992-03-15".into(), sex: "M".into(), height_cm: Some(178.0), activity: Some(1.375), weight_kg: None, water_goal_liters: Some(2.48) };
+    let (chosen, _) = validate_profile(&input, TODAY).expect("profile");
+    assert_eq!(chosen.water_goal_ml, Some(2500), "rounded to 50 ml");
+    for automatic in [None, Some(0.0)] {
+        let (profile, _) = validate_profile(&ProfileInput { water_goal_liters: automatic, ..input.clone() }, TODAY).expect("profile");
+        assert_eq!(profile.water_goal_ml, None);
+    }
+    for wrong in [0.2, 6.5] {
+        let errors = validate_profile(&ProfileInput { water_goal_liters: Some(wrong), ..input.clone() }, TODAY).expect_err("range");
+        assert!(errors.iter().any(|error| error.field == "waterGoalLiters"), "{wrong}");
+    }
+
+    data.profile = Some(chosen);
+    let ruling = vitals(&data, TODAY);
+    assert_eq!((ruling.water_goal_ml, ruling.water_goal_auto_ml), (Some(2500), Some(3050)));
+    let dashboard = build_dashboard(&data, &DashboardQuery::default(), TODAY, 13);
+    let water = dashboard.water.expect("water");
+    assert_eq!((water.goal_label.as_str(), water.basis_label.as_str()), ("de 2,5 L", "Meta elegida en tu perfil"));
+    assert_eq!((dashboard.profile_form.water_goal_liters, dashboard.profile_form.water_goal_auto_label.as_deref()), (Some(2.5), Some("3,05 L")));
+
+    let changed = tool_action("save_health_profile", &json!({ "activity": "alto" }), &data, TODAY, 13).expect("profile");
+    let ToolAction::Change(HealthMutation::SaveProfile { input }) = changed else { panic!() };
+    assert_eq!(input.water_goal_liters, Some(2.5));
+    let reset = tool_action("save_health_profile", &json!({ "waterGoalLiters": 0 }), &data, TODAY, 13).expect("profile");
+    let ToolAction::Change(HealthMutation::SaveProfile { input }) = reset else { panic!() };
+    assert_eq!(validate_profile(&input, TODAY).expect("profile").0.water_goal_ml, None);
 }

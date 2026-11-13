@@ -5386,7 +5386,7 @@
     }
   },
   "save_health_profile": {
-    "description": "Guarda o cambia el perfil de Salud: nacimiento, sexo biológico, altura y nivel de actividad, y opcionalmente el peso de hoy. Lo que no se manda queda como estaba. Requiere confirmación visible.",
+    "description": "Guarda o cambia el perfil de Salud: nacimiento, sexo biológico, altura y nivel de actividad, y opcionalmente el peso de hoy y una meta de agua propia. Lo que no se manda queda como estaba. Requiere confirmación visible.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -5422,6 +5422,12 @@
           "type": "number",
           "minimum": 20,
           "maximum": 400
+        },
+        "waterGoalLiters": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 6,
+          "description": "Meta diaria de agua en litros que elige la persona (0,5 a 6); 0 vuelve a la meta calculada por altura y peso."
         }
       }
     }

@@ -10285,7 +10285,7 @@ Sigue el canvas `SaludDashboard.jsx` que pasó el usuario (un componente React c
   - Modelo: `Profile`, `WeightEntry`, `Measurement` (peso más 16 métricas por clave: `grasaPct`, `grasaKg`, `grasaVisceral`, `obesidadPct`, `mmePct`, `mmeKg`, `musculoPct`, `musculoKg`, `proteinaPct`, `aguaPct`, `aguaKg`, `huesosKg`, `imc`, `pesoSinGrasa`, `metabolismo`, `edadMetabolica`), `Objective`, `Plan`, `Meal` y `HealthData`.
   - Cálculos:
     - edad, IMC y Mifflin-St Jeor (solo si la balanza no informa el metabolismo);
-    - agua objetivo: superficie de Mosteller × 1500 ml/m², de a 50 ml;
+    - agua objetivo: superficie de Mosteller × 1500 ml/m², de a 50 ml (`water_goal_auto_ml`); si el perfil tiene `water_goal_ml` (la meta elegida, 2026-11-13), rige esa (`water_goal_ml` de `Vitals`);
     - kcal desde macros (4/4/9) y piso de calorías;
     - `calculate_plan`: ritmo limitado al 1 % del peso por semana, superávit hasta 500 kcal, proteína 1,8 g/kg, grasas 27 % y fibra 14 g/1000 kcal;
     - `complete_measurement`: completa IMC y los kg de grasa, agua y músculo, y el peso sin grasa;
@@ -13499,3 +13499,14 @@ Pedido del usuario: que el Explorador no se abra solo al entrar y que Notia arra
 - **Entrenamiento en curso**: `useResumeWorkout` sigue abriendo Gimnasio si Rust informa un entrenamiento reciente y la pantalla está en Inicio o sin pestaña.
 - Es estado de presentación: no cambia contratos con Rust ni datos persistidos.
 - **Validaciones**: `npx vitest run` (150 archivos, 757 pruebas) con `documentsSlice.test.ts` nuevo (Inicio al iniciar y tras `resetTabs`; Explorador oculto) y `useResumeWorkout.test.tsx` ajustado (sin entrenamiento queda en Inicio); `tsc --noEmit -p tsconfig.app.json` y `eslint` de los archivos cambiados sin errores. En el navegador (servidor headless con el frontend compilado, Chromium con Playwright, 1280×800 y 390×844 táctil): después de entrar como Owner se ve el tablero de Inicio con el Explorador cerrado, **Mostrar explorador** lo abre y al recargar vuelve a Inicio con el Explorador cerrado. La primera versión solo cambiaba el estado inicial y la prueba en el navegador mostró la pestaña Inicio con el editor vacío: de ahí la corrección en `NotiaMenu`. El caso de `NotiaMenu` no tiene prueba unitaria propia.
+
+## Salud: meta de agua elegida (2026-11-13)
+
+Pedido del usuario: la meta calculada le daba 3,3 L y quería 2,5 L.
+
+- **Modelo** (`health/mod.rs`): `Profile.water_goal_ml: Option<i64>` (se guarda en `health_settings.profile_json`; `serde(default)`, así que los perfiles anteriores se leen sin ella). `ProfileInput.water_goal_liters: Option<f64>`: vacía o 0 vuelve a la calculada; entre 0,5 y 6 L se guarda en ml de a 50; fuera de rango, error de campo `waterGoalLiters`.
+- **`Vitals`**: `water_goal_auto_ml` es la calculada (Mosteller × 1500 ml/m²) y `water_goal_ml` la que rige (la elegida o la calculada). El panel de agua usa la que rige y su `basisLabel` dice «Meta elegida en tu perfil» o «Según tu altura y peso».
+- **Formulario** (`dashboard.rs` → `profileForm`): `waterGoalLiters` (la elegida o `null`) y `waterGoalAutoLabel` («3,05 L», o `null` sin altura o peso). `ProfileFormView` (`HealthForms.tsx`) muestra **Meta de agua (litros)** con la calculada de ejemplo; solo envía lo escrito.
+- **Asistente**: `save_health_profile` acepta `waterGoalLiters` (0 vuelve a la calculada); sin el dato conserva la meta elegida, como el resto del perfil (`tool_action` completa con lo guardado).
+- **Notia Fit (Android)**: muestra la meta que manda el tablero, así que no necesita cambios.
+- **Validaciones**: `health::tests::a_chosen_water_goal_replaces_the_calculated_one` (redondeo, vacía y 0, rango, `Vitals`, panel, formulario y herramienta); fixtures del tablero regeneradas con `dump_dashboard_fixtures` (solo agregan los dos campos); `HealthDashboardView.test.tsx` con la meta escrita enviada en litros; `cargo test -p notia-backend-core` (826 aprobadas y el fallo previo de `image_generation`), `npx vitest run` (758), `tsc` y `eslint` sin errores.

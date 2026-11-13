@@ -76,12 +76,13 @@ export function ProfileFormView({ dashboard, phone = false, onSave, onClose }: P
   const [height, setHeight] = useState(asText(initial.heightCm))
   const [weight, setWeight] = useState(asText(initial.weightKg))
   const [activity, setActivity] = useState(String(initial.activity))
+  const [waterGoal, setWaterGoal] = useState(asText(initial.waterGoalLiters))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<HealthError | null>(null)
   const ready = birthDate && height.trim() && weight.trim()
   const submit = async () => {
     const saved = await attempt(
-      () => onSave({ birthDate, sex, heightCm: toNumber(height), activity: Number(activity), weightKg: toNumber(weight) }),
+      () => onSave({ birthDate, sex, heightCm: toNumber(height), activity: Number(activity), weightKg: toNumber(weight), waterGoalLiters: toNumber(waterGoal) }),
       setError,
       setBusy,
     )
@@ -121,6 +122,20 @@ export function ProfileFormView({ dashboard, phone = false, onSave, onClose }: P
           <select className="hl-input" value={activity} onChange={(event) => setActivity(event.target.value)}>
             {initial.activities.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
+        </label>
+        <label className="hl-field">
+          <span>Meta de agua (litros)</span>
+          <input
+            className="hl-input"
+            inputMode="decimal"
+            placeholder={initial.waterGoalAutoLabel ? `Calculada: ${initial.waterGoalAutoLabel}` : 'Calculada'}
+            value={waterGoal}
+            onChange={(event) => setWaterGoal(event.target.value)}
+            aria-invalid={Boolean(fieldError(error, 'waterGoalLiters'))}
+          />
+          {fieldError(error, 'waterGoalLiters')
+            ? <span className="hl-error">{fieldError(error, 'waterGoalLiters')}</span>
+            : <span className="hl-hint">Vacía, Notia la calcula con tu altura y tu peso.</span>}
         </label>
         <div className="hl-form__foot">
           <button type="button" className="hl-button" onClick={onClose} disabled={busy}>Cancelar</button>

@@ -131,8 +131,23 @@ describe('HealthDashboardView', () => {
     callBackend.mockImplementationOnce(() => Promise.reject({ code: 'validation', message: 'La altura tiene que estar entre 100 y 250 cm.', fields: [{ field: 'heightCm', message: 'La altura tiene que estar entre 100 y 250 cm.' }] }))
     await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Guardar perfil' })) })
     expect(callBackend).toHaveBeenCalledWith('health_apply', expect.objectContaining({
-      mutation: { kind: 'saveProfile', input: { birthDate: '1992-03-15', sex: 'M', heightCm: 178, activity: 1.375, weightKg: 82.4 } },
+      mutation: { kind: 'saveProfile', input: { birthDate: '1992-03-15', sex: 'M', heightCm: 178, activity: 1.375, weightKg: 82.4, waterGoalLiters: null } },
     }))
     expect(await within(dialog).findByText('La altura tiene que estar entre 100 y 250 cm.')).toBeTruthy()
+  })
+
+  it('sends the water goal written in the profile, in liters', async () => {
+    serve(FULL)
+    render(<HealthDashboardView library={LIBRARY} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Editar perfil' }))
+    const dialog = await screen.findByRole('dialog')
+    const goal = within(dialog).getByLabelText(/^Meta de agua \(litros\)/) as HTMLInputElement
+    expect(goal.value).toBe('')
+    expect(goal.placeholder).toBe('Calculada: 3,05 L')
+    fireEvent.change(goal, { target: { value: '2,5' } })
+    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Guardar perfil' })) })
+    expect(callBackend).toHaveBeenCalledWith('health_apply', expect.objectContaining({
+      mutation: { kind: 'saveProfile', input: expect.objectContaining({ waterGoalLiters: 2.5 }) },
+    }))
   })
 })

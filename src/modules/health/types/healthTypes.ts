@@ -191,6 +191,10 @@ export interface ProfileForm {
   activity: number
   weightKg: number | null
   activities: Choice[]
+  /** Meta de agua elegida, en litros; `null` si se calcula. */
+  waterGoalLiters: number | null
+  /** La calculada con altura y peso («3,3 L»), si hay datos. */
+  waterGoalAutoLabel: string | null
 }
 
 export interface RecentMeal {
@@ -228,6 +232,8 @@ export interface ProfileInput {
   heightCm: number | null
   activity: number | null
   weightKg: number | null
+  /** Vacía o 0: la meta de agua se calcula. */
+  waterGoalLiters: number | null
 }
 
 export interface MeasurementInput {

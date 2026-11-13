@@ -204,6 +204,9 @@ pub fn tool_action(name: &str, arguments: &Value, data: &HealthData, today: Date
                 height_cm: number(arguments, "heightCm")?.or(stored.map(|profile| profile.height_cm)),
                 activity: activity(arguments)?.or(stored.map(|profile| profile.activity)),
                 weight_kg: number(arguments, "weightKg")?,
+                // Sin el dato, la meta elegida queda como estaba.
+                water_goal_liters: number(arguments, "waterGoalLiters")?
+                    .or(stored.and_then(|profile| profile.water_goal_ml).map(|ml| ml as f64 / 1000.0)),
             };
             change(HealthMutation::SaveProfile { input })
         }

@@ -780,6 +780,7 @@ mod tests {
                     height_cm: Some(178.0),
                     activity: Some(1.375),
                     weight_kg: Some(82.4),
+                    water_goal_liters: None,
                 },
             },
         );
