@@ -284,7 +284,12 @@ fn task_messages(system: &str, user: &str, images: Vec<String>) -> Vec<AiChatMes
 
 /// One answer from the provider, without tools and without thinking.
 pub(crate) fn complete(app: &AppHandle, settings: &AiSettings, system: &str, user: &str, images: Vec<String>) -> Result<String, BackendError> {
-    let model = resolve_model(app, settings)?;
+    // A task that looks at images (a formula, handwriting) goes to the
+    // model chosen for them.
+    let model = match settings.separate_image_model() {
+        Some(image_model) if !images.is_empty() => image_model.to_string(),
+        _ => resolve_model(app, settings)?,
+    };
     let options = ai_settings::task_options(
         system.chars().count() + user.chars().count(),
         images.len(),

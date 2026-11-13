@@ -13420,3 +13420,34 @@ Pedido: ajustar la barra superior del Task Manager publicado al board «Web publ
   - `notia-app`: 540 pasan, 14 ignoradas. Escritorio sin warnings nuevos (36) y `cargo check` Android con los 59 de la línea base.
   - Frontend: `npx tsc -b` y eslint de los archivos nuevos sin errores; `WebhookSection.test.tsx` (4 pruebas) junto con el resto de Settings, 28 pasan.
 - **Pendiente.** Una llamada real con `curl` en la app abierta con Telegram activo, otra desde otro equipo con el firewall, el cambio de puerto con el webhook activo y la vista en un cliente Android.
+
+## Modelo para imágenes aparte del modelo principal (2026-11-13)
+
+En **Configuraciones → IA** hay dos selectores: **Modelo de Ollama**, el que resuelve los pedidos y usa las herramientas, y **Modelo para imágenes**, que lee las imágenes. Con **El mismo modelo** (valor vacío, por defecto) todo sigue como antes: las imágenes van al modelo de Ollama.
+
+- **Configuración.** `ia.imageModel` en `.notia/notiaConfig.json`:
+  - `AiSettingsInput`/`AiSettings` (`backend-core/src/ai_settings.rs`) agregan `image_model` (`#[serde(default)]`, recortado al normalizar), y `normalize_ai` (`library_config.rs`) lo lee y lo escribe.
+  - `separate_image_model(selected, image)` devuelve el modelo de imágenes solo si no está vacío y es distinto del principal. Si es el mismo, se trata como vacío.
+  - En el frontend, `AiPreferences.imageModel` es opcional (`''` por defecto) y viaja con el resto de las preferencias.
+- **Conversaciones** (chat de la app, Telegram, Tareas IA, Meeting, el router de áreas y las llamadas de `complete_with_images`: revisión de recetas, estimación de comidas de Salud y autorrespuestas de WhatsApp). Todas pasan por `OllamaAgentProvider` (`app/src/backend_ollama.rs`), que es el mismo en Windows, Linux y Android:
+  - `OllamaProviderConfig::with_image_model` guarda el modelo de imágenes; `BackendProviderSettings` lo toma de `ia.imageModel` (`provider_settings_from_config`) o de las preferencias de la interfaz (`configure_fallback`), para el proveedor del turno y para `quick_provider`.
+  - Antes de cada llamada (`chat`, `stream_chat`, `tool_chat` y la ronda con herramientas en streaming), `readable_messages` reemplaza cada imagen de cada mensaje (usuario, herramienta o asistente) por el texto `[Imagen N de este mensaje, leída por el modelo de imágenes]` y lo que ese modelo escribió, debajo del texto del mensaje. El modelo principal no recibe imágenes.
+  - `describe_image` llama al modelo de imágenes sin herramientas y sin thinking, con `IMAGE_READER_PROMPT`: transcribir todo el texto y los números visibles respetando la estructura, describir comida (plato, ingredientes, porción) o lo que muestre la imagen, y no resolver el pedido. La descripción no depende del pedido, así se puede reutilizar.
+  - **Caché en memoria del proceso:** clave SHA-256 de modelo de imágenes + imagen, como máximo 256 descripciones (se descartan las más viejas). Una imagen que sigue en la conversación, o que el router ya vio, no se vuelve a leer. Después de reiniciar, se lee de nuevo la primera vez.
+  - **Errores:** si el modelo de imágenes falla o devuelve vacío, la llamada termina con «El modelo de imágenes (X) no pudo leer la imagen: …» o «… no devolvió qué ve en la imagen.», con el código y el `retryable` del error original. El modelo principal no se llama, para no responder sin haber visto la imagen.
+  - Las herramientas que guardan la imagen (foto de la receta, del equipamiento, del ticket) siguen recibiendo la imagen original: el reemplazo solo cambia lo que lee el modelo.
+- **Tareas puntuales con imagen** (`ai_tasks::complete` con imágenes: reconocimiento de InkMath y conversión de escritura a mano en `note_ink.rs`) van directo al modelo de imágenes, porque su trabajo es leer la imagen. Sin imágenes, siguen con el modelo principal.
+- **Interfaz** (`SettingsModal.tsx`, `settings/AiModelSelect.tsx`): el desplegable de modelos se extrajo a `AiModelSelect` y se usa dos veces. El de imágenes agrega la opción vacía **El mismo modelo**. Si el modelo de imágenes elegido no informa Vision, se muestra un aviso. La interfaz no valida ni decide nada: Rust normaliza y aplica.
+- **Límites:**
+  - Cada imagen nueva suma una llamada al modelo de imágenes antes de la respuesta.
+  - Lo que el modelo principal "ve" es la descripción: la precisión depende de lo que transcriba el modelo de imágenes. En capturas para clics por coordenadas (navegador del asistente), una descripción en texto puede no alcanzar.
+  - La publicación de Task Manager conserva `PublishedAiPreferences` sin este campo; su chat usa la configuración de la biblioteca a través del mismo proveedor.
+
+**Validaciones (2026-11-13, Linux):**
+- `cargo test -p notia-backend-core -- ai_settings library_config`: 19 aprobados, incluidos `the_image_model_counts_only_when_it_is_another_one` y la normalización de `imageModel`.
+- `cargo test -p notia-app -- backend_ollama ai_tasks backend_runtime`: 23 aprobados. Los nuevos:
+  - `a_separate_image_model_reads_the_images_and_the_model_gets_their_text`: el lector recibe la imagen, el principal solo texto, y la segunda vez no se relee;
+  - `without_a_separate_image_model_the_images_go_to_the_model`: vacío o el mismo modelo;
+  - `an_image_the_image_model_cannot_read_stops_the_call_with_its_name`.
+- Frontend: `npx tsc --noEmit -p tsconfig.app.json` sin errores, eslint de los archivos tocados sin errores y `npx vitest run` con 149 archivos y 755 pruebas (2 nuevas en `AiModelSelect.test.tsx`).
+- **No probado:** con modelos reales (Ollama local o en la nube), con un bot de Telegram real, en Windows y en Android (`cargo check --target aarch64-linux-android` no se corrió: los cambios están en código común, sin `cfg` de plataforma).

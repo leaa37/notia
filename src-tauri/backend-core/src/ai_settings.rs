@@ -54,6 +54,9 @@ pub struct AiSettingsInput {
     pub api_key: String,
     #[serde(default)]
     pub selected_model: String,
+    /// Model that reads the images; empty means the selected one.
+    #[serde(default)]
+    pub image_model: String,
     #[serde(default = "default_true")]
     pub thinking_enabled: bool,
     #[serde(default, deserialize_with = "lenient_thinking_level")]
@@ -75,9 +78,32 @@ pub struct AiSettings {
     pub ollama_url: String,
     pub api_key: String,
     pub selected_model: String,
+    pub image_model: String,
     pub thinking_enabled: bool,
     pub thinking_level: ThinkingLevel,
 }
+
+impl AiSettings {
+    /// The model that reads the images when it is not the selected one.
+    pub fn separate_image_model(&self) -> Option<&str> {
+        separate_image_model(&self.selected_model, &self.image_model)
+    }
+}
+
+/// `image_model` when it is set and differs from `selected_model`: images
+/// then go to it and the selected model gets what it read from them.
+pub fn separate_image_model<'a>(selected_model: &str, image_model: &'a str) -> Option<&'a str> {
+    let image_model = image_model.trim();
+    (!image_model.is_empty() && image_model != selected_model.trim()).then_some(image_model)
+}
+
+/// Instructions of the image model: what it reads from an image reaches a
+/// model that cannot see it, so it describes everything and solves nothing.
+pub const IMAGE_READER_PROMPT: &str = "Sos el lector de imágenes de un asistente. Otro modelo, que no puede ver la imagen, va a resolver el pedido de la persona solo con lo que escribas. Describí la imagen de forma completa y fiel:
+- Transcribí textualmente todo el texto y los números que se lean (tickets, facturas, resúmenes, recibos, documentos, pantallas, carteles), respetando el orden, las líneas, las columnas y los totales. Si algo no se lee bien, decilo en lugar de adivinarlo.
+- Si es comida: qué plato es, los ingredientes que se ven, el tamaño aproximado de la porción y cómo parece estar cocinado.
+- Si es otra cosa: qué muestra (personas, objetos, lugar, gráfico, captura de pantalla, apuntes) y los detalles que alguien necesitaría para actuar sobre ella.
+No respondas ni resuelvas ningún pedido: solo describí. Escribí en español.";
 
 impl AiSettingsInput {
     pub fn normalize(&self) -> AiSettings {
@@ -85,6 +111,7 @@ impl AiSettingsInput {
             ollama_url: normalize_ollama_url(&self.ollama_url),
             api_key: self.api_key.trim().to_string(),
             selected_model: self.selected_model.trim().to_string(),
+            image_model: self.image_model.trim().to_string(),
             thinking_enabled: self.thinking_enabled,
             thinking_level: self.thinking_level,
         }
@@ -318,6 +345,19 @@ mod tests {
         assert_eq!(clean_latex_answer("```latex\n\\frac{a}{b}\n```").as_deref(), Some("\\frac{a}{b}"));
         assert_eq!(clean_latex_answer("$$x^2$$").as_deref(), Some("x^2"));
         assert_eq!(clean_latex_answer("  "), None);
+    }
+
+    #[test]
+    fn the_image_model_counts_only_when_it_is_another_one() {
+        let mut settings = AiSettingsInput { selected_model: " qwen3 ".into(), image_model: " gemma3 ".into(), ..Default::default() }.normalize();
+        assert_eq!(settings.image_model, "gemma3");
+        assert_eq!(settings.separate_image_model(), Some("gemma3"));
+        settings.image_model = "qwen3".into();
+        assert_eq!(settings.separate_image_model(), None);
+        settings.image_model.clear();
+        assert_eq!(settings.separate_image_model(), None);
+        let input: AiSettingsInput = serde_json::from_value(serde_json::json!({ "selectedModel": "a" })).expect("older settings");
+        assert_eq!(input.image_model, "");
     }
 
     #[test]

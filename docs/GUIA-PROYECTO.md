@@ -168,7 +168,7 @@ Nada de esto hace falta para abrir la app y editar notas.
 
 | Función | Qué necesita |
 |---|---|
-| Chat IA y todo lo "inteligente" | **Ollama**. Por defecto `https://ollama.com` (Ollama Cloud) con API key de ollama.com. Para usar uno local: instalar Ollama, `ollama pull <modelo>` y poner `http://localhost:11434` en Configuraciones → IA. El modelo tiene que soportar *tool calling*, y visión si querés mandarle imágenes. |
+| Chat IA y todo lo "inteligente" | **Ollama**. Por defecto `https://ollama.com` (Ollama Cloud) con API key de ollama.com. Para usar uno local: instalar Ollama, `ollama pull <modelo>` y poner `http://localhost:11434` en Configuraciones → IA. El modelo tiene que soportar *tool calling*. Para imágenes: que también tenga visión, o elegir un **Modelo para imágenes** aparte en Configuraciones → IA, que las lee y le pasa el texto. |
 | Búsqueda web del asistente | **Solo con Ollama Cloud** (`/api/web_search`). El código rechaza explícitamente `localhost`. |
 | Telegram | Un bot de @BotFather con su token, configurado en la PC que corre los servicios. Se vincula con `/start` + usuario + contraseña de la biblioteca. Nunca corre en Android. |
 | Gmail y Google Calendar | Un proyecto propio de Google Cloud con credenciales OAuth (se cargan o importan del JSON en Configuraciones → Cuentas). |

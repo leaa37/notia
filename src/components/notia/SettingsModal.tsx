@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useAppDispatch, useAppSelector } from '../../store/hooks'
 import { selectSettingsActiveSection } from '../../features/ui/uiSelectors'
-import { Brain, ChevronDown, Eye, FolderOpen, KeyRound, Lock, Pencil, Play, Plus, RotateCcw, Trash2, TriangleAlert, Unlink, Wrench, X } from 'lucide-react'
+import { FolderOpen, KeyRound, Lock, Pencil, Play, Plus, RotateCcw, Trash2, TriangleAlert, Unlink, X } from 'lucide-react'
 import {
   clampOcrDebounceMs,
   INKMATH_OCR_DEBOUNCE_MAX_MS,
@@ -39,8 +39,7 @@ import { clearAllFinanceData } from '../../modules/finance/services/financeServi
 import { financeErrorMessage } from '../../modules/finance/engines/financeError'
 import { notifyFinanceDataChanged } from '../../modules/finance/services/financeDataEvents'
 import { ConfirmationDialogModal } from './ConfirmationDialogModal'
-import { useSubmenuEngine } from '../../hooks/useSubmenuEngine'
-import { NotiaSubmenuPanel } from './NotiaSubmenuPanel'
+import { AiModelSelect } from './settings/AiModelSelect'
 import { NotiaSelectMenu } from '../common/NotiaSelectMenu'
 import { disableBackups, loadBackupStatus, pickBackupDirectory, type BackupStatus } from '../../services/preferences/backupSettingsStorage'
 import { saveDevicePreferences } from '../../services/preferences/devicePreferencesStorage'
@@ -194,6 +193,7 @@ export function SettingsModal({
   const [ollamaUrlDraft, setOllamaUrlDraft] = useState(incomingAiPreferences.ollamaUrl)
   const [apiKeyDraft, setApiKeyDraft] = useState(incomingAiPreferences.apiKey)
   const [selectedModelDraft, setSelectedModelDraft] = useState(incomingAiPreferences.selectedModel)
+  const [imageModelDraft, setImageModelDraft] = useState(incomingAiPreferences.imageModel ?? '')
   const [thinkingEnabledDraft, setThinkingEnabledDraft] = useState(incomingAiPreferences.thinkingEnabled)
   const [thinkingLevelDraft, setThinkingLevelDraft] = useState(incomingAiPreferences.thinkingLevel)
   const [progressModeDraft, setProgressModeDraft] = useState(incomingAiPreferences.progressMode)
@@ -227,7 +227,6 @@ export function SettingsModal({
     message: string
   }>({ tone: 'idle', message: 'Esta acción elimina definitivamente todos los datos del módulo Finanzas en la biblioteca activa.' })
   const [availableModels, setAvailableModels] = useState<AiModelOption[]>([])
-  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false)
   const [newContextTag, setNewContextTag] = useState('')
   const [newContextColor, setNewContextColor] = useState('#64748B')
   const [libraryRoles, setLibraryRoles] = useState<LibraryRole[]>([])
@@ -245,10 +244,6 @@ export function SettingsModal({
   const [renameDraft, setRenameDraft] = useState('')
   const [deleteUser, setDeleteUser] = useState<LibraryUser | null>(null)
   const libraryDataGenerationRef = useRef(0)
-  const { triggerRef: modelTriggerRef, panelRef: modelPanelRef } = useSubmenuEngine<HTMLButtonElement, HTMLDivElement>({
-    open: isModelMenuOpen,
-    onClose: () => setIsModelMenuOpen(false),
-  })
   const [isLoadingModels, setIsLoadingModels] = useState(false)
   const [modelsErrorMessage, setModelsErrorMessage] = useState<string | null>(null)
   const [aiHealthStatus, setAiHealthStatus] = useState<{
@@ -296,6 +291,7 @@ export function SettingsModal({
     ollamaUrl: ollamaUrlDraft,
     apiKey: apiKeyDraft,
     selectedModel: selectedModelDraft,
+    imageModel: imageModelDraft,
     thinkingEnabled: thinkingEnabledDraft,
     thinkingLevel: thinkingLevelDraft,
     progressMode: progressModeDraft,
@@ -304,6 +300,7 @@ export function SettingsModal({
     editProgressMessage: editProgressMessageDraft,
   }
   const selectedModelOption = availableModels.find((model) => model.name === selectedModelDraft) ?? null
+  const imageModelOption = availableModels.find((model) => model.name === imageModelDraft) ?? null
 
   useEffect(() => {
     if (!open) {
@@ -313,6 +310,7 @@ export function SettingsModal({
     setOllamaUrlDraft(incomingAiPreferences.ollamaUrl)
     setApiKeyDraft(incomingAiPreferences.apiKey)
     setSelectedModelDraft(incomingAiPreferences.selectedModel)
+    setImageModelDraft(incomingAiPreferences.imageModel ?? '')
     setThinkingEnabledDraft(incomingAiPreferences.thinkingEnabled)
     setThinkingLevelDraft(incomingAiPreferences.thinkingLevel)
     setProgressModeDraft(incomingAiPreferences.progressMode)
@@ -323,6 +321,7 @@ export function SettingsModal({
     incomingAiPreferences.apiKey,
     incomingAiPreferences.ollamaUrl,
     incomingAiPreferences.selectedModel,
+    incomingAiPreferences.imageModel,
     incomingAiPreferences.thinkingEnabled,
     incomingAiPreferences.thinkingLevel,
     incomingAiPreferences.progressMode,
@@ -1195,51 +1194,36 @@ export function SettingsModal({
                     </SettingsFooter>
                   </SettingsCard>
                   <SettingsCard title="Modelo">
-                    <SettingsRow label="Modelo de Ollama" description="Para enviar imágenes, elegí uno con capacidad de visión.">
-                      <div className="notia-ai-model-select">
-                        <button
-                          ref={modelTriggerRef}
-                          type="button"
-                          className="notia-ai-model-select-trigger notia-settings-field"
-                          aria-label={`Modelo de Ollama: ${selectedModelDraft || 'sin seleccionar'}`}
-                          aria-haspopup="listbox"
-                          aria-expanded={isModelMenuOpen}
-                          aria-controls={isModelMenuOpen ? 'notia-ai-model-select-menu' : undefined}
-                          onClick={() => setIsModelMenuOpen((current) => !current)}
-                          disabled={isLoadingModels || availableModels.length === 0}
-                        >
-                          <span>{selectedModelDraft || (isLoadingModels ? 'Cargando modelos…' : 'No hay modelos disponibles')}</span>
-                          <ChevronDown size={16} aria-hidden="true" />
-                        </button>
-                        {isModelMenuOpen ? (
-                          <NotiaSubmenuPanel ref={modelPanelRef} id="notia-ai-model-select-menu" className="notia-ai-model-select-menu" role="listbox" aria-label="Modelos de Ollama">
-                            {availableModels.map((model) => (
-                              <button
-                                type="button"
-                                role="option"
-                                aria-selected={model.name === selectedModelDraft}
-                                className={`notia-ai-model-select-option${model.name === selectedModelDraft ? ' is-selected' : ''}`}
-                                key={model.name}
-                                onClick={() => {
-                                  const nextValue = model.name
-                                  setSelectedModelDraft(nextValue)
-                                  onAiPreferencesChange({ ...draftAiPreferences, selectedModel: nextValue })
-                                  setIsModelMenuOpen(false)
-                                }}
-                              >
-                                <span className="notia-ai-model-select-name">{model.name}</span>
-                                <span className="notia-ai-model-capabilities">
-                                  {model.supportsThinking ? <span title="Admite thinking"><Brain size={13} /> Thinking</span> : null}
-                                  {model.supportsVision ? <span title="Admite imágenes"><Eye size={13} /> Vision</span> : null}
-                                  {model.supportsTools ? <span title="Admite tool calling nativo"><Wrench size={13} /> Tools</span> : null}
-                                  {!model.supportsThinking && !model.supportsVision && !model.supportsTools ? <span>Texto</span> : null}
-                                </span>
-                              </button>
-                            ))}
-                          </NotiaSubmenuPanel>
-                        ) : null}
-                      </div>
+                    <SettingsRow label="Modelo de Ollama" description="Resuelve los pedidos y usa las herramientas. Si elegís un modelo para imágenes, este no necesita ver imágenes.">
+                      <AiModelSelect
+                        id="notia-ai-model-select-menu"
+                        label="Modelo de Ollama"
+                        value={selectedModelDraft}
+                        models={availableModels}
+                        isLoading={isLoadingModels}
+                        onSelect={(name) => {
+                          setSelectedModelDraft(name)
+                          onAiPreferencesChange({ ...draftAiPreferences, selectedModel: name })
+                        }}
+                      />
                     </SettingsRow>
+                    <SettingsRow label="Modelo para imágenes" description="Lee las fotos, capturas y PDF escaneados y le pasa al modelo de Ollama lo que ve. Con «El mismo modelo», las imágenes van directo al modelo de Ollama. No es el que genera imágenes.">
+                      <AiModelSelect
+                        id="notia-ai-image-model-select-menu"
+                        label="Modelo para imágenes"
+                        value={imageModelDraft}
+                        models={availableModels}
+                        isLoading={isLoadingModels}
+                        emptyOption={{ label: 'El mismo modelo', hint: 'Usa el modelo de Ollama' }}
+                        onSelect={(name) => {
+                          setImageModelDraft(name)
+                          onAiPreferencesChange({ ...draftAiPreferences, imageModel: name })
+                        }}
+                      />
+                    </SettingsRow>
+                    {imageModelOption && !imageModelOption.supportsVision ? (
+                      <SettingsNotice tone="error">{imageModelOption.name} no indica que pueda ver imágenes: elegí uno con Vision.</SettingsNotice>
+                    ) : null}
                     {modelsErrorMessage ? <SettingsNotice tone="error">{modelsErrorMessage}</SettingsNotice> : null}
                     {selectedModelOption?.supportsThinking ? (
                       <SettingsRow

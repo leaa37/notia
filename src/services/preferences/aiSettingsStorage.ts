@@ -20,6 +20,8 @@ export interface AiPreferences {
   ollamaUrl: string
   apiKey: string
   selectedModel: string
+  /** Model that reads the images; empty sends them to `selectedModel`. */
+  imageModel?: string
   thinkingEnabled: boolean
   thinkingLevel: AiThinkingLevel
   progressMode?: AiProgressMode
@@ -34,6 +36,7 @@ const DEFAULT_AI_PREFERENCES: AiPreferences = {
   ollamaUrl: DEFAULT_OLLAMA_API_URL,
   apiKey: '',
   selectedModel: '',
+  imageModel: '',
   thinkingEnabled: true,
   thinkingLevel: 'medium',
   progressMode: 'minimal',

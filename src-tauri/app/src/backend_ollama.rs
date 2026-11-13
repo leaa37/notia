@@ -9,7 +9,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use notia_backend_core::{
@@ -31,6 +34,8 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 600;
 pub struct OllamaProviderConfig {
     settings: AiHttpSettings,
     model: String,
+    /// Reads the images for `model`, which then gets only their text.
+    image_model: Option<String>,
     think: Value,
     tool_timeout_secs: u64,
 }
@@ -58,9 +63,60 @@ impl OllamaProviderConfig {
         Ok(Self {
             settings,
             model: model.into(),
+            image_model: None,
             think,
             tool_timeout_secs,
         })
+    }
+
+    /// Images go to `image_model` when it is set and differs from the model:
+    /// it describes them and the model works with that text.
+    pub fn with_image_model(mut self, image_model: &str) -> Self {
+        self.image_model =
+            notia_backend_core::ai_settings::separate_image_model(&self.model, image_model).map(str::to_string);
+        self
+    }
+}
+
+/// Descriptions the image model already wrote, by model and image: an image
+/// stays in the conversation (and the router sees it first) and is read once.
+const IMAGE_DESCRIPTIONS_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct ImageDescriptions {
+    by_key: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+fn image_descriptions() -> &'static Mutex<ImageDescriptions> {
+    static DESCRIPTIONS: OnceLock<Mutex<ImageDescriptions>> = OnceLock::new();
+    DESCRIPTIONS.get_or_init(|| Mutex::new(ImageDescriptions::default()))
+}
+
+fn image_description_key(image_model: &str, image: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(image_model.as_bytes());
+    hasher.update([0]);
+    hasher.update(image.as_bytes());
+    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn remembered_description(key: &str) -> Option<String> {
+    image_descriptions().lock().ok()?.by_key.get(key).cloned()
+}
+
+fn remember_description(key: String, description: &str) {
+    let Ok(mut descriptions) = image_descriptions().lock() else {
+        return;
+    };
+    if descriptions.by_key.insert(key.clone(), description.to_string()).is_none() {
+        descriptions.order.push_back(key);
+    }
+    while descriptions.order.len() > IMAGE_DESCRIPTIONS_CAPACITY {
+        if let Some(oldest) = descriptions.order.pop_front() {
+            descriptions.by_key.remove(&oldest);
+        }
     }
 }
 
@@ -624,7 +680,7 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
         control: &RequestControl,
     ) -> Result<ProviderResponse, BackendError> {
         control.check()?;
-        let messages = translate_messages(&request.messages);
+        let messages = translate_messages(&self.readable_messages(&request.messages, control)?);
         let answer = self.transport.chat(
             &self.config.settings,
             &self.config.model,
@@ -655,7 +711,7 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
         if !request.tools.is_empty() {
             return self.stream_tool_round(request, control, on_delta);
         }
-        let messages = translate_messages(&request.messages);
+        let messages = translate_messages(&self.readable_messages(&request.messages, control)?);
         let answer = self.transport.stream_chat(
             &self.config.settings,
             &self.config.model,
@@ -693,7 +749,7 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
     ) -> Result<ProviderResponse, BackendError> {
         control.check()?;
         let messages =
-            serde_json::to_value(translate_messages(&request.messages)).map_err(|_| {
+            serde_json::to_value(translate_messages(&self.readable_messages(&request.messages, control)?)).map_err(|_| {
                 BackendError::invalid_input("Los mensajes no se pudieron serializar para Ollama.")
             })?;
         let tools = translate_tools(&request.tools);
@@ -713,6 +769,78 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
 }
 
 impl<T: OllamaTransport> OllamaAgentProvider<T> {
+    /// The messages as the model can read them: with a separate image model,
+    /// each image becomes the text that model wrote about it.
+    fn readable_messages<'a>(
+        &self,
+        messages: &'a [ProviderMessage],
+        control: &RequestControl,
+    ) -> Result<Cow<'a, [ProviderMessage]>, BackendError> {
+        let Some(image_model) = self.config.image_model.as_deref() else {
+            return Ok(Cow::Borrowed(messages));
+        };
+        if messages.iter().all(|message| message.images.is_empty()) {
+            return Ok(Cow::Borrowed(messages));
+        }
+        let mut readable = messages.to_vec();
+        for message in readable.iter_mut().filter(|message| !message.images.is_empty()) {
+            let mut parts = Vec::with_capacity(message.images.len() + 1);
+            if !message.content.trim().is_empty() {
+                parts.push(message.content.clone());
+            }
+            for (index, image) in message.images.iter().enumerate() {
+                let description = self.describe_image(image_model, image, control)?;
+                parts.push(format!(
+                    "[Imagen {} de este mensaje, leída por el modelo de imágenes]\n{description}",
+                    index + 1
+                ));
+            }
+            message.content = parts.join("\n\n");
+            message.images.clear();
+        }
+        Ok(Cow::Owned(readable))
+    }
+
+    /// What `image_model` reads in `image`, once per model and image.
+    fn describe_image(&self, image_model: &str, image: &str, control: &RequestControl) -> Result<String, BackendError> {
+        let key = image_description_key(image_model, image);
+        if let Some(description) = remembered_description(&key) {
+            return Ok(description);
+        }
+        control.check()?;
+        let message = |role: &str, content: &str, images: Vec<String>| AiChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            images,
+            tool_calls: Vec::new(),
+            tool_name: None,
+        };
+        let messages = [
+            message("system", notia_backend_core::ai_settings::IMAGE_READER_PROMPT, Vec::new()),
+            message("user", "Describí esta imagen.", vec![image.to_string()]),
+        ];
+        let answer = self
+            .transport
+            .chat(&self.config.settings, image_model, &messages, &Value::Bool(false), &Value::Null, control)
+            .map_err(|error| {
+                BackendError::new(
+                    error.code,
+                    format!("El modelo de imágenes ({image_model}) no pudo leer la imagen: {}", error.message),
+                    error.retryable,
+                )
+            })?;
+        let description = tool_call_recovery::clean_answer_text(&answer.answer).trim().to_string();
+        if description.is_empty() {
+            return Err(BackendError::new(
+                BackendErrorCode::ProviderUnavailable,
+                format!("El modelo de imágenes ({image_model}) no devolvió qué ve en la imagen."),
+                true,
+            ));
+        }
+        remember_description(key, &description);
+        Ok(description)
+    }
+
     /// A round with tools, streamed: the agent can keep calling tools after
     /// its first result instead of only being able to answer, and the text
     /// the model writes before its calls reaches the person as it arrives.
@@ -723,7 +851,7 @@ impl<T: OllamaTransport> OllamaAgentProvider<T> {
         on_delta: &mut dyn FnMut(ProviderStreamDelta) -> Result<(), BackendError>,
     ) -> Result<ProviderResponse, BackendError> {
         let messages =
-            serde_json::to_value(translate_messages(&request.messages)).map_err(|_| {
+            serde_json::to_value(translate_messages(&self.readable_messages(&request.messages, control)?)).map_err(|_| {
                 BackendError::invalid_input("Los mensajes no se pudieron serializar para Ollama.")
             })?;
         let tools = translate_tools(&request.tools);
@@ -1347,5 +1475,134 @@ mod tests {
                 .message
                 .contains("secret")
         );
+    }
+
+    /// Answers as the image model or as the main model, and records each
+    /// chat call with its model and messages.
+    struct ImageReaderTransport {
+        calls: Arc<Mutex<Vec<(String, Vec<AiChatMessage>)>>>,
+        reader_fails: bool,
+    }
+
+    impl OllamaTransport for ImageReaderTransport {
+        fn chat(
+            &self,
+            _: &AiHttpSettings,
+            model: &str,
+            messages: &[AiChatMessage],
+            _: &Value,
+            _: &Value,
+            _: &RequestControl,
+        ) -> Result<AiChatResult, BackendError> {
+            self.calls.lock().expect("calls lock").push((model.to_string(), messages.to_vec()));
+            if model == "gemma3:vision" {
+                if self.reader_fails {
+                    return Err(BackendError::new(BackendErrorCode::ProviderUnavailable, "modelo no encontrado", true));
+                }
+                return Ok(AiChatResult { answer: "Ticket de almacén: yerba 1 kg $3.500, total $3.500.".to_string() });
+            }
+            Ok(AiChatResult { answer: "Listo.".to_string() })
+        }
+
+        fn tool_chat(&self, _: &AiHttpSettings, _: &str, _: &Value, _: &Value, _: &Value, _: u64, _: &RequestControl) -> Result<Value, BackendError> {
+            unreachable!()
+        }
+
+        fn stream_chat(
+            &self,
+            _: &AiHttpSettings,
+            _: &str,
+            _: &[AiChatMessage],
+            _: &Value,
+            _: &Value,
+            _: &RequestControl,
+            _: &mut dyn FnMut(AiChatStreamDelta) -> Result<(), BackendError>,
+        ) -> Result<String, BackendError> {
+            unreachable!()
+        }
+
+        fn stream_tool_chat(
+            &self,
+            _: &AiHttpSettings,
+            _: &str,
+            _: &Value,
+            _: &Value,
+            _: &Value,
+            _: u64,
+            _: &RequestControl,
+            _: &mut dyn FnMut(AiChatStreamDelta) -> Result<(), BackendError>,
+        ) -> Result<Value, BackendError> {
+            unreachable!()
+        }
+    }
+
+    /// A request whose message carries one image, unique to the test (the
+    /// read images are remembered for the whole process).
+    fn request_with_image() -> (ProviderRequest, String) {
+        let image = format!("aW1hZ2Vu{}", uuid::Uuid::new_v4().simple());
+        let mut request = request(false);
+        request.messages[0].content = "cargá este ticket".to_string();
+        request.messages[0].images = vec![image.clone()];
+        (request, image)
+    }
+
+    #[test]
+    fn a_separate_image_model_reads_the_images_and_the_model_gets_their_text() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = OllamaAgentProvider::with_transport(
+            config().with_image_model(" gemma3:vision "),
+            ImageReaderTransport { calls: Arc::clone(&calls), reader_fails: false },
+        );
+        let (request, image) = request_with_image();
+        provider.chat(&request, &RequestControl::new(None)).expect("answer");
+        {
+            let calls = calls.lock().expect("calls lock");
+            assert_eq!(calls.len(), 2);
+            let (reader, read) = &calls[0];
+            assert_eq!(reader, "gemma3:vision");
+            assert_eq!(read[0].content, notia_backend_core::ai_settings::IMAGE_READER_PROMPT);
+            assert_eq!(read[1].images, vec![image.clone()]);
+            let (model, sent) = &calls[1];
+            assert_eq!(model, "qwen3:test");
+            assert!(sent.iter().all(|message| message.images.is_empty()));
+            assert!(sent[0].content.starts_with("cargá este ticket\n\n[Imagen 1 de este mensaje, leída por el modelo de imágenes]"));
+            assert!(sent[0].content.contains("total $3.500"));
+        }
+        // The same image in a later call is not read again.
+        provider.chat(&request, &RequestControl::new(None)).expect("answer");
+        let calls = calls.lock().expect("calls lock");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].0, "qwen3:test");
+    }
+
+    #[test]
+    fn without_a_separate_image_model_the_images_go_to_the_model() {
+        for image_model in ["", "qwen3:test"] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider = OllamaAgentProvider::with_transport(
+                config().with_image_model(image_model),
+                ImageReaderTransport { calls: Arc::clone(&calls), reader_fails: false },
+            );
+            let (request, image) = request_with_image();
+            provider.chat(&request, &RequestControl::new(None)).expect("answer");
+            let calls = calls.lock().expect("calls lock");
+            assert_eq!(calls.len(), 1, "{image_model}");
+            assert_eq!(calls[0].0, "qwen3:test");
+            assert_eq!(calls[0].1[0].images, vec![image]);
+            assert_eq!(calls[0].1[0].content, "cargá este ticket");
+        }
+    }
+
+    #[test]
+    fn an_image_the_image_model_cannot_read_stops_the_call_with_its_name() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = OllamaAgentProvider::with_transport(
+            config().with_image_model("gemma3:vision"),
+            ImageReaderTransport { calls: Arc::clone(&calls), reader_fails: true },
+        );
+        let (request, _) = request_with_image();
+        let error = provider.chat(&request, &RequestControl::new(None)).expect_err("unread image");
+        assert!(error.message.contains("El modelo de imágenes (gemma3:vision)"), "{}", error.message);
+        assert_eq!(calls.lock().expect("calls lock").len(), 1, "the main model is not called");
     }
 }

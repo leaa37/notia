@@ -283,6 +283,7 @@ fn normalize_ai(value: &Value) -> Value {
         ollama_url: text(&["ollamaUrl", "baseUrl"]),
         api_key: text(&["apiKey"]),
         selected_model: text(&["selectedModel", "model"]),
+        image_model: text(&["imageModel"]),
         thinking_enabled: value.get("thinkingEnabled").and_then(Value::as_bool) != Some(false),
         thinking_level: match value.get("thinkingLevel").and_then(Value::as_str) {
             Some("low") => crate::ai_settings::ThinkingLevel::Low,
@@ -300,6 +301,7 @@ fn normalize_ai(value: &Value) -> Value {
         "ollamaUrl": settings.ollama_url,
         "apiKey": settings.api_key,
         "selectedModel": settings.selected_model,
+        "imageModel": settings.image_model,
         "thinkingEnabled": settings.thinking_enabled,
         "thinkingLevel": settings.thinking_level.as_str(),
         "progressMode": progress_mode,
@@ -474,6 +476,12 @@ mod tests {
         assert_eq!(ai["progressMode"], "minimal");
         assert_eq!(ai["showPlan"], false);
         assert_eq!(ai["thinkingEnabled"], true);
+        assert_eq!(ai["imageModel"], "");
+        let with_reader = normalize_library_config(&json!({
+            "contextDefaultsVersion": 1,
+            "ia": { "selectedModel": "qwen3", "imageModel": " gemma3 " },
+        }));
+        assert_eq!(with_reader.config["ia"]["imageModel"], "gemma3");
     }
 
     #[test]

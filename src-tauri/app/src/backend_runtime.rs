@@ -82,6 +82,7 @@ impl BackendRuntimeState {
             Some(BackendProviderSettings {
                 ollama_url: settings.ollama_url.clone(),
                 model: settings.selected_model.clone(),
+                image_model: settings.image_model.clone(),
                 api_key: settings.api_key.clone(),
                 think,
             });
@@ -123,6 +124,8 @@ impl BackendRuntimeState {
 struct BackendProviderSettings {
     ollama_url: String,
     model: String,
+    /// Reads the images when it is another model; empty means `model`.
+    image_model: String,
     api_key: String,
     think: Value,
 }
@@ -5226,7 +5229,8 @@ pub(crate) fn execute_backend_request(
             provider_settings.model,
             // A conversational turn answers without thinking.
             if request.thinking == Some(false) { Value::Bool(false) } else { provider_settings.think },
-        )?,
+        )?
+        .with_image_model(&provider_settings.image_model),
         platform_ollama_transport(app),
     );
     let mut options = AgentRuntimeOptions::default();
@@ -5340,7 +5344,7 @@ fn provider_settings_from_config(config: &Value) -> Result<BackendProviderSettin
     } else {
         Value::Bool(false)
     };
-    Ok(BackendProviderSettings { ollama_url, model, api_key: text("apiKey"), think })
+    Ok(BackendProviderSettings { ollama_url, model, image_model: text("imageModel"), api_key: text("apiKey"), think })
 }
 
 /// Provider of one library: its saved AI settings (URL, model, credential and
@@ -5548,7 +5552,8 @@ fn quick_provider(app: &AppHandle, settings: &BackendProviderSettings) -> Result
             },
             settings.model.clone(),
             Value::Bool(false),
-        )?,
+        )?
+        .with_image_model(&settings.image_model),
         platform_ollama_transport(app),
     ))
 }
