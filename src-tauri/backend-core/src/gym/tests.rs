@@ -91,6 +91,28 @@ fn an_exercise_file_round_trips_keeping_its_image_and_note_lines() {
     assert_eq!(parse_equipment(&equipment.path, &render_equipment(&equipment), true), Some(equipment));
 }
 
+/// A video named after the id belongs to the exercise without `video:` in
+/// its file, and rewriting the file does not add it.
+#[test]
+fn a_video_named_after_the_id_needs_no_video_line() {
+    let names = ["bench_press.MOV", "Press.mp4", "bench_press.webm", "notas.md", "bench_press.mp4", "bench_press_2.mp4", ".mp4"];
+    assert_eq!(video_by_id("bench_press", names).as_deref(), Some("bench_press.mp4"));
+    assert_eq!(video_by_id("BENCH_PRESS", ["bench_press.webm", "bench_press.MOV"]).as_deref(), Some("bench_press.webm"));
+    assert_eq!(video_by_id("bench_press", ["bench_press.MOV"]).as_deref(), Some("bench_press.MOV"));
+    assert_eq!(video_by_id("bench_press", ["bench_press.gif", "bench_press.md", "bench.mp4", "press_bench_press.mp4"]), None);
+    assert_eq!(video_by_id("", [".mp4"]), None);
+    assert!(is_video_name("Plancha.WebM") && !is_video_name(".mp4") && !is_video_name("Plancha.gif"));
+
+    let mut exercise = parse_exercise("Gym/exercises/Press.md", EXERCISE, false).expect("exercise");
+    exercise.video = Some("bench_press.mp4".into());
+    let rendered = render_exercise(&exercise);
+    assert!(!rendered.contains("video:"), "{rendered}");
+    assert_eq!(parse_exercise("Gym/exercises/Press.md", &rendered, false).expect("exercise").video, None);
+    // A video with another name still needs its line.
+    exercise.video = Some("Press de banca.mp4".into());
+    assert!(render_exercise(&exercise).contains("video: Press de banca.mp4\n"));
+}
+
 #[test]
 fn the_body_is_read_as_silhouette_outline_and_muscles() {
     let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 232 523"><path class="body" fill="#E8E8F5" d="M1 1Z"/><path class="body" fill="#72728D" d="M2 2Z"/><path class="muscle" data-muscle="Upper Chest" fill="#CBCBE0" d="M3 3Z"/><path data-muscle="Rotator Cuff" d="M4 4Z"/></svg>"##;

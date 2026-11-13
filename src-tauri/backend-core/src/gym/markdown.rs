@@ -22,6 +22,10 @@
 //! 1. Acostate en el banco…
 //! ```
 //!
+//! `video` es opcional: un video de la misma carpeta que se llama como el id
+//! (`bench_press.mp4`, `.webm` o `.mov`) es el del ejercicio sin nombrarlo, y
+//! al reescribir la ficha no se agrega. Un `video` escrito tiene prioridad.
+//!
 //! Un equipamiento tiene `id`, `categoria` y `origen` (`catalogo` o
 //! `propio`), el título y la foto. Las otras líneas del frontmatter (las que
 //! el editor agrega a toda nota) se conservan al reescribir el archivo.
@@ -211,7 +215,8 @@ pub fn render_exercise(exercise: &Exercise) -> String {
             ("principales", muscle_names(&exercise.primary)),
             ("secundarios", muscle_names(&exercise.secondary)),
             ("equipamiento", exercise.equipment.join(", ")),
-            ("video", exercise.video.clone().unwrap_or_default()),
+            // El video que se llama como el id se encuentra solo.
+            ("video", exercise.video.clone().filter(|video| !super::is_video_of_id(&exercise.id, video)).unwrap_or_default()),
             ("alias", exercise.aliases.join(", ")),
         ],
         &exercise.extra_front,

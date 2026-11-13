@@ -23,8 +23,8 @@ use crate::backend::gym::view::{build_view, exercise_detail, ExerciseDetail, Gym
 use crate::backend::gym::tools::{action_summary, apply_patch, read_tool, tool_action, GymToolAction};
 use crate::recipes::MessageImage;
 use crate::backend::gym::{
-    file_stem, fold, BodySex, Catalog, Equipment, Exercise, GymData, GymError, GymErrorCode, Routine, Session, Workout, EQUIPMENT_FOLDER,
-    EXERCISES_FOLDER, GYM_FOLDER,
+    file_stem, fold, is_video_name, video_by_id, BodySex, Catalog, Equipment, Exercise, GymData, GymError, GymErrorCode, Routine, Session,
+    Workout, EQUIPMENT_FOLDER, EXERCISES_FOLDER, GYM_FOLDER,
 };
 use crate::backend::{BackendError, BackendErrorCode};
 use crate::host::{AppHandle, Emitter, Manager};
@@ -178,11 +178,18 @@ struct FileStamp {
     modified: i64,
 }
 
-fn visible_markdown(name: &str) -> bool {
-    !name.starts_with('.') && !name.starts_with('_') && name.to_ascii_lowercase().ends_with(".md")
+fn is_markdown(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".md")
 }
 
-/// Los `.md` de una carpeta, leídos ahora (no del índice, que puede atrasar).
+/// Lo que se lista de una carpeta del catálogo: las notas y los videos de
+/// demostración (que se encuentran por el id del ejercicio).
+fn catalog_file_name(name: &str) -> bool {
+    !name.starts_with('.') && !name.starts_with('_') && (is_markdown(name) || is_video_name(name))
+}
+
+/// Los `.md` y los videos de una carpeta, leídos ahora (no del índice, que
+/// puede atrasar).
 fn folder_files(app: &AppHandle, library_id: &str, folder: &str) -> GymCommandResult<Vec<FileStamp>> {
     let binding = app.state::<LibraryBindingRegistry>().lookup(library_id)?;
     let mut files = match &binding.root {
@@ -201,7 +208,7 @@ fn folder_files(app: &AppHandle, library_id: &str, folder: &str) -> GymCommandRe
                         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                         .map(|elapsed| elapsed.as_millis() as i64)
                         .unwrap_or_default();
-                    visible_markdown(&name).then(|| FileStamp { path: format!("{folder}/{name}"), size: metadata.len(), modified })
+                    catalog_file_name(&name).then(|| FileStamp { path: format!("{folder}/{name}"), size: metadata.len(), modified })
                 })
                 .collect::<Vec<_>>()
         }
@@ -257,7 +264,7 @@ fn is_tree_document(tree_uri: &str, uri: &str) -> bool {
     uri.starts_with(&format!("{}/document/", tree_uri.trim_end_matches('/')))
 }
 
-/// Los `.md` de una carpeta listada sola en Android. Cada hijo tiene que
+/// Los `.md` y los videos de una carpeta listada sola en Android. Cada hijo tiene que
 /// venir de esa carpeta, un documento del árbol (no la raíz); si no, `None`.
 /// En Android la marca es la fecha de modificación: la lectura de una carpeta
 /// no trae el tamaño, y así las dos maneras de listar dan la misma marca.
@@ -278,14 +285,15 @@ fn shallow_stamps(
         if name.is_empty() || name.contains('/') {
             return None;
         }
-        if node.node_type == crate::backend::library_tree::LibraryNodeKind::File && visible_markdown(name) {
+        if node.node_type == crate::backend::library_tree::LibraryNodeKind::File && catalog_file_name(name) {
             files.push(FileStamp { path: format!("{folder}/{name}"), size: 0, modified: node.modified_at.unwrap_or_default() });
         }
     }
     Some(files)
 }
 
-/// Los `.md` de una carpeta en la lista completa de la biblioteca: las rutas
+/// Los `.md` y los videos de una carpeta en la lista completa de la
+/// biblioteca: las rutas
 /// llegan como `<árbol>/<ruta lógica>`.
 #[cfg(any(target_os = "android", test))]
 fn flat_stamps(tree_uri: &str, folder: &str, entries: Vec<crate::mobile_directory_picker::AndroidFlatFileEntry>) -> Vec<FileStamp> {
@@ -295,7 +303,7 @@ fn flat_stamps(tree_uri: &str, folder: &str, entries: Vec<crate::mobile_director
         .filter(|entry| entry.node_type != "folder")
         .filter_map(|entry| {
             let name = entry.path.strip_prefix(&prefix)?;
-            (!name.contains('/') && visible_markdown(name)).then(|| FileStamp {
+            (!name.contains('/') && catalog_file_name(name)).then(|| FileStamp {
                 path: format!("{folder}/{name}"),
                 size: 0,
                 modified: entry.last_modified.unwrap_or_default(),
@@ -413,7 +421,8 @@ fn read_catalog_files(
     mut read: impl FnMut(&str) -> Option<String>,
 ) -> HashMap<String, (FileStamp, CatalogFile)> {
     let mut files = HashMap::with_capacity(stamps.len());
-    for stamp in stamps {
+    // Los videos solo se listan: no se leen.
+    for stamp in stamps.iter().filter(|stamp| is_markdown(&stamp.path)) {
         let file = match previous.remove(&stamp.path) {
             Some((cached, file)) if cached == *stamp => file,
             _ => {
@@ -431,12 +440,25 @@ fn read_catalog_files(
     files
 }
 
-/// El catálogo con los archivos en el orden de la lista.
+/// El catálogo con los archivos en el orden de la lista. Un ejercicio que no
+/// nombra su video usa el de su carpeta que se llama como su id.
 fn assemble_catalog(stamps: &[FileStamp], files: &HashMap<String, (FileStamp, CatalogFile)>) -> Catalog {
+    let exercises_prefix = format!("{EXERCISES_FOLDER}/");
+    let videos = stamps
+        .iter()
+        .filter_map(|stamp| stamp.path.strip_prefix(&exercises_prefix))
+        .filter(|name| is_video_name(name))
+        .collect::<Vec<_>>();
     let mut catalog = Catalog::default();
     for stamp in stamps {
         match files.get(&stamp.path).map(|(_, file)| file) {
-            Some(CatalogFile::Exercise(exercise)) => catalog.exercises.push(exercise.clone()),
+            Some(CatalogFile::Exercise(exercise)) => {
+                let mut exercise = exercise.clone();
+                if exercise.video.is_none() {
+                    exercise.video = video_by_id(&exercise.id, videos.iter().copied());
+                }
+                catalog.exercises.push(exercise);
+            }
             Some(CatalogFile::Equipment(item)) => catalog.equipment.push(item.clone()),
             Some(CatalogFile::Other) | None => {}
         }
@@ -478,7 +500,13 @@ fn full_exercise(app: &AppHandle, library_id: &str, catalog: &Catalog, id: &str)
     let path = catalog.exercise(id).map(|exercise| exercise.path.clone()).ok_or_else(|| GymCommandError::new(GymCommandErrorCode::NotFound, "El ejercicio ya no está en Gym/exercises."))?;
     let text = crate::library_documents::with_documents(app, library_id, |documents| documents.read(&path))?
         .ok_or_else(|| GymCommandError::new(GymCommandErrorCode::NotFound, "El ejercicio ya no está en Gym/exercises."))?;
-    parse_exercise(&path, &text, true).ok_or_else(|| GymCommandError::validation("El archivo del ejercicio no tiene el formato de Rutinas."))
+    let mut exercise =
+        parse_exercise(&path, &text, true).ok_or_else(|| GymCommandError::validation("El archivo del ejercicio no tiene el formato de Rutinas."))?;
+    // El video que se llama como el id lo encontró la lista del catálogo.
+    if exercise.video.is_none() {
+        exercise.video = catalog.exercise(id).and_then(|known| known.video.clone());
+    }
+    Ok(exercise)
 }
 
 fn full_equipment(app: &AppHandle, library_id: &str, catalog: &Catalog, id: &str) -> GymCommandResult<Equipment> {
@@ -1337,6 +1365,46 @@ mod tests {
         assert_eq!(catalog.exercises.len(), 2);
     }
 
+    /// A video in the exercises folder named after an id is that exercise's
+    /// video: it is listed but never read, a `video:` line wins, and a video
+    /// with another name or in another folder belongs to no one.
+    #[test]
+    fn a_video_named_after_the_id_is_found_in_the_listing() {
+        let texts = HashMap::from([
+            ("Gym/exercises/Flexiones.md".to_string(), exercise_text("push_ups", "Flexiones")),
+            ("Gym/exercises/Press.md".to_string(), exercise_text("bench_press", "Press de banca")),
+            (
+                "Gym/exercises/Plancha.md".to_string(),
+                "---\nid: plank\ngrupo: core\nregistro: tiempo\nvideo: Plancha frontal.mp4\n---\n# Plancha\n".to_string(),
+            ),
+            ("Gym/exercises/Remo.md".to_string(), exercise_text("row", "Remo")),
+        ]);
+        let reads = std::cell::RefCell::new(Vec::<String>::new());
+        let read = |path: &str| {
+            reads.borrow_mut().push(path.to_string());
+            texts.get(path).cloned()
+        };
+        let stamps = vec![
+            stamp("Gym/equipment/row.mp4", 1),
+            stamp("Gym/exercises/BENCH_PRESS.webm", 1),
+            stamp("Gym/exercises/Flexiones.md", 1),
+            stamp("Gym/exercises/Plancha.md", 1),
+            stamp("Gym/exercises/Press.md", 1),
+            stamp("Gym/exercises/Remo.md", 1),
+            stamp("Gym/exercises/bench_press.mp4", 1),
+            stamp("Gym/exercises/plank.mp4", 1),
+            stamp("Gym/exercises/push_ups.gif", 1),
+        ];
+        let files = read_catalog_files(&stamps, HashMap::new(), &read);
+        assert!(reads.borrow().iter().all(|path| path.ends_with(".md")), "{:?}", reads.borrow());
+        let catalog = assemble_catalog(&stamps, &files);
+        let video = |id: &str| catalog.exercise(id).and_then(|exercise| exercise.video.clone());
+        assert_eq!(video("bench_press").as_deref(), Some("bench_press.mp4"));
+        assert_eq!(video("plank").as_deref(), Some("Plancha frontal.mp4"));
+        assert_eq!(video("push_ups"), None);
+        assert_eq!(video("row"), None);
+    }
+
     fn cached(stamps: Option<Vec<FileStamp>>, generation: u64, at: Instant) -> CachedCatalog {
         let files = stamps.iter().flatten().map(|stamp| (stamp.path.clone(), (stamp.clone(), CatalogFile::Other))).collect();
         CachedCatalog { stamps, listed_at: at, generation, used_at: at, files, images: HashMap::new(), catalog: Arc::new(Catalog::default()) }
@@ -1413,9 +1481,11 @@ mod tests {
             node(&format!("{folder}/fotos"), "folder", None),
             node(&format!("{folder}/Plancha.md"), "file", None),
         ];
+        // The notes and the demonstration videos, which belong to the
+        // exercise with their id.
         assert_eq!(
             shallow_stamps(tree, EXERCISES_FOLDER, &folder, &nodes),
-            Some(vec![stamp("Gym/exercises/Press.md", 42), stamp("Gym/exercises/Plancha.md", 0)])
+            Some(vec![stamp("Gym/exercises/Press.md", 42), stamp("Gym/exercises/Press.mp4", 1), stamp("Gym/exercises/Plancha.md", 0)])
         );
         // Children of the root, or the root itself as the folder, are rejected.
         assert_eq!(shallow_stamps(tree, EXERCISES_FOLDER, &folder, &[node(&format!("{tree}/Gym"), "folder", None)]), None);
@@ -1430,11 +1500,17 @@ mod tests {
         };
         let entries = vec![
             entry(format!("{tree}/Gym/exercises/Press.md"), "file"),
+            entry(format!("{tree}/Gym/exercises/bench_press.mp4"), "file"),
+            entry(format!("{tree}/Gym/exercises/_borrador.mp4"), "file"),
+            entry(format!("{tree}/Gym/exercises/foto.gif"), "file"),
             entry(format!("{tree}/Gym/exercises/viejos/Remo.md"), "file"),
             entry(format!("{tree}/Gym/equipment/Barra.md"), "file"),
             entry(format!("{tree}/Notas/Gym/exercises/Otro.md"), "file"),
         ];
-        assert_eq!(flat_stamps(tree, EXERCISES_FOLDER, entries), [stamp("Gym/exercises/Press.md", 5)]);
+        assert_eq!(
+            flat_stamps(tree, EXERCISES_FOLDER, entries),
+            [stamp("Gym/exercises/Press.md", 5), stamp("Gym/exercises/bench_press.mp4", 5)]
+        );
     }
 
     /// The body follows the sex of the Salud profile, read on its own.

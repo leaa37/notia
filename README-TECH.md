@@ -10760,7 +10760,7 @@ Módulo del rail **Gimnasio** (id de vista `gym`, pestaña `__workspace_gym__`),
 
 | Dato | Dónde | Quién escribe |
 |---|---|---|
-| Ejercicios | `Gym/exercises/<nombre>.md` (imagen embebida como `data:`), video al lado (`<nombre>.mp4`) | Importación inicial; ficha editable (`gym_catalog_apply`, `gym_set_media`) |
+| Ejercicios | `Gym/exercises/<nombre>.md` (imagen embebida como `data:`), video al lado: el que nombra `video:` o, si no lo nombra, `<id>.mp4` (o `.webm`, `.mov`) | Importación inicial; ficha editable (`gym_catalog_apply`, `gym_set_media`); el video por id también a mano |
 | Equipamiento | `Gym/equipment/<nombre>.md` (foto embebida), `origen: catalogo` o `propio` | Importación; el propio desde el formulario |
 | Cuerpo | `Gym/cuerpo-{frente,espalda}-{masculino,femenino}.svg`, cada músculo con `data-muscle` | Importación |
 | Rutinas, sesión en curso, historial, equipamiento propio | SQLite de la biblioteca, por `owner_user_id` (migración 31) | `gym_apply` |
@@ -10780,7 +10780,7 @@ kcalPorMinuto: 6
 principales: Pecho superior, Pecho inferior   # los 21 músculos por nombre (también clave o nombre del SVG)
 secundarios: Tríceps, Deltoide anterior
 equipamiento: barbell, flat_bench             # ids de Gym/equipment
-video: Press de banca con barra.mp4
+video: Press de banca con barra.mp4          # opcional: sin esta línea vale bench_press.mp4 (o .webm, .mov)
 alias: Bench Press, Barbell Bench Press       # también entra en la búsqueda
 contexto: "#Personal"                         # líneas de nota: se conservan al reescribir
 ---
@@ -10795,6 +10795,7 @@ contexto: "#Personal"                         # líneas de nota: se conservan al
 
 - `parse_exercise(path, text, with_image)`: sin `id` o sin nombre no es un ejercicio. Las listas no cargan la imagen (`has_image`); la ficha sí.
 - `render_exercise` reescribe el archivo completo con la imagen que tenga `Exercise.image`, así que quien edita lee antes el ejercicio con imagen.
+- **Video por id** (2026-11-13): un ejercicio sin `video:` usa el video de `Gym/exercises` que se llama como su `id`, sin importar mayúsculas: `<id>.mp4`, si no `<id>.webm`, si no `<id>.mov` (`video_by_id`, `VIDEO_EXTENSIONS` en `gym/mod.rs`). Un `video:` escrito tiene prioridad. `render_exercise` no escribe `video:` cuando el nombre sigue esa regla (`is_video_of_id`), así que editar la ficha no lo agrega. El adaptador lista los videos junto con los `.md` de la carpeta (`catalog_file_name`, en escritorio y en Android con `shallow_stamps` y `flat_stamps`), no los lee, y `assemble_catalog` completa `Exercise.video`; `full_exercise` toma ese video del catálogo para la ficha. Como el video entra en la lista, agregarlo o quitarlo fuera de Notia se ve en hasta 5 s (`LISTING_TTL`). Borrar el ejercicio o quitar su demostración borra también ese video, igual que el nombrado. `gym_set_media` sigue guardando el video subido como `<nombre del .md>.<ext>` con su `video:`. Pruebas: `a_video_named_after_the_id_needs_no_video_line` (núcleo), `a_video_named_after_the_id_is_found_in_the_listing` y `android_listings_keep_only_the_catalog_folder` (adaptador).
 - Equipamiento: `id`, `categoria` (`libres`, `estructuras`, `maquinas`, `accesorios`, `otros`), `origen`, título y foto.
 - `read_library_documents` ya quita las imágenes embebidas antes de dárselas al modelo.
 
@@ -10847,7 +10848,7 @@ contexto: "#Personal"                         # líneas de nota: se conservan al
 - **Caché del catálogo** (2026-10-02): cada archivo se guarda leído junto con su marca (ruta, tamaño y fecha; en Android solo ruta y fecha, porque el listado de una carpeta no trae el tamaño). Si la lista cambia, se releen solo los archivos nuevos o cambiados. La lista se da por buena durante 5 s (`LISTING_TTL`), salvo que un escrito del módulo suba la generación del catálogo; un escrito o un borrado descarta solo esas rutas. Se guardan como mucho 4 bibliotecas. Las fotos del equipamiento (`gym_equipment_images`) también se guardan por marca. Una edición hecha fuera de Notia aparece en hasta 5 s.
 - **Android**: `android_folder_files` resuelve `Gym/exercises` y `Gym/equipment` por niveles (`resolve_android_path_by_walking`) y lista cada carpeta sola; si eso falla, usa la lista completa. Antes la lista completa de la biblioteca se leía dos veces por cada comando y sus rutas (`<árbol>/<ruta>`) nunca coincidían, así que en Android el catálogo quedaba vacío.
 - **Un cambio de la pantalla** (`gym_apply`): arma la vista con el catálogo y la conexión que ya tiene (`write_then`). `profile_sex` lee solo `health_settings.profile_json`.
-- **Renombrar** un ejercicio o un equipamiento mueve el `.md` (`Nombre.md`, `Nombre 2.md`…); el video conserva su nombre.
+- **Renombrar** un ejercicio o un equipamiento mueve el `.md` (`Nombre.md`, `Nombre 2.md`…); el video conserva su nombre (el de `<id>.mp4` no depende del nombre del `.md`).
 - **Eventos**: cada escritura emite `notia://gym-changed` con `{ libraryId, origin }`. `gym_apply` recibe `context.origin` (`GymApplyContext`) y lo devuelve en el evento; las herramientas de la IA y los cambios del catálogo mandan `origin: null`.
 - **Modo cliente**: los comandos van al host porque no están en `CLIENT_LOCAL_COMMANDS`, así que los datos y el catálogo son los del host.
 

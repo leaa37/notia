@@ -498,6 +498,40 @@ pub fn file_stem(name: &str) -> String {
     }
 }
 
+/// Videos de demostración de una ficha, en orden de preferencia.
+pub const VIDEO_EXTENSIONS: [&str; 3] = ["mp4", "webm", "mov"];
+
+/// La extensión de video de un nombre de archivo (`mp4`, `webm` o `mov`).
+fn video_extension_of(name: &str) -> Option<&'static str> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
+    VIDEO_EXTENSIONS.iter().copied().find(|known| extension.eq_ignore_ascii_case(known))
+}
+
+/// Si `name` es un video de demostración.
+pub fn is_video_name(name: &str) -> bool {
+    video_extension_of(name).is_some()
+}
+
+/// Si el video se llama como el id del ejercicio (`<id>.mp4`, sin importar
+/// mayúsculas): ese se encuentra solo y no necesita `video:` en la ficha.
+pub fn is_video_of_id(id: &str, name: &str) -> bool {
+    !id.is_empty() && is_video_name(name) && name.rsplit_once('.').is_some_and(|(stem, _)| stem.eq_ignore_ascii_case(id))
+}
+
+/// El video de un ejercicio que no lo nombra en su ficha: el archivo de su
+/// carpeta que se llama como su id (`<id>.mp4`; si no hay, `.webm` o `.mov`).
+/// `names` son los nombres de los archivos de esa carpeta.
+pub fn video_by_id<'a>(id: &str, names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let candidates = names.into_iter().filter(|name| is_video_of_id(id, name)).collect::<Vec<_>>();
+    VIDEO_EXTENSIONS
+        .iter()
+        .find_map(|extension| candidates.iter().find(|name| video_extension_of(name) == Some(*extension)))
+        .map(|name| name.to_string())
+}
+
 /// Un id estable a partir de un nombre: minúsculas, sin acentos, con `_`.
 pub fn slug_id(name: &str) -> String {
     let folded = fold(name);
