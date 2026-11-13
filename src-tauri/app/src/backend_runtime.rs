@@ -5235,6 +5235,10 @@ pub(crate) fn execute_backend_request(
     );
     let mut options = AgentRuntimeOptions::default();
     options.continuation_judge = Some(continuation_judge);
+    options.auto_confirm = notia_backend_core::auto_confirm::AutoConfirm::for_request(
+        &auto_confirm_areas(app, &request.context.library_id),
+        &request,
+    );
     options.projection = if matches!(request.context.persistence_policy, PersistencePolicy::PublishedNoMemory)
     {
         ToolCatalogProjection::PublishedTaskManager
@@ -5556,6 +5560,17 @@ fn quick_provider(app: &AppHandle, settings: &BackendProviderSettings) -> Result
         .with_image_model(&settings.image_model),
         platform_ollama_transport(app),
     ))
+}
+
+/// The modules whose records the library saves without asking
+/// (`ia.autoConfirmAreas`); none when its configuration cannot be read.
+fn auto_confirm_areas(app: &AppHandle, library_id: &str) -> Vec<String> {
+    crate::library_config::read_library_config(app, library_id)
+        .ok()
+        .flatten()
+        .and_then(|config| config.pointer("/ia/autoConfirmAreas").and_then(Value::as_array).cloned())
+        .map(|ids| ids.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// One completion without tools, without thinking, within `timeout`; the

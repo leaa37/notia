@@ -42,6 +42,7 @@
 - Memoria persistente y herramientas nativas para el agente de IA.
 - Memoria persistente del agente para el usuario Owner y Telegram vinculado al Owner, con reglas operativas por biblioteca, guardado de datos personales en el mismo turno, organización automática de memory.md en segundo plano y reescritura cuando se llena; Meeting, Graph View, publicación y Telegram de otros usuarios sin memoria global.
 - Pensamientos propios del agente en `.agent/memory/thoughts.md` (qué notó, avisó, preguntó o propuso, con fecha), siempre presente, con límite, reorganizados en cada guardado y usados como contexto en todos los chats del Owner.
+- Registrar sin confirmar por módulo (Configuraciones → IA; Salud, Gimnasio y Rutina, apagado por defecto): los registros del día pedidos desde la app o Telegram se guardan sin preguntar; borrar, los ajustes y lo que corre solo siguen pidiendo confirmación.
 - Confirmaciones y planes con Confirmar, Confirmar todos (sin volver a preguntar en ese pedido), Proponer otra cosa y Cancelar, en el chat y en Telegram; en Telegram, al tocar una opción, el mensaje pierde los botones, muestra lo elegido y sigue con el progreso; si la respuesta se escribe, el progreso sigue en un mensaje nuevo.
 - Biografía del Owner en `.agent/memory/biography.md`, escrita como un libro (capítulos por etapa, en prosa) con lo que cuenta y con alguna pregunta ocasional, usada como contexto en los chats del Owner.
 - Forma de hablar del Owner en `.agent/memory/talk.md`: el agente anota cómo escribe y le habla parecido.

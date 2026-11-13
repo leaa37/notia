@@ -13,6 +13,7 @@ pub mod agent_workspace;
 pub mod ai_actions;
 pub mod ai_tasks;
 pub mod ai_settings;
+pub mod auto_confirm;
 pub mod audio_devices;
 pub mod audio_resample;
 pub mod browser;

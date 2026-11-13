@@ -297,6 +297,11 @@ fn normalize_ai(value: &Value) -> Value {
         _ => "minimal",
     };
     let enabled = |key: &str| value.get(key).and_then(Value::as_bool) != Some(false);
+    let auto_confirm_ids = value
+        .get("autoConfirmAreas")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
     json!({
         "ollamaUrl": settings.ollama_url,
         "apiKey": settings.api_key,
@@ -308,6 +313,7 @@ fn normalize_ai(value: &Value) -> Value {
         "showPlan": enabled("showPlan"),
         "showReasoningSummary": enabled("showReasoningSummary"),
         "editProgressMessage": enabled("editProgressMessage"),
+        "autoConfirmAreas": crate::auto_confirm::normalize_area_ids(&auto_confirm_ids),
     })
 }
 
@@ -482,6 +488,12 @@ mod tests {
             "ia": { "selectedModel": "qwen3", "imageModel": " gemma3 " },
         }));
         assert_eq!(with_reader.config["ia"]["imageModel"], "gemma3");
+        assert_eq!(ai["autoConfirmAreas"], json!([]));
+        let records = normalize_library_config(&json!({
+            "contextDefaultsVersion": 1,
+            "ia": { "autoConfirmAreas": ["rutina", "finanzas", "salud", 3, "salud"] },
+        }));
+        assert_eq!(records.config["ia"]["autoConfirmAreas"], json!(["salud", "rutina"]));
     }
 
     #[test]

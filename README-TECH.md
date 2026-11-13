@@ -6891,7 +6891,7 @@ El runtime común expone `extract_document_facts` para devolver candidatos expl�
 
 ### Política de autoaplicación de cambios de bajo riesgo
 
-> **Retirada:** la autoaplicación se eliminó al mover el agente a Rust, porque los previews del backend no informan nivel de riesgo. Todo cambio requiere confirmación visible. El párrafo siguiente describe el comportamiento anterior.
+> **Retirada:** la autoaplicación se eliminó al mover el agente a Rust, porque los previews del backend no informan nivel de riesgo. Todo cambio requiere confirmación visible. El párrafo siguiente describe el comportamiento anterior. Desde el 2026-11-13, la única excepción es «Registrar sin confirmar» por módulo: ver «Registrar sin confirmar por módulo» al final del documento.
 
 La preferencia `notia:ai-auto-apply-low-risk:v1` se guarda por biblioteca y está desactivada por defecto. Si el usuario la activa, `ChatWorkspaceView` solo acepta automáticamente un preview de un único documento cuyo riesgo tipado sea `low`, con hunks concretos y acción `apply-all`; el preview y la validación de revisión siguen existiendo. Renombrados, borrados, operaciones multiarchivo, Task Manager y Finanzas no entran en esta excepción y mantienen confirmación visible.
 
@@ -13451,3 +13451,38 @@ En **Configuraciones → IA** hay dos selectores: **Modelo de Ollama**, el que r
   - `an_image_the_image_model_cannot_read_stops_the_call_with_its_name`.
 - Frontend: `npx tsc --noEmit -p tsconfig.app.json` sin errores, eslint de los archivos tocados sin errores y `npx vitest run` con 149 archivos y 755 pruebas (2 nuevas en `AiModelSelect.test.tsx`).
 - **No probado:** con modelos reales (Ollama local o en la nube), con un bot de Telegram real, en Windows y en Android (`cargo check --target aarch64-linux-android` no se corrió: los cambios están en código común, sin `cfg` de plataforma).
+
+## Registrar sin confirmar por módulo (2026-11-13)
+
+Pedido del usuario: que registrar agua, una comida o una serie no pida confirmación. Es la única excepción a «todo cambio requiere confirmación visible» (ver «Política de autoaplicación de cambios de bajo riesgo»).
+
+- **Configuración.** `ia.autoConfirmAreas` en `.notia/notiaConfig.json`, por biblioteca y apagado por defecto (`[]`).
+  - `normalize_ai` (`library_config.rs`) solo conserva `salud`, `gimnasio` y `rutina`, una vez cada uno y en ese orden (`auto_confirm::normalize_area_ids`).
+  - En el frontend, `AiPreferences.autoConfirmAreas` es opcional y viaja con el resto de las preferencias de IA.
+- **Política** (`backend-core/src/auto_confirm.rs`). `AutoConfirm::for_request(areas, request)` devuelve la política vacía si el pedido no lo escribió una persona desde la app o Telegram: canal distinto de `App`/`Telegram` (Meeting, publicación), `autonomous`, `scheduled_action` (Acciones IA), `webhook_call` o `ai_task`. Los registros que cuentan:
+
+| Módulo | Herramientas |
+|---|---|
+| Salud | `log_meal`, `update_meal`, `log_water`, `log_weight`, `log_steps`, `log_sleep`, `save_body_measurement` |
+| Gimnasio | `control_gym_session`, `log_gym_workout` |
+| Rutina | `set_routine_task_status`, `set_routine_completions` |
+
+  - No cuentan los borrados (`delete_*`) ni los ajustes: `save_health_profile`, `set_weight_goal`, `set_health_plan`, rutinas, equipamiento y fichas de Gimnasio, y crear o cambiar la rutina de hábitos.
+  - Un test verifica que cada herramienta de la lista sea de escritura de su área y que ninguna borre.
+- **Motor** (`agent.rs`). `AgentRuntimeOptions.auto_confirm` se arma en cada turno (`backend_runtime.rs`, `auto_confirm_areas` lee la configuración de la biblioteca; si no se puede leer, no autoconfirma nada).
+  - Una llamada cubierta, con `requires_confirmation`, hace lo mismo que con «Confirmar todos»: el preview valida la entrada (una entrada inválida vuelve al modelo como error, igual que antes), no se emite `ConfirmationRequired` y se ejecuta con `execute_confirmed` usando ese preview.
+  - La decisión lleva `approve_all: false`: solo aprueba esa llamada, no el resto del turno.
+  - Las continuaciones se rearman con la configuración vigente.
+- **Comidas.** `log_meal` puede crear la receta (con revisión de IA) cuando no existe en Recetas. Autoconfirmado, eso también ocurre sin preguntar; la respuesta del asistente lo informa.
+- **Interfaz** (`SettingsModal.tsx`): tarjeta «Registrar sin confirmar» en Configuraciones → IA, con un interruptor por módulo y la descripción de lo que incluye. La lista de herramientas la decide Rust; la interfaz solo envía los módulos elegidos.
+
+**Validaciones (2026-11-13, Linux):**
+- `cargo test -p notia-backend-core`: 822 aprobados y 1 fallido, `image_generation::tests::only_sexual_content_with_minors_is_refused`, que falla desde antes de este cambio. Los nuevos:
+  - `auto_confirm::tests::only_records_of_the_three_modules_are_offered_and_none_deletes`;
+  - `auto_confirm::tests::the_library_choice_is_normalized`;
+  - `agent::tests::a_record_the_library_saves_without_asking_runs_at_once`;
+  - `agent::tests::deleting_other_modules_and_runs_nobody_watches_still_ask` (borrar, módulo no elegido, corrida autónoma, publicación y Telegram);
+  - la normalización de `autoConfirmAreas` en `library_config`.
+- `cargo test -p notia-app`: 468 aprobados y los 2 fallidos de antes (`meeting::tests::a_meeting_whose_session_is_gone_finishes_with_its_lines` y `services::telegram_service::tests::endpoint_accepts_standard_bot_token_shape`).
+- Frontend: `tsc` sin errores, eslint de los archivos tocados sin errores y `vitest` con 755 aprobados.
+- **No probado:** con un modelo real ni con Telegram real, en Windows ni en Android. Los cambios están en código común, sin `cfg` de plataforma.

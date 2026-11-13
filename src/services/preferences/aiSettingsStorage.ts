@@ -22,6 +22,8 @@ export interface AiPreferences {
   selectedModel: string
   /** Model that reads the images; empty sends them to `selectedModel`. */
   imageModel?: string
+  /** Modules whose records the assistant saves without asking (`salud`, `gimnasio`, `rutina`). */
+  autoConfirmAreas?: string[]
   thinkingEnabled: boolean
   thinkingLevel: AiThinkingLevel
   progressMode?: AiProgressMode
@@ -37,6 +39,7 @@ const DEFAULT_AI_PREFERENCES: AiPreferences = {
   apiKey: '',
   selectedModel: '',
   imageModel: '',
+  autoConfirmAreas: [],
   thinkingEnabled: true,
   thinkingLevel: 'medium',
   progressMode: 'minimal',

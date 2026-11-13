@@ -1015,6 +1015,8 @@ En Linux, el servidor se compila desde `src-tauri` con `cargo build --release --
 
 Cada subcarpeta de `bibliotecas` se agrega sola al arrancar y, si no hay ninguna, Notia crea `Biblioteca`. Para sumar otra, creá la carpeta y reiniciá el servidor. En este modo no se usan `--data-dir` ni `--add-library`, así nada queda afuera. Respaldar o mover la carpeta alcanza para llevarse todo.
 
+**Zona horaria.** El servidor calcula «hoy», la Agenda, los registros del día y la hora que conoce el asistente con la zona horaria del sistema donde corre. En Linux es la variable `TZ` (por ejemplo `TZ=America/Argentina/Buenos_Aires`, con el paquete `tzdata` instalado); sin ella suele ser UTC, y lo que hacés a la noche queda en el día siguiente. Las Acciones IA usan además la zona del lugar elegido en Configuraciones → Clima.
+
 ### Búsqueda de Archivos
 
 | Campo | Descripción |
@@ -1248,6 +1250,7 @@ Notia guarda las preferencias en su backend: las del dispositivo en los datos de
 - **API Key**: opcional, para servicios que requieren autenticación.
 - **Modelo de Ollama**: el que resuelve los pedidos y usa las herramientas. Cada modelo muestra si admite Thinking, Vision (imágenes) y Tools.
 - **Modelo para imágenes**: lee las fotos, capturas y PDF escaneados que mandás (en el chat, por Telegram o por WhatsApp) y le pasa al modelo de Ollama lo que ve: el texto transcripto (tickets, resúmenes, documentos) y una descripción (por ejemplo, el plato y su porción). Así el modelo de Ollama puede ser uno que no ve imágenes. Con **El mismo modelo** (el valor por defecto), las imágenes van directo al modelo de Ollama, como antes. Cada imagen se lee una sola vez mientras Notia está abierta; el modelo que elijas tiene que tener Vision, y si no, Configuraciones te avisa. Leer InkMath y convertir la escritura a mano también usan este modelo. No es el modelo que genera imágenes (Configuraciones → Imágenes).
+- **Registrar sin confirmar**: un interruptor por módulo (Salud, Gimnasio y Rutina, apagados por defecto). Encendido, lo que pedís desde la app o Telegram se guarda sin preguntar y el asistente te cuenta qué registró: en Salud, comidas (y corregirlas), agua, peso, pasos, sueño y mediciones; en Gimnasio, el entrenamiento en curso y registrar uno hecho; en Rutina, marcar las tareas y hábitos del día. Borrar, cambiar ajustes (perfil, plan, rutinas, equipamiento, fichas) y lo que corre solo (Acciones IA, Tareas IA, webhook) siguen pidiendo confirmación. Lo de las comidas incluye crear la receta cuando no existe.
 - **Feedback del agente**: estándar, mínimo, detallado o desactivado; el plan y el resumen de enfoque se pueden ocultar.
 
 Las ediciones documentales se proponen con diff por hunks, revisión exacta, confirmación y undo por `operationId`. La memoria activa vive en `.agent/memory/memory.md`; los chats persistentes del Owner y Telegram vinculado al Owner pueden cargarla y guardarla, mientras Meeting y Telegram vinculado a otro usuario no la cargan ni la guardan. La búsqueda web de Ollama solo admite consultas públicas sanitizadas y no envía claves, datos personales ni contenido del workspace.
@@ -1358,7 +1361,7 @@ Notia ejecuta ahora toda la lógica de la aplicación en su motor nativo; la int
 
 - **Telegram** funciona aunque la ventana de Notia esté cerrada, y también en Android. Si le enviás al bot un PDF escaneado (sin texto), te pide fotos de las páginas.
 - **Notas editadas por el agente**: si el agente modifica una nota que tenés abierta, Notia la recarga. Si además tenías cambios sin guardar, al guardar te avisa del conflicto en lugar de pisar la versión del agente.
-- **Confirmaciones**: ya no existe la opción de aplicar automáticamente los cambios de bajo riesgo; todo cambio del agente pide confirmación. En los planes del agente se quitó **Reintentar paso fallido**; **Continuar TO-DO** y **Cancelar** siguen disponibles.
+- **Confirmaciones**: ya no existe la opción de aplicar automáticamente los cambios de bajo riesgo; todo cambio del agente pide confirmación, salvo los registros de los módulos que elijas en **Registrar sin confirmar** (Configuraciones → IA). En los planes del agente se quitó **Reintentar paso fallido**; **Continuar TO-DO** y **Cancelar** siguen disponibles.
 - **Preferencias por dispositivo**: el prompt elegido del agente, las opciones de voz y la publicación de Task Manager se guardan en cada dispositivo, no en la biblioteca. Las elecciones anteriores se conservan.
 - **Publicación de Task Manager**: en Windows se vuelve a publicar sola al abrir Notia, con tema oscuro.
 - **Task Manager**: un ticket se mueve a Completadas o Canceladas solo cuando cambiás su estado; una subtarea finalizada que guardás junto a su tarea padre queda donde está. Los comentarios usan el formato con fecha, hora y autor descrito en **Task Manager**.

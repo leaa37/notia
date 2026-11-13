@@ -259,6 +259,8 @@ pub struct AgentRuntimeOptions {
     /// Model that decides whether a reply without tools only announces a
     /// step; without it, fixed phrases decide (`contains_pending_action`).
     pub continuation_judge: Option<super::continuation::ContinuationJudge>,
+    /// Records the library saves without asking (see `auto_confirm`).
+    pub auto_confirm: super::auto_confirm::AutoConfirm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +281,7 @@ impl Default for AgentRuntimeOptions {
             stream_final_response: true,
             projection: ToolCatalogProjection::Full,
             continuation_judge: None,
+            auto_confirm: super::auto_confirm::AutoConfirm::default(),
         }
     }
 }
@@ -1175,7 +1178,10 @@ fn run_agent_inner(
                         Err(error) => return Err(error),
                     }
                 }
-                if tool.requires_confirmation && authorization.is_ok() && rejected_input.is_none() && !approve_all {
+                // A record the library saves without asking goes on as if
+                // the person had confirmed it (see `auto_confirm`).
+                let auto_confirmed = tool.requires_confirmation && options.auto_confirm.covers(&call.name);
+                if tool.requires_confirmation && authorization.is_ok() && rejected_input.is_none() && !approve_all && !auto_confirmed {
                     if let Some(interactions) = interactions {
                         let preview = preflight_preview.flatten();
                         state.store_continuation(
@@ -1244,7 +1250,8 @@ fn run_agent_inner(
                         )?;
                     }
                 }
-                let confirmed = approve_all && (tool.requires_confirmation || call.name == "request_user_confirmation");
+                let confirmed =
+                    auto_confirmed || (approve_all && (tool.requires_confirmation || call.name == "request_user_confirmation"));
                 let run = || {
                     if approved_plan {
                         return Ok(approved_plan_result(&call));
@@ -1254,7 +1261,8 @@ fn run_agent_inner(
                             operation_id: call.id.clone(),
                             accepted: true,
                             hunk_ids: Vec::new(),
-                            approve_all: true,
+                            // A record saved without asking approves only itself.
+                            approve_all,
                             suggestion: None,
                         };
                         return executor.execute_confirmed(&request.context, &call, &decision, preflight_preview.clone().flatten().as_ref());
@@ -3362,6 +3370,74 @@ mod tests {
                 ..
             } if operation_id == "operation-1"
         )));
+    }
+
+    /// A run that calls `tool` (which asks for confirmation) and then answers.
+    fn run_with_record(tool_name: &str, request: &mut AgentRequest, options: &AgentRuntimeOptions) -> (Result<AgentResponse, BackendError>, usize, Vec<BackendEvent>) {
+        let call = |content: &str, calls: Vec<ProviderToolCall>| ProviderResponse {
+            message: ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: content.into(),
+                images: Vec::new(),
+                tool_calls: calls,
+                tool_name: None,
+            },
+        };
+        let provider = Provider {
+            responses: Mutex::new(vec![
+                call("", vec![ProviderToolCall { id: "operation-1".into(), name: tool_name.into(), arguments: serde_json::json!({ "ml": 250 }) }]),
+                call("Listo, registré el agua.", Vec::new()),
+            ]),
+            calls: Mutex::new(0),
+        };
+        let executor = Executor {
+            executions: Mutex::new(0),
+            result: ToolResult { call_id: String::new(), ok: true, changed: true, data: None, error: None, preview: None },
+        };
+        request.tools = vec![tool(tool_name, false)];
+        request.tools[0].requires_confirmation = true;
+        let events = VecEventSink::default();
+        let result = run_agent(&provider, &executor, &NoopAgentState, &events, request, &principal(), &RequestControl::new(None), options);
+        let executions = *executor.executions.lock().expect("executions");
+        (result, executions, events.events())
+    }
+
+    #[test]
+    fn a_record_the_library_saves_without_asking_runs_at_once() {
+        let mut request = request(Vec::new());
+        let mut options = AgentRuntimeOptions::default();
+        options.auto_confirm = crate::auto_confirm::AutoConfirm::for_request(&["salud"], &request);
+        let (result, executions, events) = run_with_record("log_water", &mut request, &options);
+        assert_eq!(result.expect("answer").response.markdown, "Listo, registré el agua.");
+        assert_eq!(executions, 1);
+        assert!(!events.iter().any(|event| matches!(event, BackendEvent::ConfirmationRequired { .. })));
+    }
+
+    #[test]
+    fn deleting_other_modules_and_runs_nobody_watches_still_ask() {
+        // Deleting, even in a chosen module.
+        let mut request = request(Vec::new());
+        let mut options = AgentRuntimeOptions::default();
+        options.auto_confirm = crate::auto_confirm::AutoConfirm::for_request(&["salud", "gimnasio", "rutina"], &request);
+        let (result, executions, _) = run_with_record("delete_health_record", &mut request, &options);
+        assert_eq!(result.expect_err("asks").code, BackendErrorCode::Conflict);
+        assert_eq!(executions, 0);
+        // A module that was not chosen.
+        options.auto_confirm = crate::auto_confirm::AutoConfirm::for_request(&["gimnasio"], &request);
+        let (result, executions, _) = run_with_record("log_water", &mut request, &options);
+        assert_eq!(result.expect_err("asks").code, BackendErrorCode::Conflict);
+        assert_eq!(executions, 0);
+        // A run nobody is watching: a webhook call, Notia's own run, the
+        // published board.
+        let mut unwatched = request.clone();
+        unwatched.autonomous = true;
+        assert_eq!(crate::auto_confirm::AutoConfirm::for_request(&["salud"], &unwatched), Default::default());
+        let mut published = request.clone();
+        published.context.channel = BackendChannel::Published;
+        assert_eq!(crate::auto_confirm::AutoConfirm::for_request(&["salud"], &published), Default::default());
+        let mut telegram = request.clone();
+        telegram.context.channel = BackendChannel::Telegram;
+        assert!(crate::auto_confirm::AutoConfirm::for_request(&["salud"], &telegram).covers("log_meal"));
     }
 
     #[test]

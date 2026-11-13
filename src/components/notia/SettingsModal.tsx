@@ -84,6 +84,12 @@ import './settings/settings.css'
 const OWNER_USER_ID = 'user-owner'
 const OWNER_ROLE_ID = 'role-owner'
 const THINKING_LEVEL_LABELS = { low: 'Bajo', medium: 'Medio', high: 'Alto' } as const
+/** Modules whose records may be saved without asking; Rust decides which tools count. */
+const AUTO_CONFIRM_MODULES = [
+  { id: 'salud', label: 'Salud', description: 'Comidas (y corregirlas), agua, peso, pasos, sueño y mediciones. No el perfil, el objetivo ni el plan.' },
+  { id: 'gimnasio', label: 'Gimnasio', description: 'El entrenamiento en curso (empezar, series, terminar) y registrar uno hecho. No las rutinas, el equipamiento ni las fichas.' },
+  { id: 'rutina', label: 'Rutina', description: 'Marcar las tareas y hábitos del día. No crear ni cambiar la rutina.' },
+] as const
 const FINANCE_DELETED_DATA = ['Cuentas', 'Categorías personalizadas', 'Movimientos', 'Tickets', 'Productos y precios', 'Sueldos', 'Ahorro', 'Cuotas', 'Inversiones', 'Archivos de extracción']
 
 interface SettingsModalProps {
@@ -194,6 +200,7 @@ export function SettingsModal({
   const [apiKeyDraft, setApiKeyDraft] = useState(incomingAiPreferences.apiKey)
   const [selectedModelDraft, setSelectedModelDraft] = useState(incomingAiPreferences.selectedModel)
   const [imageModelDraft, setImageModelDraft] = useState(incomingAiPreferences.imageModel ?? '')
+  const [autoConfirmAreasDraft, setAutoConfirmAreasDraft] = useState(incomingAiPreferences.autoConfirmAreas ?? [])
   const [thinkingEnabledDraft, setThinkingEnabledDraft] = useState(incomingAiPreferences.thinkingEnabled)
   const [thinkingLevelDraft, setThinkingLevelDraft] = useState(incomingAiPreferences.thinkingLevel)
   const [progressModeDraft, setProgressModeDraft] = useState(incomingAiPreferences.progressMode)
@@ -292,6 +299,7 @@ export function SettingsModal({
     apiKey: apiKeyDraft,
     selectedModel: selectedModelDraft,
     imageModel: imageModelDraft,
+    autoConfirmAreas: autoConfirmAreasDraft,
     thinkingEnabled: thinkingEnabledDraft,
     thinkingLevel: thinkingLevelDraft,
     progressMode: progressModeDraft,
@@ -311,6 +319,7 @@ export function SettingsModal({
     setApiKeyDraft(incomingAiPreferences.apiKey)
     setSelectedModelDraft(incomingAiPreferences.selectedModel)
     setImageModelDraft(incomingAiPreferences.imageModel ?? '')
+    setAutoConfirmAreasDraft(incomingAiPreferences.autoConfirmAreas ?? [])
     setThinkingEnabledDraft(incomingAiPreferences.thinkingEnabled)
     setThinkingLevelDraft(incomingAiPreferences.thinkingLevel)
     setProgressModeDraft(incomingAiPreferences.progressMode)
@@ -322,6 +331,7 @@ export function SettingsModal({
     incomingAiPreferences.ollamaUrl,
     incomingAiPreferences.selectedModel,
     incomingAiPreferences.imageModel,
+    incomingAiPreferences.autoConfirmAreas,
     incomingAiPreferences.thinkingEnabled,
     incomingAiPreferences.thinkingLevel,
     incomingAiPreferences.progressMode,
@@ -1264,6 +1274,25 @@ export function SettingsModal({
                         </div>
                       </SettingsRow>
                     ) : null}
+                  </SettingsCard>
+                  <SettingsCard title="Registrar sin confirmar">
+                    <SettingsNotice tone="idle">Lo que pedís desde la app o Telegram en estos módulos se guarda sin preguntar, y el asistente te cuenta qué registró. Borrar, cambiar ajustes y lo que corre solo (Acciones IA, Tareas IA, webhook) siguen pidiendo confirmación.</SettingsNotice>
+                    {AUTO_CONFIRM_MODULES.map((module) => (
+                      <SettingsRow key={module.id} inline label={module.label} htmlFor={`notia-settings-auto-confirm-${module.id}`} description={module.description}>
+                        <SettingsSwitch
+                          id={`notia-settings-auto-confirm-${module.id}`}
+                          label={`Registrar sin confirmar en ${module.label}`}
+                          checked={autoConfirmAreasDraft.includes(module.id)}
+                          onChange={(checked) => {
+                            const next = AUTO_CONFIRM_MODULES
+                              .filter((item) => (item.id === module.id ? checked : autoConfirmAreasDraft.includes(item.id)))
+                              .map((item) => item.id)
+                            setAutoConfirmAreasDraft(next)
+                            onAiPreferencesChange({ ...draftAiPreferences, autoConfirmAreas: next })
+                          }}
+                        />
+                      </SettingsRow>
+                    ))}
                   </SettingsCard>
                   <SettingsCard title="Feedback del agente">
                     <SettingsRow label="Detalle del progreso">
