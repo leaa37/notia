@@ -1076,6 +1076,12 @@ fn run_agent_inner(
                     && can_safely_retry(value)
                     && retry_count < options.max_tool_retries;
             }
+            // With «Registrar sin confirmar» on, the model's own asks (a plan,
+            // a confirmation) do not stop the run, as with «Confirmar todos»:
+            // the person chose not to approve records, and every change that
+            // is not one still asks in its own gate below.
+            let model_ask_skipped = options.auto_confirm.is_on()
+                && (is_plan_tool(&call.name) || call.name == "request_user_confirmation");
             if should_execute && authorization.is_ok() {
                 if let Some(interactions) = interactions {
                     if call.name == "request_user_clarification" {
@@ -1103,7 +1109,7 @@ fn run_agent_inner(
                         )?;
                         return Err(interaction_conflict(&call.id));
                     }
-                    if call.name == "request_user_confirmation" && !approve_all {
+                    if call.name == "request_user_confirmation" && !approve_all && !model_ask_skipped {
                         let operation = interactions.next_operation_token(&request.context, &call.id);
                         let preview = confirmation_preview_from_call(&call, &operation)?;
                         state.store_continuation(
@@ -1130,7 +1136,7 @@ fn run_agent_inner(
                         )?;
                         return Err(interaction_conflict(&call.id));
                     }
-                    if is_plan_tool(&call.name) && !approve_all {
+                    if is_plan_tool(&call.name) && !approve_all && !model_ask_skipped {
                         let operation = interactions.next_operation_token(&request.context, &call.id);
                         let plan = plan_from_call(&call)?;
                         state.store_continuation(
@@ -1236,7 +1242,8 @@ fn run_agent_inner(
                 )?;
                 // With «Confirmar todos» a plan counts as approved and a change
                 // runs as confirmed, with the preview it was checked against.
-                let approved_plan = approve_all && is_plan_tool(&call.name);
+                let approved_plan = (approve_all || model_ask_skipped) && is_plan_tool(&call.name);
+                let approved_by = if approve_all { PlanApproval::ConfirmAll } else { PlanApproval::RecordsWithoutAsking };
                 if approved_plan {
                     if let Ok(plan) = plan_from_call(&call) {
                         emit(
@@ -1245,16 +1252,17 @@ fn run_agent_inner(
                             &mut event_count,
                             BackendEvent::AssistantNote {
                                 request_id: request.context.request_id.clone(),
-                                text: approved_plan_note(&plan),
+                                text: approved_plan_note(&plan, approved_by),
                             },
                         )?;
                     }
                 }
-                let confirmed =
-                    auto_confirmed || (approve_all && (tool.requires_confirmation || call.name == "request_user_confirmation"));
+                let confirmed = auto_confirmed
+                    || (approve_all && (tool.requires_confirmation || call.name == "request_user_confirmation"))
+                    || (model_ask_skipped && call.name == "request_user_confirmation");
                 let run = || {
                     if approved_plan {
-                        return Ok(approved_plan_result(&call));
+                        return Ok(approved_plan_result(&call, approved_by));
                     }
                     if confirmed {
                         let decision = ConfirmationDecision {
@@ -1733,8 +1741,17 @@ fn is_plan_tool(name: &str) -> bool {
     matches!(name, "set_agent_execution_plan" | "set_task_execution_plan" | "create_agent_plan" | "update_agent_plan")
 }
 
-/// Result of a plan approved beforehand with «Confirmar todos».
-fn approved_plan_result(call: &ToolCall) -> ToolResult {
+/// Why a plan went on without the person approving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanApproval {
+    /// «Confirmar todos» earlier in the request.
+    ConfirmAll,
+    /// «Registrar sin confirmar» is on for some module.
+    RecordsWithoutAsking,
+}
+
+/// Result of a plan approved beforehand.
+fn approved_plan_result(call: &ToolCall, approved_by: PlanApproval) -> ToolResult {
     let plan = plan_from_call(call).ok();
     ToolResult {
         call_id: call.id.clone(),
@@ -1742,7 +1759,10 @@ fn approved_plan_result(call: &ToolCall) -> ToolResult {
         changed: false,
         data: Some(serde_json::json!({
             "accepted": true,
-            "approvedBy": "confirmar-todos",
+            "approvedBy": match approved_by {
+                PlanApproval::ConfirmAll => "confirmar-todos",
+                PlanApproval::RecordsWithoutAsking => "registrar-sin-confirmar",
+            },
             "planId": plan.as_ref().map(|plan| plan.plan_id.clone()),
             "stepIds": plan.as_ref().map(|plan| plan.steps.iter().map(|step| step.id.clone()).collect::<Vec<_>>()),
         })),
@@ -1751,8 +1771,8 @@ fn approved_plan_result(call: &ToolCall) -> ToolResult {
     }
 }
 
-/// The plan approved with «Confirmar todos», shown to the person as a note.
-fn approved_plan_note(plan: &super::ExecutionPlan) -> String {
+/// The plan approved beforehand, shown to the person as a note.
+fn approved_plan_note(plan: &super::ExecutionPlan, approved_by: PlanApproval) -> String {
     let steps = plan
         .steps
         .iter()
@@ -1760,7 +1780,10 @@ fn approved_plan_note(plan: &super::ExecutionPlan) -> String {
         .map(|(index, step)| format!("{}. {}", index + 1, step.label))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("Plan (aprobado con «Confirmar todos»):\n{steps}")
+    match approved_by {
+        PlanApproval::ConfirmAll => format!("Plan (aprobado con «Confirmar todos»):\n{steps}"),
+        PlanApproval::RecordsWithoutAsking => format!("Plan (sigue sin pedir aprobación: «Registrar sin confirmar» está activo; lo que no sea un registro pide su confirmación):\n{steps}"),
+    }
 }
 
 fn plan_from_call(call: &ToolCall) -> Result<super::ExecutionPlan, BackendError> {
@@ -2500,9 +2523,9 @@ mod tests {
             arguments: serde_json::json!({"steps": ["Mover Mercado Libre", "Mover bancos"]}),
             round: 1,
         };
-        let result = approved_plan_result(&plan);
+        let result = approved_plan_result(&plan, PlanApproval::ConfirmAll);
         assert!(result.ok && result.data.as_ref().is_some_and(|data| data["accepted"] == true));
-        let note = approved_plan_note(&plan_from_call(&plan).expect("plan"));
+        let note = approved_plan_note(&plan_from_call(&plan).expect("plan"), PlanApproval::ConfirmAll);
         assert!(note.contains("Confirmar todos") && note.contains("2. Mover bancos"));
         assert!(is_plan_tool("update_agent_plan") && !is_plan_tool("save_finance_transaction"));
     }
@@ -3411,6 +3434,88 @@ mod tests {
         assert_eq!(result.expect("answer").response.markdown, "Listo, registré el agua.");
         assert_eq!(executions, 1);
         assert!(!events.iter().any(|event| matches!(event, BackendEvent::ConfirmationRequired { .. })));
+    }
+
+    /// Runs, as Telegram does (with interactions), a model that calls
+    /// `turns` one per round (name, needs confirmation) and then answers
+    /// «Listo.».
+    fn run_turns(turns: &[(&str, bool)], options: &AgentRuntimeOptions) -> (AgentRunResult, usize, Vec<BackendEvent>) {
+        let call = |content: &str, calls: Vec<ProviderToolCall>| ProviderResponse {
+            message: ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: content.into(),
+                images: Vec::new(),
+                tool_calls: calls,
+                tool_name: None,
+            },
+        };
+        let arguments = |name: &str| match name {
+            "set_agent_execution_plan" => serde_json::json!({ "steps": ["Registrar el agua", "Registrar la comida"] }),
+            "request_user_confirmation" => serde_json::json!({ "question": "¿Registro 250 ml de agua?" }),
+            _ => serde_json::json!({ "ml": 250 }),
+        };
+        let mut responses = turns
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| call("", vec![ProviderToolCall { id: format!("operation-{index}"), name: (*name).into(), arguments: arguments(name) }]))
+            .collect::<Vec<_>>();
+        responses.push(call("Listo.", Vec::new()));
+        let provider = Provider { responses: Mutex::new(responses), calls: Mutex::new(0) };
+        let executor = Executor {
+            executions: Mutex::new(0),
+            result: ToolResult { call_id: String::new(), ok: true, changed: true, data: None, error: None, preview: None },
+        };
+        let mut request = request(Vec::new());
+        request.tools = turns
+            .iter()
+            .map(|(name, confirm)| {
+                let mut definition = tool(name, false);
+                definition.requires_confirmation = *confirm;
+                definition
+            })
+            .collect();
+        let events = VecEventSink::default();
+        let state = InteractionState::default();
+        let generations = crate::OperationGenerationCache::default();
+        let interactions = crate::InteractionRuntime::new(&state, None, None, &generations);
+        let result = run_agent_with_interaction(&provider, &executor, &NoopAgentState, &events, &request, &principal(), &RequestControl::new(None), options, &interactions)
+            .expect("the run answers or waits");
+        let executions = *executor.executions.lock().expect("executions");
+        (result, executions, events.events())
+    }
+
+    /// With «Registrar sin confirmar» on, the model's own plan or
+    /// confirmation does not stop a record (Telegram kept asking for them);
+    /// a change that is not a record still asks after the plan, and with
+    /// nothing on the plan still waits for the person.
+    #[test]
+    fn the_models_own_plan_or_confirmation_does_not_stop_records() {
+        let mut on = AgentRuntimeOptions::default();
+        on.auto_confirm = crate::auto_confirm::AutoConfirm::for_request(&["salud"], &request(Vec::new()));
+        let answered = |result: &AgentRunResult| matches!(result, AgentRunResult::Completed(response) if response.response.markdown == "Listo.");
+        let waiting = |result: &AgentRunResult, state: OperationState| matches!(result, AgentRunResult::Waiting(status) if status.state == state);
+
+        let (result, executions, events) = run_turns(&[("set_agent_execution_plan", false), ("log_water", true)], &on);
+        assert!(answered(&result), "{result:?}");
+        assert_eq!(executions, 1, "only the record runs; the runtime answers the plan");
+        assert!(events.iter().any(|event| matches!(event, BackendEvent::AssistantNote { text, .. } if text.contains("Registrar sin confirmar") && text.contains("1. Registrar el agua"))));
+
+        let (result, executions, _) = run_turns(&[("request_user_confirmation", false), ("log_water", true)], &on);
+        assert!(answered(&result), "{result:?}");
+        assert_eq!(executions, 2);
+
+        // Deleting after a plan still asks in its own gate.
+        let (result, executions, _) = run_turns(&[("set_agent_execution_plan", false), ("delete_health_record", true)], &on);
+        assert!(waiting(&result, OperationState::WaitingConfirmation), "{result:?}");
+        assert_eq!(executions, 0);
+
+        // Nothing on: the plan and the model's confirmation wait.
+        let off = AgentRuntimeOptions::default();
+        let (result, executions, _) = run_turns(&[("set_agent_execution_plan", false), ("log_water", true)], &off);
+        assert!(waiting(&result, OperationState::WaitingPlan), "{result:?}");
+        assert_eq!(executions, 0);
+        let (result, _, _) = run_turns(&[("request_user_confirmation", false), ("log_water", true)], &off);
+        assert!(waiting(&result, OperationState::WaitingConfirmation), "{result:?}");
     }
 
     #[test]

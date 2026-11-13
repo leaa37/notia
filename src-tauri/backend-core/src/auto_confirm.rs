@@ -69,6 +69,13 @@ impl AutoConfirm {
         Self { areas }
     }
 
+    /// Whether some module saves its records without asking. Then the
+    /// model's own asks (a plan, `request_user_confirmation`) do not stop a
+    /// run either: each change that is not a record still asks in its gate.
+    pub fn is_on(&self) -> bool {
+        !self.areas.is_empty()
+    }
+
     /// Whether the call of `tool_name` saves without asking.
     pub fn covers(&self, tool_name: &str) -> bool {
         self.areas.iter().any(|area| records_of(*area).contains(&tool_name))
