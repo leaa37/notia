@@ -13,5 +13,7 @@ pub const WHATSAPP_WAIT: Duration = Duration::from_secs(60);
 /// sends its menu in a burst of messages within seconds, and a task talks
 /// with it turn after turn.
 pub const WHATSAPP_TASK_WAIT: Duration = Duration::from_secs(15);
-/// The wait of a new Telegram request.
-pub const TELEGRAM_WAIT: Duration = Duration::from_secs(10);
+/// The wait of a new Telegram request: enough for a long text Telegram
+/// splits or messages sent together; slower messages are separate requests.
+/// Albums keep their own window (`ALBUM_WINDOW` in the Telegram worker).
+pub const TELEGRAM_WAIT: Duration = Duration::from_secs(1);
