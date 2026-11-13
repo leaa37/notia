@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::body::parse_body_svg;
-use super::change::{apply_exercise_edit, plan_change, saved_equipment, Clock, ExerciseEdit, GymMutation, SetField, StoreOp};
+use super::change::{apply_exercise_edit, plan_change, saved_equipment, Clock, ExerciseEdit, GymMutation, SetField, StoreOp, WatchSession};
 use super::markdown::{parse_equipment, parse_exercise, render_equipment, render_exercise};
 use super::view::{build_view, exercise_detail, GymQuery, Screen};
 use super::*;
@@ -59,7 +59,10 @@ fn apply(data: &mut GymData, catalog: &Catalog, mutation: GymMutation, now_ms: i
             StoreOp::DeleteRoutine(id) => data.routines.retain(|routine| routine.id != id),
             StoreOp::PutOwned(owned) => data.owned = owned.into_iter().collect(),
             StoreOp::PutSession(session) => data.session = session,
-            StoreOp::PutWorkout(workout) => data.workouts.push(workout),
+            StoreOp::PutWorkout(workout) => match data.workouts.iter_mut().find(|existing| existing.id == workout.id) {
+                Some(existing) => *existing = workout,
+                None => data.workouts.push(workout),
+            },
             StoreOp::DeleteWorkout(id) => data.workouts.retain(|workout| workout.id != id),
         }
     }
@@ -216,6 +219,9 @@ fn the_panel_counts_the_week_and_the_muscles() {
         sets: 3,
         volume: 1800.0,
         exercises: vec![WorkoutExercise { exercise: "bench_press".into(), sets: vec![SetPlan::default(); 3] }],
+        watch_id: None,
+        avg_bpm: None,
+        max_bpm: None,
     };
     // Jueves 1 de octubre de 2026; el lunes 28 de septiembre entrenó, y las dos semanas anteriores también dos veces.
     let now = 1_790_900_000_000; // 2026-10-01 ~ 22:13 UTC
@@ -570,6 +576,9 @@ fn dump_preview_fixtures() {
                 sets: 15,
                 volume: 2400.0,
                 exercises: routine.items.iter().map(|item| WorkoutExercise { exercise: item.exercise.clone(), sets: item.sets.clone() }).collect(),
+                watch_id: None,
+                avg_bpm: None,
+                max_bpm: None,
             });
         }
     }
@@ -585,6 +594,9 @@ fn dump_preview_fixtures() {
         sets: 15,
         volume: 2400.0,
         exercises: routines[0].items.iter().map(|item| WorkoutExercise { exercise: item.exercise.clone(), sets: item.sets.clone() }).collect(),
+        watch_id: None,
+        avg_bpm: None,
+        max_bpm: None,
     });
     // Un entrenamiento en curso de la rutina del miércoles.
     let wednesday = &routines[1];
@@ -631,4 +643,53 @@ mod erased {
             serde_json::to_string(self).expect("json")
         }
     }
+}
+
+
+/// The watch's sessions complete the Notia workout they overlap (calories
+/// and pulse, keeping the sets and the minutes), add the rest as their own
+/// workouts, ignore walks, short or odd ones, and update instead of
+/// duplicating when imported again. A high sleeping pulse asks for a light
+/// day on the panel.
+#[test]
+fn the_watch_sessions_complete_or_add_workouts() {
+    let catalog = catalog();
+    let mut data = GymData::default();
+    let routine = apply(&mut data, &catalog, GymMutation::CreateRoutine, 0, "2026-10-01").expect("routine");
+    apply(&mut data, &catalog, GymMutation::AddExercise { routine_id: routine.clone(), exercise_id: "bench_press".into() }, 0, "2026-10-01");
+    // A 50-minute workout finished at 19:00 UTC on 1 Oct 2026.
+    let ended = 1_790_881_200_000;
+    apply(&mut data, &catalog, GymMutation::LogWorkout { routine_id: Some(routine.clone()), date: "2026-10-01".into(), minutes: 50.0, exercises: vec![WorkoutExercise { exercise: "bench_press".into(), sets: vec![SetPlan { weight: Some(60.0), reps: Some(8.0) }; 3] }] }, ended, "2026-10-01");
+    let notia = data.workouts[0].clone();
+    let session = |id: &str, kind: &str, date: &str, start: i64, end: i64| WatchSession { id: id.into(), kind: kind.into(), date: date.into(), start_ms: start, end_ms: end, kcal: Some(310.4), avg_bpm: Some(118.2), max_bpm: Some(151.0) };
+    let minute = 60_000;
+    let sessions = vec![
+        session("hc-1", "strength_training", "2026-10-01", ended - 48 * minute, ended + 2 * minute),
+        session("hc-2", "running", "2026-09-30", ended - 1_440 * minute, ended - 1_410 * minute),
+        session("hc-3", "walking", "2026-09-30", ended - 1_300 * minute, ended - 1_250 * minute),
+        session("hc-4", "running", "2026-09-30", ended - 1_200 * minute, ended - 1_197 * minute),
+        session("hc-2", "running", "2026-09-30", ended - 1_440 * minute, ended - 1_410 * minute),
+        session("hc-5", "biking", "2026-10-09", ended, ended + 40 * minute),
+    ];
+    apply(&mut data, &catalog, GymMutation::ImportWatchSessions { sessions: sessions.clone() }, ended, "2026-10-01");
+    assert_eq!(data.workouts.len(), 2, "{:?}", data.workouts);
+    let merged = data.workouts.iter().find(|workout| workout.id == notia.id).expect("merged");
+    assert_eq!((merged.watch_id.as_deref(), merged.kcal, merged.avg_bpm, merged.max_bpm), (Some("hc-1"), 310.0, Some(118.0), Some(151.0)));
+    assert_eq!((merged.minutes, merged.sets, &merged.exercises), (notia.minutes, notia.sets, &notia.exercises));
+    let run = data.workouts.iter().find(|workout| workout.watch_id.as_deref() == Some("hc-2")).expect("run");
+    assert_eq!((run.routine_name.as_str(), run.routine_id.as_str(), run.minutes, run.date.as_str()), ("Correr", "", 30.0, "2026-09-30"));
+    // Again, with other calories: updated, not duplicated.
+    let mut again = sessions;
+    again[1].kcal = Some(280.0);
+    apply(&mut data, &catalog, GymMutation::ImportWatchSessions { sessions: again }, ended, "2026-10-01");
+    assert_eq!(data.workouts.len(), 2);
+    assert_eq!(data.workouts.iter().find(|workout| workout.watch_id.as_deref() == Some("hc-2")).expect("run").kcal, 280.0);
+
+    // The sleeping pulse 6 above the two-week average.
+    for back in 1..=6 {
+        data.sleep_bpm.insert(crate::health::days_ago(parse_date("2026-10-01").expect("date"), back).to_string(), 50.0);
+    }
+    data.sleep_bpm.insert("2026-10-01".into(), 56.0);
+    let panel = build_view(&data, &catalog, &GymQuery::default(), parse_date("2026-10-01").expect("date"), ended).panel.expect("panel");
+    assert!(panel.advice.starts_with("Tu pulso dormido está 6 lpm arriba de tu promedio"), "{}", panel.advice);
 }

@@ -258,7 +258,28 @@ pub(crate) fn load(connection: &Connection, owner: &str) -> HealthResult<HealthD
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(HealthData { profile, weights, measurements, objective: objective.unwrap_or_default(), plan, water, steps, sleep, meals })
+    let sleep_bpm = connection
+        .prepare("SELECT date, bpm FROM health_sleep_heart WHERE owner_user_id = ?1")?
+        .query_map([owner], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    // Los días entrenados de Gimnasio, para sugerir el nivel de actividad.
+    let exercise_dates = connection
+        .prepare("SELECT DISTINCT date FROM gym_workouts WHERE owner_user_id = ?1")?
+        .query_map([owner], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(HealthData {
+        profile,
+        weights,
+        measurements,
+        objective: objective.unwrap_or_default(),
+        plan,
+        water,
+        steps,
+        sleep,
+        meals,
+        sleep_bpm,
+        exercise_dates,
+    })
 }
 
 /// Crea la fila de ajustes del usuario si todavía no existe.
@@ -343,6 +364,13 @@ fn apply_ops(connection: &Connection, owner: &str, ops: &[StoreOp]) -> HealthRes
             }
             StoreOp::DeleteSleep(date) => {
                 connection.execute("DELETE FROM health_sleep WHERE owner_user_id = ?1 AND date = ?2", params![owner, date])?;
+            }
+            StoreOp::PutSleepBpm { date, bpm } => {
+                connection.execute(
+                    "INSERT INTO health_sleep_heart (owner_user_id, date, bpm, updated_at) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(owner_user_id, date) DO UPDATE SET bpm = excluded.bpm, updated_at = excluded.updated_at",
+                    params![owner, date, bpm, now],
+                )?;
             }
             StoreOp::PutMeal(meal) => {
                 let n = &meal.nutrition;
@@ -756,6 +784,26 @@ mod tests {
             )
             .expect("user");
         connection
+    }
+
+    /// The watch's sleeping pulse is stored and read back by date, and the
+    /// days trained in Gimnasio reach Salud (for the activity level).
+    #[test]
+    fn the_watch_pulse_and_the_training_days_round_trip() {
+        let connection = database();
+        let owner = crate::backend::OWNER_LIBRARY_USER_ID;
+        let day = |date: &str, bpm: f64| crate::backend::health::WatchDay { date: date.into(), sleep_bpm: Some(bpm), ..Default::default() };
+        apply(&connection, owner, HealthMutation::ImportWatch { days: vec![day("2026-09-27", 51.0), day("2026-09-28", 54.5)] });
+        apply(&connection, owner, HealthMutation::ImportWatch { days: vec![day("2026-09-28", 53.0)] });
+        connection
+            .execute(
+                "INSERT INTO gym_workouts (id, owner_user_id, date, ended_at, workout_json) VALUES ('w1', ?1, '2026-09-26', 1, '{}'), ('w2', ?1, '2026-09-26', 2, '{}'), ('w3', 'user-ana', '2026-09-25', 3, '{}')",
+                [owner],
+            )
+            .expect("workouts");
+        let data = load(&connection, owner).expect("load");
+        assert_eq!(data.sleep_bpm.iter().map(|(date, bpm)| (date.as_str(), *bpm)).collect::<Vec<_>>(), [("2026-09-27", 51.0), ("2026-09-28", 53.0)]);
+        assert_eq!(data.exercise_dates.iter().map(String::as_str).collect::<Vec<_>>(), ["2026-09-26"]);
     }
 
     fn apply(connection: &Connection, owner: &str, mutation: HealthMutation) -> Change {

@@ -658,7 +658,20 @@ pub(crate) fn load(connection: &Connection, owner: &str) -> GymCommandResult<Gym
         session,
         sex: if sex == Some(crate::backend::health::Sex::Female) { BodySex::Female } else { BodySex::Male },
         sex_from_profile: sex.is_some(),
+        sleep_bpm: sleep_bpm(connection, owner),
     })
+}
+
+/// El pulso dormido de las últimas noches, de Salud (del reloj), para el
+/// consejo del panel. Sin la tabla o sin datos, ninguno.
+fn sleep_bpm(connection: &Connection, owner: &str) -> std::collections::BTreeMap<String, f64> {
+    let read = || -> rusqlite::Result<std::collections::BTreeMap<String, f64>> {
+        connection
+            .prepare("SELECT date, bpm FROM health_sleep_heart WHERE owner_user_id = ?1 ORDER BY date DESC LIMIT 30")?
+            .query_map([owner], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?
+            .collect()
+    };
+    read().unwrap_or_default()
 }
 
 /// El sexo del perfil de Salud, si lo cargó: se lee solo el perfil, no los
@@ -712,7 +725,8 @@ fn apply_ops(connection: &Connection, owner: &str, ops: &[StoreOp]) -> GymComman
             StoreOp::PutWorkout(workout) => {
                 connection.execute(
                     "INSERT INTO gym_workouts (id, owner_user_id, date, ended_at, workout_json) VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(id) DO NOTHING",
+                     ON CONFLICT(id) DO UPDATE SET date = excluded.date, ended_at = excluded.ended_at, workout_json = excluded.workout_json
+                     WHERE gym_workouts.owner_user_id = excluded.owner_user_id",
                     params![workout.id, owner, workout.date, workout.ended_ms, to_json(workout)?],
                 )?;
             }
@@ -1233,6 +1247,20 @@ mod tests {
         let (today, _) = local_today();
         let view = build_view(&data, &catalog, &GymQuery { screen: Screen::Entrenar, ..GymQuery::default() }, today, 700_000);
         assert_eq!(view.training.as_ref().map(|training| training.status.as_str()), Some("done"));
+
+        // A stored workout is updated (the watch completes it), only for its
+        // owner; the watch's sleeping pulse reaches Gimnasio.
+        let mut completed = data.workouts[0].clone();
+        completed.watch_id = Some("hc-1".into());
+        completed.avg_bpm = Some(121.0);
+        apply_ops(&connection, owner, &[StoreOp::PutWorkout(completed.clone())]).expect("update");
+        apply_ops(&connection, "user-ana", &[StoreOp::PutWorkout(Workout { kcal: 1.0, ..completed.clone() })]).expect("other");
+        connection
+            .execute("INSERT INTO health_sleep_heart (owner_user_id, date, bpm, updated_at) VALUES (?1, '2026-09-28', 52.0, 1)", [owner])
+            .expect("pulse");
+        let data = load(&connection, owner).expect("load");
+        assert_eq!(data.workouts, vec![completed]);
+        assert_eq!(data.sleep_bpm.get("2026-09-28"), Some(&52.0));
     }
 
     /// The agent's tools on a library folder: preview without saving, then

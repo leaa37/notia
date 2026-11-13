@@ -12,7 +12,7 @@ pub mod tools;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,10 @@ pub struct Profile {
     /// Meta diaria de agua que eligió la persona; sin ella se calcula.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub water_goal_ml: Option<i64>,
+    /// Usar el gasto medido con las comidas y el peso en lugar del de la
+    /// fórmula, cuando hay datos para medirlo.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_measured_expenditure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -329,6 +333,10 @@ pub struct HealthData {
     /// Minutos de sueño por fecha: la del día en que se despertó.
     pub sleep: BTreeMap<String, i64>,
     pub meals: Vec<Meal>,
+    /// Pulso promedio mientras dormía, por la fecha del sueño (del reloj).
+    pub sleep_bpm: BTreeMap<String, f64>,
+    /// Días con un entrenamiento en Gimnasio (solo lectura, para la actividad).
+    pub exercise_dates: BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +679,14 @@ pub struct Vitals {
     pub bmi: Option<f64>,
     pub bmr: Option<f64>,
     pub bmr_from_scale: bool,
+    /// El gasto diario que rige: el medido si la persona lo eligió y hay
+    /// datos, si no el de la fórmula.
     pub tdee: Option<f64>,
+    /// Metabolismo basal × factor de actividad.
+    pub tdee_formula: Option<f64>,
+    /// El gasto medido con las comidas y el peso, o por qué todavía no.
+    pub expenditure: ExpenditureStatus,
+    pub tdee_measured: bool,
     /// La meta de agua que rige: la elegida en el perfil o la calculada.
     pub water_goal_ml: Option<i64>,
     /// La calculada por altura y peso, aunque rija la elegida.
@@ -691,7 +706,13 @@ pub fn vitals(data: &HealthData, today: Date) -> Vitals {
         let profile = profile?;
         Some(bmr_mifflin(current_kg?, profile.height_cm, age?, profile.sex))
     });
-    let tdee = profile.zip(bmr).map(|(profile, bmr)| (bmr * profile.activity).round());
+    let tdee_formula = profile.zip(bmr).map(|(profile, bmr)| (bmr * profile.activity).round());
+    let expenditure = measured_expenditure(data, today);
+    let measured = match (&expenditure, profile.is_some_and(|profile| profile.use_measured_expenditure)) {
+        (ExpenditureStatus::Ready(measured), true) => Some(measured.kcal),
+        _ => None,
+    };
+    let tdee = measured.or(tdee_formula);
     let water_goal_auto_ml = profile.zip(current_kg).map(|(profile, kg)| water_goal_ml(kg, profile.height_cm));
     let water_goal_ml = profile.and_then(|profile| profile.water_goal_ml).or(water_goal_auto_ml);
     let maintenance = match (profile, current_kg, tdee, bmr) {
@@ -701,8 +722,238 @@ pub fn vitals(data: &HealthData, today: Date) -> Vitals {
         )),
         _ => None,
     };
-    Vitals { age, current_kg, bmi, bmr, bmr_from_scale: scale_bmr.is_some(), tdee, water_goal_ml, water_goal_auto_ml, maintenance }
+    Vitals {
+        age,
+        current_kg,
+        bmi,
+        bmr,
+        bmr_from_scale: scale_bmr.is_some(),
+        tdee,
+        tdee_formula,
+        expenditure,
+        tdee_measured: measured.is_some(),
+        water_goal_ml,
+        water_goal_auto_ml,
+        maintenance,
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Ajustes con los datos de las últimas semanas (reloj, comidas y peso)
+// ---------------------------------------------------------------------------
+
+/// Días que miran la actividad sugerida y el gasto medido: las 4 semanas
+/// anteriores a hoy (hoy todavía no terminó).
+pub const ADJUST_WINDOW_DAYS: i64 = 28;
+/// Días con pasos que hacen falta para sugerir el nivel de actividad.
+pub const MIN_STEP_DAYS: usize = 14;
+/// Días con comidas que hacen falta para medir el gasto (3 de cada 4).
+pub const MIN_LOGGED_DAYS: usize = 21;
+/// Pesajes y días entre el primero y el último para medir la tendencia.
+pub const MIN_WEIGHINGS: usize = 3;
+pub const MIN_WEIGHT_SPAN_DAYS: i64 = 14;
+/// Pulso dormido por encima del promedio que avisa cansancio.
+pub const ELEVATED_SLEEP_BPM: f64 = 5.0;
+
+fn in_window(date: &str, today: Date) -> bool {
+    parse_date(date).is_some_and(|date| date >= days_ago(today, ADJUST_WINDOW_DAYS) && date < today)
+}
+
+/// El nivel de actividad que muestran los pasos y los entrenamientos.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivitySuggestion {
+    pub factor: f64,
+    pub steps_average: i64,
+    pub step_days: usize,
+    /// `None` si no hay entrenamientos registrados en Gimnasio en la ventana.
+    pub exercise_days_per_week: Option<f64>,
+}
+
+/// Con entrenamientos en Gimnasio, el nivel sale de los días por semana
+/// (como describen los niveles) y los pasos lo corren uno (menos de 5.000 o
+/// 10.000 o más) o dos (15.000 o más). Sin entrenamientos, solo los pasos
+/// (cortes de Tudor-Locke: 5.000, 7.500, 10.000), hasta «Alto»: «Muy alto»
+/// es trabajo físico y no se deduce de los pasos.
+pub fn activity_suggestion(data: &HealthData, today: Date) -> Option<ActivitySuggestion> {
+    let steps = data.steps.iter().filter(|(date, steps)| **steps > 0 && in_window(date, today)).map(|(_, steps)| *steps).collect::<Vec<_>>();
+    if steps.len() < MIN_STEP_DAYS {
+        return None;
+    }
+    let average = steps.iter().sum::<i64>() as f64 / steps.len() as f64;
+    let exercise_days = data.exercise_dates.iter().filter(|date| in_window(date, today)).count();
+    let per_week = (exercise_days > 0).then(|| exercise_days as f64 * 7.0 / ADJUST_WINDOW_DAYS as f64);
+    let level = match per_week {
+        Some(per_week) => {
+            let by_days: i64 = if per_week < 1.0 {
+                0
+            } else if per_week < 2.5 {
+                1
+            } else if per_week <= 5.5 {
+                2
+            } else {
+                3
+            };
+            let by_steps = if average < 5_000.0 {
+                -1
+            } else if average >= 15_000.0 {
+                2
+            } else if average >= 10_000.0 {
+                1
+            } else {
+                0
+            };
+            (by_days + by_steps).clamp(0, ACTIVITIES.len() as i64 - 1)
+        }
+        None => {
+            if average < 5_000.0 {
+                0
+            } else if average < 7_500.0 {
+                1
+            } else if average < 10_000.0 {
+                2
+            } else {
+                3
+            }
+        }
+    };
+    Some(ActivitySuggestion {
+        factor: ACTIVITIES[level as usize].0,
+        steps_average: average.round() as i64,
+        step_days: steps.len(),
+        exercise_days_per_week: per_week,
+    })
+}
+
+/// El gasto diario medido: lo que comió en promedio menos lo que explica
+/// el cambio de peso (7.700 kcal por kilo).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expenditure {
+    pub kcal: f64,
+    pub intake: f64,
+    pub kg_per_week: f64,
+    pub logged_days: usize,
+    pub weighings: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExpenditureStatus {
+    Ready(Expenditure),
+    /// Por qué todavía no se puede medir.
+    Missing(String),
+}
+
+impl Default for ExpenditureStatus {
+    fn default() -> Self {
+        Self::Missing(String::new())
+    }
+}
+
+/// Las comidas de las 4 semanas anteriores (al menos 21 días cargados) y
+/// la recta de los pesajes (al menos 3, separados por 2 semanas o más). Un
+/// día con comidas a medio cargar baja el promedio: por eso pide constancia.
+pub fn measured_expenditure(data: &HealthData, today: Date) -> ExpenditureStatus {
+    let mut intake_by_day: BTreeMap<&str, f64> = BTreeMap::new();
+    for meal in data.meals.iter().filter(|meal| in_window(&meal.date, today)) {
+        *intake_by_day.entry(meal.date.as_str()).or_default() += meal.nutrition.kcal;
+    }
+    intake_by_day.retain(|_, kcal| *kcal > 0.0);
+    let logged_days = intake_by_day.len();
+    if logged_days < MIN_LOGGED_DAYS {
+        return ExpenditureStatus::Missing(format!(
+            "Hacen falta comidas cargadas en al menos {MIN_LOGGED_DAYS} de los últimos {ADJUST_WINDOW_DAYS} días (hay {logged_days})."
+        ));
+    }
+    // Los pesos y las mediciones de la balanza, uno por día.
+    let mut weights: BTreeMap<Date, f64> = BTreeMap::new();
+    for (date, kg) in data.measurements.iter().map(|m| (m.date.as_str(), m.weight)).chain(data.weights.iter().map(|w| (w.date.as_str(), w.kg))) {
+        if let Some(date) = parse_date(date).filter(|_| in_window(date, today)) {
+            weights.insert(date, kg);
+        }
+    }
+    let span = match (weights.keys().next(), weights.keys().last()) {
+        (Some(first), Some(last)) => last.since(*first).map(|span| span.get_days() as i64).unwrap_or(0),
+        _ => 0,
+    };
+    if weights.len() < MIN_WEIGHINGS || span < MIN_WEIGHT_SPAN_DAYS {
+        return ExpenditureStatus::Missing(format!(
+            "Hacen falta al menos {MIN_WEIGHINGS} pesajes en las últimas 4 semanas, separados por {MIN_WEIGHT_SPAN_DAYS} días o más."
+        ));
+    }
+    let start = *weights.keys().next().expect("weights");
+    let points = weights.iter().map(|(date, kg)| (date.since(start).map(|span| span.get_days() as f64).unwrap_or(0.0), *kg)).collect::<Vec<_>>();
+    let slope = least_squares_slope(&points);
+    let intake = intake_by_day.values().sum::<f64>() / logged_days as f64;
+    let kcal = ((intake - slope * KCAL_PER_KG) / 10.0).round() * 10.0;
+    if !(1_000.0..=6_000.0).contains(&kcal) {
+        return ExpenditureStatus::Missing("Los números no cierran: revisá que estén cargadas todas las comidas de cada día.".to_string());
+    }
+    ExpenditureStatus::Ready(Expenditure { kcal, intake: intake.round(), kg_per_week: slope * 7.0, logged_days, weighings: weights.len() })
+}
+
+/// Pendiente de la recta que mejor ajusta los puntos (kg por día).
+fn least_squares_slope(points: &[(f64, f64)]) -> f64 {
+    let n = points.len() as f64;
+    let (mean_x, mean_y) = (points.iter().map(|p| p.0).sum::<f64>() / n, points.iter().map(|p| p.1).sum::<f64>() / n);
+    let covariance = points.iter().map(|(x, y)| (x - mean_x) * (y - mean_y)).sum::<f64>();
+    let variance = points.iter().map(|(x, _)| (x - mean_x).powi(2)).sum::<f64>();
+    if variance == 0.0 {
+        0.0
+    } else {
+        covariance / variance
+    }
+}
+
+/// El pulso dormido de una noche frente al de las 2 semanas anteriores.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SleepHeart {
+    pub bpm: f64,
+    /// Promedio de las 14 noches anteriores (al menos 5 con dato).
+    pub baseline: Option<f64>,
+}
+
+impl SleepHeart {
+    /// Varios latidos arriba de lo habitual: cansancio, poca recuperación o
+    /// el comienzo de un resfrío.
+    pub fn elevated(&self) -> bool {
+        self.baseline.is_some_and(|baseline| self.bpm - baseline >= ELEVATED_SLEEP_BPM)
+    }
+}
+
+pub fn sleep_heart(sleep_bpm: &BTreeMap<String, f64>, date: Date) -> Option<SleepHeart> {
+    let bpm = *sleep_bpm.get(&date.to_string())?;
+    let from = days_ago(date, 14);
+    let previous = sleep_bpm
+        .iter()
+        .filter(|(day, _)| parse_date(day).is_some_and(|day| day >= from && day < date))
+        .map(|(_, bpm)| *bpm)
+        .collect::<Vec<_>>();
+    let baseline = (previous.len() >= 5).then(|| previous.iter().sum::<f64>() / previous.len() as f64);
+    Some(SleepHeart { bpm, baseline })
+}
+
+/// Lo que el reloj (vía Health Connect) dejó de un día. Cada dato es
+/// opcional: llega lo que el reloj registró.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchDay {
+    pub date: String,
+    #[serde(default)]
+    pub steps: Option<i64>,
+    #[serde(default)]
+    pub sleep_minutes: Option<i64>,
+    #[serde(default)]
+    pub sleep_bpm: Option<f64>,
+    #[serde(default)]
+    pub weight_kg: Option<f64>,
+    #[serde(default)]
+    pub body_fat_pct: Option<f64>,
+    #[serde(default)]
+    pub bmr_kcal: Option<f64>,
+}
+
+/// Días que acepta una importación y hasta cuándo para atrás.
+pub const WATCH_IMPORT_MAX_DAYS: usize = 62;
+pub const WATCH_IMPORT_OLDEST_DAYS: i64 = 60;
 
 /// El plan que rige: el guardado o el de mantenimiento.
 pub fn active_plan<'a>(data: &'a HealthData, vitals: &'a Vitals) -> Option<&'a Plan> {
@@ -824,6 +1075,7 @@ pub fn validate_profile(input: &ProfileInput, today: Date) -> Result<(Profile, O
             height_cm: round1(input.height_cm.unwrap_or_default()),
             activity,
             water_goal_ml,
+            use_measured_expenditure: false,
         },
         input.weight_kg.map(round1),
     ))
@@ -1199,4 +1451,11 @@ pub enum HealthMutation {
     DeleteSleep { date: String },
     SaveMeal { id: Option<String>, input: MealInput },
     DeleteMeal { id: String },
+    /// Lo que trae el reloj de varios días: reemplaza el dato de cada día
+    /// que llega y no toca los que no llegan.
+    ImportWatch { days: Vec<WatchDay> },
+    /// El nivel de actividad del perfil (por ejemplo, el sugerido).
+    SetActivity { activity: f64 },
+    /// Usar el gasto medido en lugar del de la fórmula.
+    SetMeasuredExpenditure { enabled: bool },
 }

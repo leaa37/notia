@@ -136,6 +136,32 @@ describe('HealthDashboardView', () => {
     expect(await within(dialog).findByText('La altura tiene que estar entre 100 y 250 cm.')).toBeTruthy()
   })
 
+  it('shows the sleeping pulse and offers the level and the expenditure the data show', async () => {
+    serve({
+      ...FULL,
+      objective: {
+        ...FULL.objective,
+        adjust: {
+          activityLabel: 'Ligero (1 a 3 días por semana)',
+          activitySuggestion: { value: '1.55', label: 'Moderado (3 a 5 días por semana)', reason: 'Promedio de 9.000 pasos por día.' },
+          formulaLabel: '2.436 kcal',
+          measuredLabel: '2.680 kcal',
+          measuredDetail: 'Comiste 2.400 kcal por día en promedio.',
+          usingMeasured: false,
+          canUseMeasured: true,
+        },
+      },
+      sleep: { ...FULL.sleep, heart: { label: 'Pulso dormido 56 lpm', detail: '6 lpm más que tu promedio de 2 semanas (50).', tone: 'warn' } },
+    })
+    render(<HealthDashboardView library={LIBRARY} />)
+    expect(await screen.findByText('Pulso dormido 56 lpm.')).toBeTruthy()
+    expect(screen.getByText('2.680 kcal')).toBeTruthy()
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Usar este nivel' })) })
+    expect(callBackend).toHaveBeenCalledWith('health_apply', expect.objectContaining({ mutation: { kind: 'setActivity', activity: 1.55 } }))
+    await act(async () => { fireEvent.click(screen.getByLabelText(/Usar el gasto medido/)) })
+    expect(callBackend).toHaveBeenCalledWith('health_apply', expect.objectContaining({ mutation: { kind: 'setMeasuredExpenditure', enabled: true } }))
+  })
+
   it('sends the water goal written in the profile, in liters', async () => {
     serve(FULL)
     render(<HealthDashboardView library={LIBRARY} />)

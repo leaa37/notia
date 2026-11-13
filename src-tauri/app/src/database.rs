@@ -12,7 +12,7 @@ use crate::host::{
 
 const NOTIA_DIRECTORY: &str = ".notia";
 const DATABASE_FILE_NAME: &str = "notia.db";
-pub const CURRENT_SCHEMA_VERSION: i64 = 33;
+pub const CURRENT_SCHEMA_VERSION: i64 = 34;
 /// A client's copy that never got its host's database.
 pub(crate) const COPY_WITHOUT_DATABASE: &str =
     "La copia de este equipo no tiene la base de datos de la biblioteca: conectate al host para completarla.";
@@ -1310,6 +1310,22 @@ fn migrate_to(connection: &Connection, target: i64) -> Result<i64, rusqlite::Err
                  PRIMARY KEY (owner_user_id, date)
              );
              INSERT INTO notia_schema_migrations (version) VALUES (33);",
+        )?;
+        transaction.commit()?;
+    }
+    if current_version < 34 && target >= 34 {
+        // Salud: el pulso promedio mientras dormía, del reloj, por la fecha
+        // del sueño (el día en que se despertó).
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS health_sleep_heart (
+                 owner_user_id TEXT NOT NULL REFERENCES library_users(id) ON DELETE CASCADE,
+                 date TEXT NOT NULL,
+                 bpm REAL NOT NULL CHECK (bpm > 0),
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY (owner_user_id, date)
+             );
+             INSERT INTO notia_schema_migrations (version) VALUES (34);",
         )?;
         transaction.commit()?;
     }

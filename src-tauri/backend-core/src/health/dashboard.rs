@@ -8,7 +8,7 @@ use super::reference::{bmi_range, bmi_state, range_for, state, Range, Tone};
 use super::{
     active_plan, activity_label, day_label, day_month, days_ago, fmt, long_date, meals_of, parse_date, shift_days, short_date,
     signed, sleep_label, steps_label, total, vitals, weekday_narrow, HealthData, MacroKey, MealCategory, MetricGroup, Nutrition, Plan, PlanSource, Sex,
-    Vitals, ACTIVITIES, METRICS, PACES, SLEEP_RANGE_MINUTES, STEPS_GOAL,
+    Vitals, ACTIVITIES, METRICS, PACES, SLEEP_RANGE_MINUTES, STEPS_GOAL, activity_suggestion, sleep_heart, ExpenditureStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -231,6 +231,45 @@ pub struct DailyPanel {
     pub chart: Option<WeightChart>,
     pub empty_text: String,
     pub entries: Vec<DailyRow>,
+    /// El pulso dormido de anoche (solo en el sueño, si el reloj lo trajo).
+    pub heart: Option<HeartView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartView {
+    /// «Pulso dormido 54 lpm».
+    pub label: String,
+    /// Frente al promedio de las 2 semanas anteriores.
+    pub detail: String,
+    /// `ok`, `warn` o `muted` (sin promedio todavía).
+    pub tone: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySuggestionView {
+    pub value: String,
+    pub label: String,
+    /// De dónde sale: los pasos y los entrenamientos de 4 semanas.
+    pub reason: String,
+}
+
+/// Lo que las últimas semanas dicen para ajustar el plan.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustView {
+    pub activity_label: String,
+    /// Solo si difiere del nivel del perfil.
+    pub activity_suggestion: Option<ActivitySuggestionView>,
+    /// «2.900 kcal»: metabolismo basal × actividad.
+    pub formula_label: Option<String>,
+    /// «2.680 kcal»: lo que comiste menos lo que explica el cambio de peso.
+    pub measured_label: Option<String>,
+    /// Cómo se midió, o qué falta para medirlo.
+    pub measured_detail: String,
+    pub using_measured: bool,
+    pub can_use_measured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -256,6 +295,7 @@ pub struct ObjectivePanel {
     pub low_bmi_warning: bool,
     pub can_plan: bool,
     pub plan: Option<PlanView>,
+    pub adjust: Option<AdjustView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -504,7 +544,7 @@ pub fn build_dashboard(data: &HealthData, query: &DashboardQuery, today: Date, h
         header: header(data, &vitals),
         bmi: bmi_panel(data, &vitals),
         weight: weight_panel(data, &vitals, query.weight_range, today),
-        objective: objective_panel(data, &vitals),
+        objective: objective_panel(data, &vitals, today),
         food: food_panel(data, &vitals, query.food_date.as_deref(), today),
         today_calories: active_plan(data, &vitals).map(|plan| calories_summary(&total(&meals_of(data, &today.to_string())), plan)),
         weight_trend: weight_trend(data, &vitals, today),
@@ -792,6 +832,7 @@ fn steps_panel(data: &HealthData, range: WeightRange, today: Date) -> DailyPanel
         ),
         empty_text: "Cargá los pasos de al menos dos días para ver tu evolución.".to_string(),
         entries: daily_rows(&data.steps, steps_label),
+        heart: None,
     }
 }
 
@@ -819,7 +860,23 @@ fn sleep_panel(data: &HealthData, range: WeightRange, today: Date) -> DailyPanel
         ),
         empty_text: "Cargá el sueño de al menos dos noches para ver tu evolución.".to_string(),
         entries: daily_rows(&data.sleep, sleep_label),
+        heart: heart_view(data, today),
     }
+}
+
+fn heart_view(data: &HealthData, today: Date) -> Option<HeartView> {
+    let heart = sleep_heart(&data.sleep_bpm, today)?;
+    let label = format!("Pulso dormido {} lpm", fmt(heart.bpm, 0));
+    let Some(baseline) = heart.baseline else {
+        return Some(HeartView { label, detail: "Con 5 noches más se compara con tu promedio.".to_string(), tone: "muted".to_string() });
+    };
+    let delta = heart.bpm - baseline;
+    let detail = if heart.elevated() {
+        format!("{} lpm más que tu promedio de 2 semanas ({}): puede ser cansancio o el comienzo de un resfrío; hoy conviene entrenar liviano.", fmt(delta, 0), fmt(baseline, 0))
+    } else {
+        format!("Tu promedio de 2 semanas es {} lpm.", fmt(baseline, 0))
+    };
+    Some(HeartView { label, detail, tone: if heart.elevated() { "warn" } else { "ok" }.to_string() })
 }
 
 /// Los pesos del último mes en una línea con medio kilo de aire arriba y abajo.
@@ -908,7 +965,7 @@ fn plan_view(plan: &Plan) -> PlanView {
     }
 }
 
-fn objective_panel(data: &HealthData, vitals: &Vitals) -> ObjectivePanel {
+fn objective_panel(data: &HealthData, vitals: &Vitals, today: Date) -> ObjectivePanel {
     let target = data.objective.target_kg;
     let target_bmi = target.zip(data.profile.as_ref()).and_then(|(target, profile)| super::bmi(target, profile.height_cm));
     ObjectivePanel {
@@ -931,7 +988,50 @@ fn objective_panel(data: &HealthData, vitals: &Vitals) -> ObjectivePanel {
         low_bmi_warning: target_bmi.is_some_and(|bmi| bmi < 18.5),
         can_plan: target.is_some() && vitals.tdee.is_some(),
         plan: data.plan.as_ref().map(plan_view),
+        adjust: adjust_view(data, vitals, today),
     }
+}
+
+fn adjust_view(data: &HealthData, vitals: &Vitals, today: Date) -> Option<AdjustView> {
+    let profile = data.profile.as_ref()?;
+    let activity_suggestion = activity_suggestion(data, today).filter(|suggestion| (suggestion.factor - profile.activity).abs() > 1e-6).map(|suggestion| {
+        let training = match suggestion.exercise_days_per_week {
+            Some(per_week) => format!(" y {} entrenamientos por semana", fmt(per_week, 1)),
+            None => " (sin entrenamientos en Gimnasio)".to_string(),
+        };
+        ActivitySuggestionView {
+            value: suggestion.factor.to_string(),
+            label: activity_label(suggestion.factor).unwrap_or_default().to_string(),
+            reason: format!(
+                "Promedio de {} pasos por día{training} en las últimas 4 semanas ({} días con pasos).",
+                fmt(suggestion.steps_average as f64, 0),
+                suggestion.step_days
+            ),
+        }
+    });
+    let (measured_label, measured_detail) = match &vitals.expenditure {
+        ExpenditureStatus::Ready(measured) => (
+            Some(format!("{} kcal", fmt(measured.kcal, 0))),
+            format!(
+                "Comiste {} kcal por día en promedio ({} días cargados) y tu peso {} {} kg por semana ({} pesajes) en las últimas 4 semanas. Solo vale si cargaste todas las comidas de esos días.",
+                fmt(measured.intake, 0),
+                measured.logged_days,
+                if measured.kg_per_week < 0.0 { "bajó" } else { "subió" },
+                fmt(measured.kg_per_week.abs(), 2),
+                measured.weighings
+            ),
+        ),
+        ExpenditureStatus::Missing(reason) => (None, reason.clone()),
+    };
+    Some(AdjustView {
+        activity_label: activity_label(profile.activity).unwrap_or_default().to_string(),
+        activity_suggestion,
+        formula_label: vitals.tdee_formula.map(|kcal| format!("{} kcal", fmt(kcal, 0))),
+        can_use_measured: measured_label.is_some(),
+        measured_label,
+        measured_detail,
+        using_measured: vitals.tdee_measured,
+    })
 }
 
 fn macro_indicator(key: MacroKey, value: f64, target: f64) -> MacroIndicator {
@@ -1008,7 +1108,10 @@ fn food_panel(data: &HealthData, vitals: &Vitals, date: Option<&str>, today: Dat
         over,
         remaining_label,
         stats: vec![
-            StatRow { label: "Gasto diario estimado".into(), value: format!("{} kcal", fmt(vitals.tdee.unwrap_or_default(), 0)) },
+            StatRow {
+                label: if vitals.tdee_measured { "Gasto diario medido" } else { "Gasto diario estimado" }.into(),
+                value: format!("{} kcal", fmt(vitals.tdee.unwrap_or_default(), 0)),
+            },
             StatRow { label: "Objetivo del día".into(), value: format!("{} kcal", fmt(plan.kcal, 0)) },
             StatRow { label: "Metabolismo basal".into(), value: format!("{} kcal", fmt(vitals.bmr.unwrap_or_default(), 0)) },
         ],

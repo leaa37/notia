@@ -92,6 +92,8 @@ export function HealthDashboardView({ library }: { library: NotiaLibrary }) {
         onGeneratePlan={generatePlan}
         onCalculatePlan={() => apply({ kind: 'calculatePlan' })}
         onClearPlan={() => { void run({ kind: 'clearPlan' }) }}
+        onActivity={(activity) => { void run({ kind: 'setActivity', activity }) }}
+        onMeasuredExpenditure={(enabled) => { void run({ kind: 'setMeasuredExpenditure', enabled }) }}
       />
     ),
     food: dashboard.food && (

@@ -62,7 +62,32 @@ pub enum GymMutation {
     DeleteWorkout { workout_id: String },
     /// Marca y desmarca equipamiento con el que cuenta.
     SetEquipment { add: Vec<String>, remove: Vec<String> },
+    /// Los entrenamientos que registró el reloj (Health Connect).
+    ImportWatchSessions { sessions: Vec<WatchSession> },
 }
+
+/// Un entrenamiento del reloj. `kind` es la clave del tipo en Health
+/// Connect («running», «strength_training»…); `date`, la fecha local del
+/// comienzo.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchSession {
+    pub id: String,
+    pub kind: String,
+    pub date: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    #[serde(default)]
+    pub kcal: Option<f64>,
+    #[serde(default)]
+    pub avg_bpm: Option<f64>,
+    #[serde(default)]
+    pub max_bpm: Option<f64>,
+}
+
+/// Entrenamientos por importación y hasta cuándo para atrás.
+pub const MAX_WATCH_SESSIONS: usize = 200;
+const WATCH_OLDEST_DAYS: i64 = 60;
 
 /// Un ejercicio de una rutina guardada entera.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -185,6 +210,9 @@ pub fn workout_of(routine: &Routine, session: &Session, catalog: &Catalog, now_m
         sets,
         volume: (volume * 10.0).round() / 10.0,
         exercises,
+        watch_id: None,
+        avg_bpm: None,
+        max_bpm: None,
     })
 }
 
@@ -535,7 +563,102 @@ pub fn plan_change(data: &GymData, catalog: &Catalog, mutation: &GymMutation, cl
             }
             Change { ops: vec![StoreOp::PutOwned(owned.into_iter().collect())], routine_id: None }
         }
+        GymMutation::ImportWatchSessions { sessions } => import_watch_sessions(data, sessions, clock)?,
     })
+}
+
+/// Los entrenamientos del reloj. Uno que se superpone (la mitad o más del
+/// más corto) con un entrenamiento de Notia lo completa con las calorías y
+/// el pulso del reloj, sin cambiar sus series ni sus minutos; uno que no,
+/// se suma como entrenamiento propio («Correr», «Fuerza»…). Importar de
+/// nuevo actualiza en lugar de duplicar. Lo que no se entiende (sin tipo
+/// conocido, menos de 5 minutos o más de 6 horas, fechas raras) se ignora.
+fn import_watch_sessions(data: &GymData, sessions: &[WatchSession], clock: &mut Clock) -> GymResult<Change> {
+    if sessions.len() > MAX_WATCH_SESSIONS {
+        return Err(GymError::validation(format!("Se importan hasta {MAX_WATCH_SESSIONS} entrenamientos por vez.")));
+    }
+    let today = crate::health::parse_date(&clock.today);
+    let oldest = today.map(|today| crate::health::days_ago(today, WATCH_OLDEST_DAYS));
+    let mut workouts = data.workouts.clone();
+    let mut ops = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for session in sessions {
+        let Some(label) = super::watch_session_label(session.kind.trim()) else { continue };
+        let minutes = (session.end_ms - session.start_ms) as f64 / 60_000.0;
+        let date = crate::health::parse_date(session.date.trim());
+        let dated = date.zip(today).zip(oldest).is_some_and(|((date, today), oldest)| date <= today && date >= oldest);
+        if session.id.trim().is_empty() || !seen.insert(session.id.trim().to_string()) || !(5.0..=360.0).contains(&minutes) || !dated {
+            continue;
+        }
+        let kcal = session.kcal.filter(|kcal| (0.0..=3_000.0).contains(kcal)).map(f64::round);
+        let bpm = |value: Option<f64>| value.filter(|bpm| (30.0..=230.0).contains(bpm)).map(f64::round);
+        let (avg_bpm, max_bpm) = (bpm(session.avg_bpm), bpm(session.max_bpm));
+        let watch_id = Some(session.id.trim().to_string());
+        let overlap = |workout: &Workout| {
+            let start = workout.ended_ms - (workout.minutes * 60_000.0) as i64;
+            let shared = (workout.ended_ms.min(session.end_ms) - start.max(session.start_ms)).max(0) as f64;
+            let shorter = ((workout.ended_ms - start).min(session.end_ms - session.start_ms)).max(1) as f64;
+            shared / shorter
+        };
+        let index = workouts.iter().position(|workout| workout.watch_id == watch_id).or_else(|| {
+            workouts
+                .iter()
+                .enumerate()
+                .filter(|(_, workout)| workout.watch_id.is_none() && overlap(workout) >= 0.5)
+                .max_by(|(_, a), (_, b)| overlap(a).total_cmp(&overlap(b)))
+                .map(|(index, _)| index)
+        });
+        let updated = match index {
+            // Uno de Notia: suma lo del reloj y conserva el resto.
+            Some(index) if !workouts[index].routine_id.is_empty() || !workouts[index].exercises.is_empty() => {
+                let mut workout = workouts[index].clone();
+                workout.watch_id = watch_id;
+                workout.kcal = kcal.unwrap_or(workout.kcal);
+                workout.avg_bpm = avg_bpm.or(workout.avg_bpm);
+                workout.max_bpm = max_bpm.or(workout.max_bpm);
+                (index, workout)
+            }
+            // Uno del reloj ya importado: lo que traiga ahora.
+            Some(index) => {
+                let mut workout = workouts[index].clone();
+                workout.date = session.date.trim().to_string();
+                workout.routine_name = label.to_string();
+                workout.ended_ms = session.end_ms;
+                workout.minutes = crate::health::round1(minutes);
+                workout.kcal = kcal.unwrap_or(workout.kcal);
+                workout.avg_bpm = avg_bpm;
+                workout.max_bpm = max_bpm;
+                (index, workout)
+            }
+            None => {
+                let workout = Workout {
+                    id: (clock.new_id)(),
+                    date: session.date.trim().to_string(),
+                    routine_id: String::new(),
+                    routine_name: label.to_string(),
+                    color: "teal".to_string(),
+                    ended_ms: session.end_ms,
+                    minutes: crate::health::round1(minutes),
+                    kcal: kcal.unwrap_or(0.0),
+                    sets: 0,
+                    volume: 0.0,
+                    exercises: Vec::new(),
+                    watch_id,
+                    avg_bpm,
+                    max_bpm,
+                };
+                workouts.push(workout.clone());
+                ops.push(StoreOp::PutWorkout(workout));
+                continue;
+            }
+        };
+        let (index, workout) = updated;
+        if workouts[index] != workout {
+            workouts[index] = workout.clone();
+            ops.push(StoreOp::PutWorkout(workout));
+        }
+    }
+    Ok(Change { ops, routine_id: None })
 }
 
 fn checked_sets(sets: &[SetPlan]) -> GymResult<Vec<SetPlan>> {
@@ -632,6 +755,9 @@ fn logged_workout(
         sets,
         volume: (volume * 10.0).round() / 10.0,
         exercises: done,
+        watch_id: None,
+        avg_bpm: None,
+        max_bpm: None,
     })
 }
 

@@ -743,6 +743,19 @@ fn panel(data: &GymData, catalog: &Catalog, query: &GymQuery, today: Date, now_m
             }
         })
         .unwrap_or_default();
+    // El pulso dormido alto (del reloj) pide un día más liviano.
+    let advice = match crate::health::sleep_heart(&data.sleep_bpm, today) {
+        Some(heart) if heart.elevated() => {
+            let rise = fmt(heart.bpm - heart.baseline.unwrap_or(heart.bpm), 0);
+            let rest = "hoy conviene entrenar liviano o descansar.";
+            if advice.is_empty() {
+                format!("Tu pulso dormido está {rise} lpm arriba de tu promedio: {rest}")
+            } else {
+                format!("Tu pulso dormido está {rise} lpm arriba de tu promedio: {rest} {advice}")
+            }
+        }
+        _ => advice,
+    };
 
     // Calendario de 24 semanas.
     let mut all_kcal = days.values().map(|day| day.kcal).collect::<Vec<_>>();

@@ -315,6 +315,35 @@ pub struct Workout {
     pub volume: f64,
     #[serde(default)]
     pub exercises: Vec<WorkoutExercise>,
+    /// El entrenamiento del reloj (Health Connect) que lo completó o lo creó.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_id: Option<String>,
+    /// Pulso promedio y máximo del reloj durante el entrenamiento.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_bpm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bpm: Option<f64>,
+}
+
+/// El nombre en Gimnasio de un tipo de entrenamiento del reloj (la clave de
+/// Health Connect), o `None` si no se suma: caminar ya cuenta en los pasos
+/// y el reloj detecta caminatas solo.
+pub fn watch_session_label(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "strength_training" | "weightlifting" | "calisthenics" => "Fuerza",
+        "running" | "running_treadmill" => "Correr",
+        "biking" | "biking_stationary" => "Bici",
+        "swimming_pool" | "swimming_open_water" => "Natación",
+        "elliptical" => "Elíptico",
+        "rowing_machine" => "Remo",
+        "high_intensity_interval_training" => "HIIT",
+        "stair_climbing" => "Escaleras",
+        "hiking" => "Trekking",
+        "yoga" => "Yoga",
+        "pilates" => "Pilates",
+        "other_workout" => "Entrenamiento",
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +427,8 @@ pub struct GymData {
     pub sex: BodySex,
     /// Si el sexo viene del perfil de Salud.
     pub sex_from_profile: bool,
+    /// El pulso dormido de cada noche, de Salud (del reloj).
+    pub sleep_bpm: BTreeMap<String, f64>,
 }
 
 impl GymData {

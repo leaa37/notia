@@ -13510,3 +13510,51 @@ Pedido del usuario: la meta calculada le daba 3,3 L y quería 2,5 L.
 - **Asistente**: `save_health_profile` acepta `waterGoalLiters` (0 vuelve a la calculada); sin el dato conserva la meta elegida, como el resto del perfil (`tool_action` completa con lo guardado).
 - **Notia Fit (Android)**: muestra la meta que manda el tablero, así que no necesita cambios.
 - **Validaciones**: `health::tests::a_chosen_water_goal_replaces_the_calculated_one` (redondeo, vacía y 0, rango, `Vitals`, panel, formulario y herramienta); fixtures del tablero regeneradas con `dump_dashboard_fixtures` (solo agregan los dos campos); `HealthDashboardView.test.tsx` con la meta escrita enviada en litros; `cargo test -p notia-backend-core` (826 aprobadas y el fallo previo de `image_generation`), `npx vitest run` (758), `tsc` y `eslint` sin errores.
+
+## Datos del reloj: Salud y Gimnasio con Health Connect (2026-11-13)
+
+Pedido del usuario: aprovechar la conexión de Notia Fit con Health Connect (Galaxy Watch 6 vía Samsung Health) para cargar más datos y ajustar los cálculos. Qué comparte Samsung Health con Health Connect según su tabla (que puede cambiar con su versión): pasos, entrenamientos con sus calorías, sueño con etapas, frecuencia cardíaca, peso, grasa y metabolismo basal. No comparte las calorías diarias del «activity tracker», la variabilidad cardíaca, la frecuencia de reposo ni la temperatura. Notia Fit lee y manda los datos; Notia decide qué guardar y calcula.
+
+### Contratos
+
+- `health_apply` con `{ kind: "importWatch", days: WatchDay[] }`. `WatchDay { date, steps?, sleepMinutes?, sleepBpm?, weightKg?, bodyFatPct?, bmrKcal? }`. Hasta 62 días por vez, de los últimos 60 y no futuros (los demás se ignoran). Cada dato reemplaza el de su día y lo que no llega no se toca; 0 pasos o 0 minutos no borran nada. Un dato fuera de rango (por ejemplo, pulso fuera de 25–150) se descarta sin rechazar la importación. `bodyFatPct` y `bmrKcal` son una medición de **Composición corporal** de ese día (`grasaPct`, `metabolismo`) con el peso del día, el de una medición previa o el último registrado; se suman a lo que la medición ya tenía y se vuelven a calcular los valores derivados (IMC, kilos de grasa, peso sin grasa…). Importar lo mismo otra vez no escribe nada («Sin datos nuevos del reloj.»).
+- `health_apply` con `{ kind: "setActivity", activity }` (un factor de la lista) y `{ kind: "setMeasuredExpenditure", enabled }`. Guardar el perfil conserva `useMeasuredExpenditure`.
+- `gym_apply` con `{ type: "import-watch-sessions", sessions: WatchSession[] }`. `WatchSession { id, kind, date, startMs, endMs, kcal?, avgBpm?, maxBpm? }`: `kind` es la clave del tipo de Health Connect; `watch_session_label` la traduce (`strength_training`, `weightlifting` y `calisthenics` → «Fuerza»; `running` → «Correr»; `biking` → «Bici»; natación, elíptico, remo, HIIT, escaleras, trekking, yoga, pilates y «Entrenamiento»). `walking` y los tipos desconocidos no se importan (los pasos ya cuentan las caminatas y el reloj las detecta solo). Se ignoran los de menos de 5 minutos o más de 6 horas, los de más de 60 días o futuros y los ids repetidos.
+  - Si un entrenamiento con ese `watchId` ya existe, se actualiza.
+  - Si no, el entrenamiento de Notia que más se superpone (la mitad o más del más corto) recibe `watchId`, las calorías y el pulso del reloj; conserva las series, los minutos y la rutina.
+  - Si tampoco, se crea uno con `routineId` vacío, el nombre del tipo, color `teal`, sin series.
+  - `StoreOp::PutWorkout` ahora actualiza la fila existente (`ON CONFLICT(id) DO UPDATE … WHERE` el dueño coincide); antes la ignoraba.
+
+### Datos
+
+- Migración 34: `health_sleep_heart (owner_user_id, date, bpm, updated_at)`, el pulso promedio mientras dormía por la fecha del sueño.
+- `HealthData.sleep_bpm` y `HealthData.exercise_dates` (los días con entrenamientos en `gym_workouts`, solo lectura). `GymData.sleep_bpm` (las últimas 30 noches) para el consejo.
+- `Profile.use_measured_expenditure` (en `profile_json`, `serde(default)`). `Workout.watch_id`, `avg_bpm`, `max_bpm` (en `workout_json`, opcionales).
+
+### Cálculos (`health/mod.rs`)
+
+- **Nivel de actividad sugerido** (`activity_suggestion`): mira las 4 semanas anteriores a hoy y necesita pasos en 14 días o más.
+  - Con entrenamientos en Gimnasio, el nivel sale de los días por semana: menos de 1 es sedentario, menos de 2,5 ligero, hasta 5,5 moderado y más, alto. Los pasos lo bajan uno con menos de 5.000, lo suben uno con 10.000 o más y dos con 15.000 o más.
+  - Sin entrenamientos, solo los pasos, con los cortes de Tudor-Locke (5.000, 7.500 y 10.000), hasta «Alto». «Muy alto» es trabajo físico y no se deduce de los pasos.
+  - El tablero lo ofrece solo si difiere del nivel del perfil.
+- **Gasto medido** (`measured_expenditure`): promedio de kcal de los días con comidas (al menos 21 de los últimos 28) menos la pendiente de los pesajes por mínimos cuadrados × 7.700 kcal/kg (al menos 3 pesajes de la ventana, de pesos y mediciones, separados por 14 días o más). Redondea a 10. Fuera de 1.000–6.000 kcal se informa que «los números no cierran». Un día con comidas a medio cargar baja el promedio: el texto lo advierte. Con `use_measured_expenditure` y datos, `Vitals.tdee` es el medido (`tdee_measured`) y el de la fórmula queda en `tdee_formula`. El mantenimiento y el resumen de la IA usan el que rige. Un plan ya calculado no se recalcula solo.
+- **Pulso dormido** (`sleep_heart`): el de la noche frente al promedio de las 14 anteriores (al menos 5 con dato). 5 lpm o más arriba es `elevated`.
+
+### Vistas
+
+- `ObjectivePanel.adjust` (`AdjustView`): nivel actual, sugerencia, gasto por fórmula, gasto medido con su detalle o lo que falta, y si se usa. En la web es el bloque «Ajustes con tus datos» de **Peso objetivo**, con **Usar este nivel** y **Usar el gasto medido para mis calorías**. La estadística del día dice «Gasto diario medido» o «estimado».
+- `DailyPanel.heart` (solo en el sueño): «Pulso dormido 54 lpm», el detalle frente al promedio y el tono (`ok`, `warn`, `muted`).
+- Consejo del panel de Gimnasio: con el pulso dormido alto, empieza por «Tu pulso dormido está N lpm arriba de tu promedio: hoy conviene entrenar liviano o descansar.».
+- La IA: `get_health_summary` suma `dailyExpenditureSource`, `formulaExpenditureKcal`, `measuredExpenditure`, `activitySuggestion` y `sleepingHeartRate`; el historial de Gimnasio suma `fromWatch`, `avgBpm` y `maxBpm`.
+
+### Validaciones
+
+- Núcleo (`cargo test -p notia-backend-core`, 831 aprobadas y el fallo previo de `image_generation`):
+  - `health::tests::the_watch_days_are_imported_once_and_merged_with_the_scale`;
+  - `the_activity_level_follows_the_steps_and_the_training_days`;
+  - `the_measured_expenditure_comes_from_the_meals_and_the_weight`;
+  - `the_sleeping_pulse_warns_when_it_rises`;
+  - `gym::tests::the_watch_sessions_complete_or_add_workouts`.
+- Adaptador (`cargo test -p notia-app`, 469 aprobadas y los 2 fallos previos de `meeting` y `telegram_service`): `health::tests::the_watch_pulse_and_the_training_days_round_trip` y la actualización de un entrenamiento en `gym::tests::routines_sessions_and_workouts_round_trip_per_user`.
+- Web: `HealthDashboardView.test.tsx` (pulso dormido, **Usar este nivel**, gasto medido); fixtures regeneradas con `dump_dashboard_fixtures`.
+- Pendiente: probar con un reloj real. Los tipos y las cantidades que llegan dependen de la versión de Samsung Health.

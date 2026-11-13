@@ -17,7 +17,7 @@ fn ids() -> NewIds {
 }
 
 fn profile(sex: Sex, age: i16, height: f64, activity: f64) -> Profile {
-    Profile { birth_date: format!("{}-03-15", 2026 - age), sex, height_cm: height, activity, water_goal_ml: None }
+    Profile { birth_date: format!("{}-03-15", 2026 - age), sex, height_cm: height, activity, water_goal_ml: None, use_measured_expenditure: false }
 }
 
 fn meal(id: &str, date: &str, category: MealCategory, name: &str, kcal: f64, created: i64) -> Meal {
@@ -63,6 +63,7 @@ fn overweight() -> HealthData {
             meal("m3", "2026-09-27", MealCategory::Almuerzo, "Fideos con bolognesa", 640.0, 3),
             meal("m4", "2026-09-26", MealCategory::Almuerzo, "milanesa de pollo con ensalada", 500.0, 0),
         ],
+        ..HealthData::default()
     }
 }
 
@@ -538,4 +539,158 @@ fn a_chosen_water_goal_replaces_the_calculated_one() {
     let reset = tool_action("save_health_profile", &json!({ "waterGoalLiters": 0 }), &data, TODAY, 13).expect("profile");
     let ToolAction::Change(HealthMutation::SaveProfile { input }) = reset else { panic!() };
     assert_eq!(validate_profile(&input, TODAY).expect("profile").0.water_goal_ml, None);
+}
+
+
+/// Applies a change's writes to the data, as the app's adapter does.
+fn applied(mut data: HealthData, change: &change::Change) -> HealthData {
+    for op in &change.ops {
+        match op {
+            StoreOp::PutProfile(profile) => data.profile = Some(profile.clone()),
+            StoreOp::PutWeight(entry) => {
+                data.weights.retain(|stored| stored.date != entry.date);
+                data.weights.push(entry.clone());
+                data.weights.sort_by(|a, b| a.date.cmp(&b.date));
+            }
+            StoreOp::PutMeasurement(measurement) => {
+                data.measurements.retain(|stored| stored.date != measurement.date);
+                data.measurements.push(measurement.clone());
+                data.measurements.sort_by(|a, b| a.date.cmp(&b.date));
+            }
+            StoreOp::PutSteps { date, steps } => {
+                data.steps.insert(date.clone(), *steps);
+            }
+            StoreOp::PutSleep { date, minutes } => {
+                data.sleep.insert(date.clone(), *minutes);
+            }
+            StoreOp::PutSleepBpm { date, bpm } => {
+                data.sleep_bpm.insert(date.clone(), *bpm);
+            }
+            other => panic!("unexpected op {other:?}"),
+        }
+    }
+    data
+}
+
+/// The watch's days replace each day's data that arrives and leave the
+/// rest; odd readings are dropped, the body fat of the watch becomes that
+/// day's measurement with the day's weight, and importing again changes
+/// nothing.
+#[test]
+fn the_watch_days_are_imported_once_and_merged_with_the_scale() {
+    let data = overweight();
+    let days = vec![
+        WatchDay { date: "2026-09-27".into(), steps: Some(10_400), sleep_minutes: Some(452), sleep_bpm: Some(51.26), ..WatchDay::default() },
+        WatchDay { date: "2026-09-28".into(), steps: Some(0), sleep_minutes: Some(390), sleep_bpm: Some(300.0), weight_kg: Some(82.1), body_fat_pct: Some(21.4), bmr_kcal: Some(1760.0) },
+        WatchDay { date: "2026-09-29".into(), steps: Some(5_000), ..WatchDay::default() },
+        WatchDay { date: "2026-06-01".into(), steps: Some(5_000), ..WatchDay::default() },
+    ];
+    let change = plan_change(&data, &HealthMutation::ImportWatch { days: days.clone() }, TODAY, &ids()).expect("import");
+    assert_eq!(change.summary, "Datos del reloj: pasos de 1 día, sueño de 1 día, pulso dormido de 1 día, peso de 1 día, composición de 1 día.");
+    let imported = applied(data, &change);
+    assert_eq!(imported.steps.get("2026-09-27"), Some(&10_400));
+    assert_eq!(imported.steps.get("2026-09-28"), Some(&4_310), "zero steps keep the stored day");
+    assert!(!imported.steps.contains_key("2026-09-29") && !imported.steps.contains_key("2026-06-01"), "future and too old are dropped");
+    assert_eq!((imported.sleep.get("2026-09-27"), imported.sleep.get("2026-09-28")), (Some(&452), Some(&390)));
+    assert_eq!(imported.sleep_bpm.get("2026-09-27"), Some(&51.3));
+    assert!(!imported.sleep_bpm.contains_key("2026-09-28"), "300 bpm is not a reading");
+    let today = imported.measurements.iter().find(|m| m.date == "2026-09-28").expect("measurement");
+    assert_eq!((today.weight, today.value("grasaPct"), today.value("metabolismo")), (82.1, Some(21.4), Some(1760.0)));
+    assert_eq!(today.value("grasaKg"), Some(17.6), "derived again from the new fat and weight");
+    assert_eq!(today.value("grasaVisceral"), Some(10.0), "what the scale had stays");
+    let again = plan_change(&imported, &HealthMutation::ImportWatch { days }, TODAY, &ids()).expect("again");
+    assert!(again.ops.is_empty());
+    assert_eq!(again.summary, "Sin datos nuevos del reloj.");
+}
+
+/// A month of steps and training days suggests the level; without enough
+/// steps it suggests nothing.
+#[test]
+fn the_activity_level_follows_the_steps_and_the_training_days() {
+    let mut data = overweight();
+    data.steps.clear();
+    assert_eq!(activity_suggestion(&data, TODAY), None);
+    for back in 1..=20 {
+        data.steps.insert(days_ago(TODAY, back).to_string(), 8_000);
+    }
+    let steps_only = activity_suggestion(&data, TODAY).expect("suggestion");
+    assert_eq!((steps_only.factor, steps_only.steps_average, steps_only.step_days, steps_only.exercise_days_per_week), (1.55, 8_000, 20, None));
+    // 3 days a week of training, and 11.000 steps move it one up.
+    for back in (1..=28).filter(|back| back % 7 < 3) {
+        data.exercise_dates.insert(days_ago(TODAY, back).to_string());
+    }
+    let trained = activity_suggestion(&data, TODAY).expect("suggestion");
+    assert_eq!(trained.exercise_days_per_week, Some(3.0));
+    assert_eq!(trained.factor, 1.55);
+    for back in 1..=20 {
+        data.steps.insert(days_ago(TODAY, back).to_string(), 11_000);
+    }
+    assert_eq!(activity_suggestion(&data, TODAY).expect("suggestion").factor, 1.725);
+    // The dashboard offers it only when it differs from the profile.
+    let dashboard = build_dashboard(&data, &DashboardQuery::default(), TODAY, 13);
+    let adjust = dashboard.objective.adjust.expect("adjust");
+    assert_eq!(adjust.activity_suggestion.expect("suggestion").label, "Alto (6 a 7 días por semana)");
+    let mut matching = data.clone();
+    matching.profile.as_mut().expect("profile").activity = 1.725;
+    assert!(build_dashboard(&matching, &DashboardQuery::default(), TODAY, 13).objective.adjust.expect("adjust").activity_suggestion.is_none());
+}
+
+/// Four weeks of meals and weighings measure the real expenditure; the
+/// plan uses it only if the person chooses it, and saving the profile keeps
+/// that choice.
+#[test]
+fn the_measured_expenditure_comes_from_the_meals_and_the_weight() {
+    let mut data = overweight();
+    data.meals.clear();
+    data.weights.clear();
+    data.measurements.clear();
+    assert!(matches!(measured_expenditure(&data, TODAY), ExpenditureStatus::Missing(reason) if reason.contains("21")));
+    for back in 1..=24 {
+        data.meals.push(meal(&format!("w{back}"), &days_ago(TODAY, back).to_string(), MealCategory::Almuerzo, "Plato", 2_400.0, back));
+    }
+    assert!(matches!(measured_expenditure(&data, TODAY), ExpenditureStatus::Missing(reason) if reason.contains("pesajes")));
+    // One kilo down in 28 days, weighed every week.
+    for (back, kg) in [(28, 84.0), (21, 83.75), (14, 83.5), (7, 83.25), (1, 83.0)] {
+        data.weights.push(WeightEntry { date: days_ago(TODAY, back).to_string(), kg });
+    }
+    data.weights.sort_by(|a, b| a.date.cmp(&b.date));
+    let ExpenditureStatus::Ready(measured) = measured_expenditure(&data, TODAY) else { panic!("ready") };
+    assert_eq!((measured.intake, measured.logged_days, measured.weighings), (2_400.0, 24, 5));
+    assert!((measured.kg_per_week + 0.25).abs() < 0.01, "{measured:?}");
+    assert_eq!(measured.kcal, 2_680.0);
+
+    let formula = vitals(&data, TODAY);
+    assert!(!formula.tdee_measured && formula.tdee == formula.tdee_formula);
+    let on = applied(data.clone(), &plan_change(&data, &HealthMutation::SetMeasuredExpenditure { enabled: true }, TODAY, &ids()).expect("on"));
+    let measured_vitals = vitals(&on, TODAY);
+    assert_eq!((measured_vitals.tdee, measured_vitals.tdee_measured), (Some(2_680.0), true));
+    assert_eq!(measured_vitals.maintenance.expect("plan").kcal, 2_680.0);
+    let profile = ProfileInput { birth_date: "1992-03-15".into(), sex: "M".into(), height_cm: Some(178.0), activity: Some(1.55), weight_kg: None, water_goal_liters: None };
+    let saved = applied(on.clone(), &plan_change(&on, &HealthMutation::SaveProfile { input: profile }, TODAY, &ids()).expect("profile"));
+    assert!(saved.profile.expect("profile").use_measured_expenditure);
+    let dashboard = build_dashboard(&on, &DashboardQuery::default(), TODAY, 13);
+    let adjust = dashboard.objective.adjust.expect("adjust");
+    assert_eq!((adjust.measured_label.as_deref(), adjust.using_measured, adjust.can_use_measured), (Some("2.680 kcal"), true, true));
+    let changed = applied(on.clone(), &plan_change(&on, &HealthMutation::SetActivity { activity: 1.725 }, TODAY, &ids()).expect("activity"));
+    assert_eq!(changed.profile.expect("profile").activity, 1.725);
+    assert!(plan_change(&on, &HealthMutation::SetActivity { activity: 1.3 }, TODAY, &ids()).is_err());
+}
+
+/// Last night's sleeping pulse against the two weeks before: 5 beats more
+/// is a warning; with fewer than 5 nights there is no average yet.
+#[test]
+fn the_sleeping_pulse_warns_when_it_rises() {
+    let mut data = overweight();
+    data.sleep_bpm.insert(TODAY.to_string(), 56.0);
+    let heart = build_dashboard(&data, &DashboardQuery::default(), TODAY, 13).sleep.heart.expect("heart");
+    assert_eq!((heart.label.as_str(), heart.tone.as_str()), ("Pulso dormido 56 lpm", "muted"));
+    for back in 1..=6 {
+        data.sleep_bpm.insert(days_ago(TODAY, back).to_string(), 50.0);
+    }
+    let heart = build_dashboard(&data, &DashboardQuery::default(), TODAY, 13).sleep.heart.expect("heart");
+    assert_eq!(heart.tone, "warn");
+    assert!(heart.detail.starts_with("6 lpm más que tu promedio de 2 semanas (50)"), "{}", heart.detail);
+    data.sleep_bpm.insert(TODAY.to_string(), 52.0);
+    assert!(!sleep_heart(&data.sleep_bpm, TODAY).expect("heart").elevated());
+    assert!(build_dashboard(&data, &DashboardQuery::default(), TODAY, 13).steps.heart.is_none());
 }

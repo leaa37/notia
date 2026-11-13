@@ -65,7 +65,8 @@
     "targetState": null,
     "lowBmiWarning": false,
     "canPlan": false,
-    "plan": null
+    "plan": null,
+    "adjust": null
   },
   "food": null,
   "todayCalories": null,
@@ -103,7 +104,8 @@
     ],
     "chart": null,
     "emptyText": "Cargá los pasos de al menos dos días para ver tu evolución.",
-    "entries": []
+    "entries": [],
+    "heart": null
   },
   "sleep": {
     "todayLabel": "—",
@@ -133,7 +135,8 @@
     ],
     "chart": null,
     "emptyText": "Cargá el sueño de al menos dos noches para ver tu evolución.",
-    "entries": []
+    "entries": [],
+    "heart": null
   },
   "composition": null,
   "profileForm": {

@@ -375,6 +375,29 @@ pub fn summary_view(data: &HealthData, today: Date) -> Value {
         "bmrKcal": vitals.bmr.map(f64::round),
         "bmrSource": if vitals.bmr_from_scale { "balanza" } else { "Mifflin-St Jeor" },
         "dailyExpenditureKcal": vitals.tdee,
+        "dailyExpenditureSource": if vitals.tdee_measured { "medido con comidas y peso" } else { "fórmula: metabolismo basal × actividad" },
+        "formulaExpenditureKcal": vitals.tdee_formula,
+        "measuredExpenditure": match &vitals.expenditure {
+            super::ExpenditureStatus::Ready(measured) => json!({
+                "kcal": measured.kcal,
+                "intakeKcal": measured.intake,
+                "kgPerWeek": (measured.kg_per_week * 100.0).round() / 100.0,
+                "loggedDays": measured.logged_days,
+                "inUse": vitals.tdee_measured,
+            }),
+            super::ExpenditureStatus::Missing(reason) => json!({ "missing": reason }),
+        },
+        "activitySuggestion": super::activity_suggestion(data, today).map(|suggestion| json!({
+            "level": activity_label(suggestion.factor),
+            "differsFromProfile": (suggestion.factor - profile.activity).abs() > 1e-6,
+            "stepsAveragePerDay": suggestion.steps_average,
+            "trainingDaysPerWeek": suggestion.exercise_days_per_week.map(|days| (days * 10.0).round() / 10.0),
+        })),
+        "sleepingHeartRate": super::sleep_heart(&data.sleep_bpm, today).map(|heart| json!({
+            "lastNightBpm": heart.bpm,
+            "twoWeekAverageBpm": heart.baseline.map(f64::round),
+            "elevated": heart.elevated(),
+        })),
         "objective": { "targetKg": data.objective.target_kg, "paceKgPerWeek": data.objective.pace },
         "plan": plan.map(|plan| json!({
             "kind": if data.plan.is_some() { format!("{:?}", plan.source).to_lowercase() } else { "maintenance".to_string() },

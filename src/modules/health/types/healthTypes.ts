@@ -73,6 +73,19 @@ export interface DailyPanel {
   chart: WeightChart | null
   emptyText: string
   entries: Array<{ date: string; dateLabel: string; valueLabel: string }>
+  /** Pulso dormido de anoche (solo en el sueño, si llegó del reloj). */
+  heart: { label: string; detail: string; tone: 'ok' | 'warn' | 'muted' } | null
+}
+
+/** Lo que las últimas semanas dicen para ajustar el plan (Rust lo calcula). */
+export interface AdjustView {
+  activityLabel: string
+  activitySuggestion: { value: string; label: string; reason: string } | null
+  formulaLabel: string | null
+  measuredLabel: string | null
+  measuredDetail: string
+  usingMeasured: boolean
+  canUseMeasured: boolean
 }
 
 export interface PlanView {
@@ -94,6 +107,7 @@ export interface ObjectivePanel {
   lowBmiWarning: boolean
   canPlan: boolean
   plan: PlanView | null
+  adjust: AdjustView | null
 }
 
 export interface MacroPill {
@@ -272,6 +286,8 @@ export type HealthMutation =
   | { kind: 'deleteSleep'; date: string }
   | { kind: 'saveMeal'; id: string | null; input: MealInput }
   | { kind: 'deleteMeal'; id: string }
+  | { kind: 'setActivity'; activity: number }
+  | { kind: 'setMeasuredExpenditure'; enabled: boolean }
 
 export interface MealEstimate {
   kcal: number

@@ -9,7 +9,7 @@ use serde::Serialize;
 use super::{
     calculate_plan, field_errors_message, fmt, parse_date, short_date, signed, validate_meal, validate_measurement, validate_objective,
     validate_profile, validate_sleep, validate_steps, validate_water, validate_weight, vitals, sleep_label, steps_label, FieldError, HealthData, HealthMutation, Meal, Measurement, Objective, Plan,
-    PlanInput, Profile, WeightEntry,
+    PlanInput, Profile, WatchDay, WeightEntry,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +26,8 @@ pub enum StoreOp {
     DeleteSteps(String),
     PutSleep { date: String, minutes: i64 },
     DeleteSleep(String),
+    /// El pulso promedio mientras dormía, del reloj.
+    PutSleepBpm { date: String, bpm: f64 },
     PutMeal(Meal),
     DeleteMeal(String),
 }
@@ -86,7 +88,9 @@ pub fn plan_change(data: &HealthData, mutation: &HealthMutation, today: Date, id
     let change = |ops: Vec<StoreOp>, summary: String| Change { ops, summary, meal_id: None };
     match mutation {
         HealthMutation::SaveProfile { input } => {
-            let (profile, weight) = validate_profile(input, today).map_err(HealthError::fields)?;
+            let (mut profile, weight) = validate_profile(input, today).map_err(HealthError::fields)?;
+            // El formulario no trae esta elección: queda como estaba.
+            profile.use_measured_expenditure = data.profile.as_ref().is_some_and(|stored| stored.use_measured_expenditure);
             let mut ops = vec![StoreOp::PutProfile(profile.clone())];
             let current = vitals(data, today).current_kg;
             let mut summary = format!(
@@ -245,7 +249,113 @@ pub fn plan_change(data: &HealthData, mutation: &HealthMutation, today: Date, id
                 format!("Eliminar «{}» ({} kcal) de {} del {}.", meal.name, fmt(meal.nutrition.kcal, 0), meal.category.label().to_lowercase(), date_label(&meal.date)),
             ))
         }
+        HealthMutation::ImportWatch { days } => import_watch(data, days, today),
+        HealthMutation::SetActivity { activity } => {
+            let mut profile = data.profile.clone().ok_or_else(|| HealthError::validation("Primero completá tu perfil de Salud."))?;
+            let label = super::activity_label(*activity).ok_or_else(|| HealthError::validation("Elegí un nivel de actividad de la lista."))?;
+            profile.activity = *activity;
+            Ok(change(vec![StoreOp::PutProfile(profile)], format!("Cambiar el nivel de actividad a «{label}».")))
+        }
+        HealthMutation::SetMeasuredExpenditure { enabled } => {
+            let mut profile = data.profile.clone().ok_or_else(|| HealthError::validation("Primero completá tu perfil de Salud."))?;
+            profile.use_measured_expenditure = *enabled;
+            let summary = if *enabled {
+                "Usar el gasto medido con tus comidas y tu peso en lugar del calculado con la fórmula."
+            } else {
+                "Volver al gasto calculado con la fórmula (metabolismo basal × actividad)."
+            };
+            Ok(change(vec![StoreOp::PutProfile(profile)], summary.to_string()))
+        }
     }
+}
+
+/// Lo que trae el reloj: cada dato de cada día reemplaza el guardado y lo
+/// que no llega no se toca. Un dato fuera de rango se descarta (el reloj
+/// puede traer lecturas raras) en lugar de rechazar toda la importación.
+/// La grasa y el metabolismo de la báscula del reloj son una medición de
+/// ese día, con el peso del día (o el último) y lo que ya tuviera.
+fn import_watch(data: &HealthData, days: &[WatchDay], today: Date) -> Result<Change, HealthError> {
+    if days.len() > super::WATCH_IMPORT_MAX_DAYS {
+        return Err(HealthError::validation(format!("Se importan hasta {} días por vez.", super::WATCH_IMPORT_MAX_DAYS)));
+    }
+    let oldest = super::days_ago(today, super::WATCH_IMPORT_OLDEST_DAYS);
+    let height = data.profile.as_ref().map(|profile| profile.height_cm);
+    let mut ops = Vec::new();
+    let (mut steps_days, mut sleep_days, mut heart_days, mut weight_days, mut body_days) = (0, 0, 0, 0, 0);
+    for day in days {
+        let Some(date) = parse_date(day.date.trim()).filter(|date| *date <= today && *date >= oldest) else { continue };
+        let key = date.to_string();
+        if let Some(Ok((date, steps))) = day.steps.filter(|steps| *steps > 0).map(|steps| validate_steps(&key, &steps.to_string(), today)) {
+            if data.steps.get(&date) != Some(&steps) {
+                ops.push(StoreOp::PutSteps { date, steps });
+                steps_days += 1;
+            }
+        }
+        if let Some(Ok((date, minutes))) = day.sleep_minutes.filter(|minutes| *minutes > 0).map(|minutes| validate_sleep(&key, &format!("{minutes} min"), today)) {
+            if data.sleep.get(&date) != Some(&minutes) {
+                ops.push(StoreOp::PutSleep { date, minutes });
+                sleep_days += 1;
+            }
+        }
+        if let Some(bpm) = day.sleep_bpm.filter(|bpm| (25.0..=150.0).contains(bpm)).map(super::round1) {
+            if data.sleep_bpm.get(&key) != Some(&bpm) {
+                ops.push(StoreOp::PutSleepBpm { date: key.clone(), bpm });
+                heart_days += 1;
+            }
+        }
+        let weight = day.weight_kg.and_then(|kg| validate_weight(&key, Some(kg), today).ok());
+        if let Some(entry) = &weight {
+            if !data.weights.iter().any(|stored| stored.date == entry.date && (stored.kg - entry.kg).abs() < 0.05) {
+                ops.push(StoreOp::PutWeight(entry.clone()));
+                weight_days += 1;
+            }
+        }
+        let mut values = std::collections::BTreeMap::new();
+        if let Some(fat) = day.body_fat_pct {
+            values.insert("grasaPct".to_string(), fat);
+        }
+        if let Some(bmr) = day.bmr_kcal {
+            values.insert("metabolismo".to_string(), bmr);
+        }
+        if values.is_empty() {
+            continue;
+        }
+        let stored = data.measurements.iter().find(|measurement| measurement.date == key);
+        let kg = weight
+            .as_ref()
+            .map(|entry| entry.kg)
+            .or_else(|| stored.map(|measurement| measurement.weight))
+            .or_else(|| data.weights.iter().filter(|entry| entry.date <= key).last().map(|entry| entry.kg));
+        let Some(kg) = kg else { continue };
+        let mut merged = stored.map(|measurement| measurement.values.clone()).unwrap_or_default();
+        // Lo que se calcula del peso o de la grasa se vuelve a calcular.
+        let weight_changed = stored.map_or(true, |measurement| (measurement.weight - kg).abs() >= 0.05);
+        let derived: &[&str] = if weight_changed {
+            &["imc", "grasaKg", "pesoSinGrasa", "aguaKg", "musculoKg", "mmeKg"]
+        } else if values.contains_key("grasaPct") {
+            &["grasaKg", "pesoSinGrasa"]
+        } else {
+            &[]
+        };
+        for key in derived {
+            merged.remove(*key);
+        }
+        merged.extend(values);
+        let input = super::MeasurementInput { date: key.clone(), weight: Some(kg), values: merged };
+        if let Ok(measurement) = validate_measurement(&input, height, today) {
+            if stored != Some(&measurement) {
+                ops.push(StoreOp::PutMeasurement(measurement));
+                body_days += 1;
+            }
+        }
+    }
+    let parts = [(steps_days, "pasos"), (sleep_days, "sueño"), (heart_days, "pulso dormido"), (weight_days, "peso"), (body_days, "composición")]
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, what)| format!("{what} de {count} {}", if *count == 1 { "día" } else { "días" }))
+        .collect::<Vec<_>>();
+    let summary = if parts.is_empty() { "Sin datos nuevos del reloj.".to_string() } else { format!("Datos del reloj: {}.", parts.join(", ")) };
+    Ok(Change { ops, summary, meal_id: None })
 }
 
 /// Lo que hace falta para armar un plan: perfil, peso, gasto y objetivo.

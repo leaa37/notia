@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { asHealthError } from '../services/healthService'
-import type { BmiPanel, DailyPanel, ObjectivePanel, WaterPanel, WeightPanel } from '../types/healthTypes'
+import type { AdjustView, BmiPanel, DailyPanel, ObjectivePanel, WaterPanel, WeightPanel } from '../types/healthTypes'
 import { RangeBarView, WeightChartView } from './HealthCharts'
 import { toNumber, type DailyPanelCopy } from './healthUi'
 
@@ -128,6 +128,11 @@ export function DailyPanelView({ panel, copy, today, onRange, onAdd, onDelete }:
             <span className="hl-small hl-muted">{panel.todayCaption}</span>
           </div>
           {panel.summary && <p className="hl-small hl-muted">{panel.summary}</p>}
+          {panel.heart && (
+            <p className={panel.heart.tone === 'warn' ? 'hl-small hl-warn' : 'hl-small hl-muted'}>
+              <span className="hl-strong">{panel.heart.label}.</span> {panel.heart.detail}
+            </p>
+          )}
         </div>
         <div className="hl-seg" role="group" aria-label={`Período del gráfico de ${copy.title.toLowerCase()}`}>
           {panel.ranges.map((range) => (
@@ -175,9 +180,38 @@ interface ObjectivePanelProps {
   onGeneratePlan: () => Promise<void>
   onCalculatePlan: () => Promise<void>
   onClearPlan: () => void
+  onActivity: (activity: number) => void
+  onMeasuredExpenditure: (enabled: boolean) => void
 }
 
-export function ObjectivePanelView({ panel, onObjective, onGeneratePlan, onCalculatePlan, onClearPlan }: ObjectivePanelProps) {
+/** El gasto medido y el nivel de actividad que muestran tus datos. */
+function AdjustBlock({ adjust, onActivity, onMeasuredExpenditure }: { adjust: AdjustView; onActivity: (activity: number) => void; onMeasuredExpenditure: (enabled: boolean) => void }) {
+  return (
+    <div className="hl-well hl-adjust">
+      <h3 className="hl-small hl-strong">Ajustes con tus datos</h3>
+      <dl className="hl-pairs">
+        <dt>Gasto por fórmula</dt><dd>{adjust.formulaLabel ?? '—'}</dd>
+        <dt>Gasto medido</dt><dd>{adjust.measuredLabel ?? '—'}</dd>
+      </dl>
+      <p className="hl-small hl-muted">{adjust.measuredDetail}</p>
+      {adjust.canUseMeasured && (
+        <label className="hl-small">
+          <input type="checkbox" checked={adjust.usingMeasured} onChange={(event) => onMeasuredExpenditure(event.target.checked)} />
+          {' '}Usar el gasto medido para mis calorías
+        </label>
+      )}
+      <p className="hl-small">Nivel de actividad: {adjust.activityLabel}</p>
+      {adjust.activitySuggestion && (
+        <>
+          <p className="hl-small">Según tus datos sería <span className="hl-strong">{adjust.activitySuggestion.label}</span>. {adjust.activitySuggestion.reason}</p>
+          <button type="button" className="hl-button" onClick={() => onActivity(Number(adjust.activitySuggestion?.value))}>Usar este nivel</button>
+        </>
+      )}
+    </div>
+  )
+}
+
+export function ObjectivePanelView({ panel, onObjective, onGeneratePlan, onCalculatePlan, onClearPlan, onActivity, onMeasuredExpenditure }: ObjectivePanelProps) {
   const [target, setTarget] = useState(panel.targetKg === null ? '' : String(panel.targetKg).replace('.', ','))
   const [busy, setBusy] = useState<'ai' | 'calculated' | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -245,6 +279,7 @@ export function ObjectivePanelView({ panel, onObjective, onGeneratePlan, onCalcu
           <button type="button" className="hl-link" onClick={onClearPlan}>Quitar plan y volver a mantenimiento</button>
         </div>
       )}
+      {panel.adjust && <AdjustBlock adjust={panel.adjust} onActivity={onActivity} onMeasuredExpenditure={onMeasuredExpenditure} />}
     </section>
   )
 }

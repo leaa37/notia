@@ -251,6 +251,15 @@
       "summary": "Déficit de 550 kcal por día sobre tu gasto estimado.",
       "notes": [],
       "recommendations": []
+    },
+    "adjust": {
+      "activityLabel": "Ligero (1 a 3 días por semana)",
+      "activitySuggestion": null,
+      "formulaLabel": "2.436 kcal",
+      "measuredLabel": null,
+      "measuredDetail": "Hacen falta comidas cargadas en al menos 21 de los últimos 28 días (hay 2).",
+      "usingMeasured": false,
+      "canUseMeasured": false
     }
   },
   "food": {
@@ -665,7 +674,8 @@
         "dateLabel": "24 sept 2026",
         "valueLabel": "6.200 pasos"
       }
-    ]
+    ],
+    "heart": null
   },
   "sleep": {
     "todayLabel": "6 h 30 min",
@@ -776,7 +786,8 @@
         "dateLabel": "26 sept 2026",
         "valueLabel": "6 h 40 min"
       }
-    ]
+    ],
+    "heart": null
   },
   "composition": {
     "date": "2026-09-28",

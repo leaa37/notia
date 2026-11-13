@@ -944,6 +944,9 @@ pub fn read_tool(name: &str, arguments: &Value, data: &GymData, catalog: &Catalo
                     "kcal": workout.kcal,
                     "sets": workout.sets,
                     "volumeKg": workout.volume,
+                    "fromWatch": workout.watch_id.is_some(),
+                    "avgBpm": workout.avg_bpm,
+                    "maxBpm": workout.max_bpm,
                     "exercises": workout.exercises.iter().map(|item| json!({
                         "exercise": catalog.exercise(&item.exercise).map(|exercise| exercise.name.clone()).unwrap_or_else(|| item.exercise.clone()),
                         "sets": item.sets,
