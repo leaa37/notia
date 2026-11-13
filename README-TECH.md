@@ -10823,7 +10823,7 @@ contexto: "#Personal"                         # líneas de nota: se conservan al
 - `view.rs`: `build_view(data, catalog, query, today, now_ms)` arma solo la pantalla pedida (`panel`, `rutinas`, `editar`, `entrenar`, `equipo`).
   - Panel:
     - la racha cuenta semanas seguidas con al menos tantos días entrenados como días asignados;
-    - semana, calorías, tiempo, próxima rutina y consejo;
+    - semana, calorías, tiempo, próxima rutina y consejo. La próxima es la asignada a hoy si hoy no entrenó («Hoy toca …», `nextIsToday: true`, 2026-11-13); si no, la del próximo día asignado («Hoy es día de descanso» o «Hoy ya entrenaste», `nextIsToday: false`). `nextIsToday` lo usan los clientes que recomiendan empezar la rutina del día, como la app Notia Fit; la web no lo muestra. Prueba: `the_panel_counts_the_week_and_the_muscles`;
     - estado de los músculos de la semana: fatigado si pasaron menos de 36 h, recuperándose hasta 72 h y recuperado después. Las series principales cuentan 1 y las secundarias 0,5;
     - calendario de 24 semanas, con niveles 1–3 por tercios de calorías, y barras de 14 días.
   - Rutinas: resumen de músculos, volumen y descanso total. La biblioteca de ejercicios filtra por texto (nombre, alias, equipamiento), por grupo y por «solo con mi equipamiento».

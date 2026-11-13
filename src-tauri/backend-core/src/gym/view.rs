@@ -210,6 +210,9 @@ pub struct PanelView {
     pub next_label: String,
     pub next_routine_id: Option<String>,
     pub next_name: String,
+    /// La próxima es la rutina asignada a hoy y hoy todavía no entrenó: la
+    /// que se recomienda empezar.
+    pub next_is_today: bool,
     pub stats: Vec<StatCard>,
     pub muscle_states: BTreeMap<String, String>,
     pub muscles: Vec<MuscleRow>,
@@ -644,8 +647,10 @@ fn panel(data: &GymData, catalog: &Catalog, query: &GymQuery, today: Date, now_m
     let trained_today = days.contains_key(&today_key);
     let mut next: Option<&Routine> = None;
     let mut next_label = String::new();
+    let mut next_is_today = false;
     if let (Some(routine), false) = (assigned.get(&today_index), trained_today) {
         next = Some(routine);
+        next_is_today = true;
         next_label = format!("Hoy toca {}", routine.name);
     } else {
         for offset in 1..=7 {
@@ -857,6 +862,7 @@ fn panel(data: &GymData, catalog: &Catalog, query: &GymQuery, today: Date, now_m
         next_label,
         next_routine_id: next.map(|routine| routine.id.clone()),
         next_name: next.map(|routine| routine.name.clone()).unwrap_or_default(),
+        next_is_today,
         stats,
         muscle_states,
         muscles,

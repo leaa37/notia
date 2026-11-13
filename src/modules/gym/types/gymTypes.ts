@@ -112,6 +112,8 @@ export interface PanelView {
   nextLabel: string
   nextRoutineId: string | null
   nextName: string
+  /** La próxima es la rutina de hoy y hoy todavía no entrenó. */
+  nextIsToday: boolean
   stats: StatCard[]
   muscleStates: Record<string, MuscleState>
   muscles: MuscleRow[]

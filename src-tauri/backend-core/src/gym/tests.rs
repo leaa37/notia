@@ -231,6 +231,7 @@ fn the_panel_counts_the_week_and_the_muscles() {
     let panel = view.panel.expect("panel");
     assert_eq!(panel.week_label, "Semana del 28 de septiembre al 4 de octubre");
     assert_eq!(panel.next_label, "Hoy toca Nueva rutina");
+    assert!(panel.next_is_today);
     let stat = |key: &str| panel.stats.iter().find(|stat| stat.key == key).cloned().expect("stat");
     assert_eq!(stat("streak").value, "2 semanas");
     assert_eq!(stat("week").value, "1 de 2");
@@ -240,6 +241,15 @@ fn the_panel_counts_the_week_and_the_muscles() {
     assert_eq!(panel.weeks.len(), 24);
     assert!(panel.day.has && panel.day.date.starts_with("Lunes 28 de septiembre"));
     assert_eq!(panel.bars.len(), 14);
+
+    // A rest day, or a day already trained, recommends nothing for today.
+    let friday = build_view(&data, &catalog, &GymQuery::default(), parse_date("2026-10-02").expect("date"), now).panel.expect("panel");
+    assert!(!friday.next_is_today);
+    assert!(friday.next_label.starts_with("Hoy es día de descanso"), "{}", friday.next_label);
+    data.workouts.push(workout("2026-10-01", now));
+    let trained = build_view(&data, &catalog, &GymQuery::default(), today, now).panel.expect("panel");
+    assert!(!trained.next_is_today);
+    assert!(trained.next_label.starts_with("Hoy ya entrenaste"), "{}", trained.next_label);
 }
 
 #[test]
