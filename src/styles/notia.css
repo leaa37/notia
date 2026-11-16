@@ -5189,13 +5189,18 @@ table { width: 100%; border-collapse: collapse; } th, td { padding: 11px 8px; te
 }
 
 .notia-chat-message-bubble--thinking {
-  height: 142px;
-  min-height: 142px;
-  max-height: 142px;
   background: color-mix(in srgb, var(--color-card-bg) 90%, var(--color-accent-bg) 10%);
   color: var(--color-muted-text);
   opacity: 0.78;
   overflow: hidden;
+}
+
+/* The reasoning streams in a block of fixed height, so the thread does not
+   jump while it grows; with only the dots the bubble fits them. */
+.notia-chat-message-bubble--thinking-text {
+  height: 142px;
+  min-height: 142px;
+  max-height: 142px;
 }
 
 .notia-chat-message-bubble--thinking .notia-chat-markdown {

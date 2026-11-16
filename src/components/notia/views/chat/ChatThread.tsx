@@ -635,7 +635,7 @@ function ChatThreadComponent({
               {!pendingAgentQuestion && !pendingAgentConfirmation && !streamingTerminal ? (
               <article className="notia-chat-message notia-chat-message--assistant">
                 <AssistantAvatar agent={streamingAgentLook} />
-                <div className="notia-chat-message-bubble notia-chat-message-bubble--thinking">
+                <div className={`notia-chat-message-bubble notia-chat-message-bubble--thinking${streamingThinking.trim() ? ' notia-chat-message-bubble--thinking-text' : ''}`}>
                   <span className="notia-chat-message-role">
                     {streamingAgentLook ? `${streamingAgentLook.name} · pensando` : 'Progreso'}
                   </span>

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::catalog::{
-    authorize_tool_call, project_tool_catalog, AuthorizationPrincipal, ToolCatalogProjection,
+    authorize_tool_call, project_tool_catalog, tool_policy, AuthorizationPrincipal, ToolCatalogProjection, ToolPolicy,
 };
 use super::chat_attachments::{read_attachment, read_attachment_tool, READ_ATTACHMENT_TOOL};
 use super::context::BackendRequestContext;
@@ -873,39 +873,21 @@ fn run_agent_inner(
                     }
                 }
             }
-            let content = verified_web_citations(content, &tool_results);
-            let response = AgentResponse {
-                request_id: request.context.request_id.clone(),
-                changed: tool_results.iter().any(|result| result.changed),
-                rounds,
-                response: channel_response(content.clone()),
-                tool_results,
-            };
-            if !streamed_content {
-                emit(
-                    events,
-                    options,
-                    &mut event_count,
-                    BackendEvent::AssistantDelta {
-                        request_id: request.context.request_id.clone(),
-                        delta: content,
-                    },
-                )?;
-            }
-            state.store_response(&request.context, &request.idempotency_key, &response)?;
-            emit(
-                events,
-                options,
-                &mut event_count,
-                BackendEvent::Completed {
-                    request_id: request.context.request_id.clone(),
-                    rounds,
-                },
-            )?;
-            return Ok(response);
+            return complete_run(state, events, options, &mut event_count, request, rounds, tool_results, content, streamed_content);
         }
 
-        if !content.is_empty() {
+        // An answer written along with only the agent's own notes (memory,
+        // thoughts, how the person talks…) is the turn's answer: the notes
+        // are saved and the run ends with it. Asking another round made the
+        // model answer again, and the person got the same answer twice. An
+        // answer that only announces a step, or a turn that may write
+        // Finanzas (its answer is checked), keeps going as before.
+        let answers_with_notes = !content.is_empty()
+            && !answer_only
+            && calls.iter().all(|call| tool_policy(&call.name) == ToolPolicy::Memory)
+            && !offers_finance_writes(request, &tools)
+            && !announces_pending_step(request, options, control, &content, tool_results.len(), true);
+        if !content.is_empty() && !answers_with_notes {
             emit(
                 events,
                 options,
@@ -1355,6 +1337,9 @@ fn run_agent_inner(
             append_model_images(&mut messages, model_images);
             had_tool_result = true;
         }
+        if answers_with_notes {
+            return complete_run(state, events, options, &mut event_count, request, rounds, tool_results, content, streamed_content);
+        }
         if repeated_call {
             messages.push(system_correction(
                 "No repitas una llamada idéntica ya ejecutada en esta operación. Reutiliza el resultado disponible y responde con la evidencia obtenida.",
@@ -1379,6 +1364,53 @@ fn run_agent_inner(
             false,
         ),
     )
+}
+
+/// Ends the run with `content` as its answer: the response is stored, the
+/// answer reaches the person (unless it already streamed) and the run
+/// completes.
+#[allow(clippy::too_many_arguments)]
+fn complete_run(
+    state: &dyn AgentStateHooks,
+    events: &dyn BackendEventSink,
+    options: &AgentRuntimeOptions,
+    event_count: &mut usize,
+    request: &AgentRequest,
+    rounds: u32,
+    tool_results: Vec<ToolResult>,
+    content: String,
+    streamed_content: bool,
+) -> Result<AgentResponse, BackendError> {
+    let content = verified_web_citations(content, &tool_results);
+    let response = AgentResponse {
+        request_id: request.context.request_id.clone(),
+        changed: tool_results.iter().any(|result| result.changed),
+        rounds,
+        response: channel_response(content.clone()),
+        tool_results,
+    };
+    if !streamed_content {
+        emit(
+            events,
+            options,
+            event_count,
+            BackendEvent::AssistantDelta {
+                request_id: request.context.request_id.clone(),
+                delta: content,
+            },
+        )?;
+    }
+    state.store_response(&request.context, &request.idempotency_key, &response)?;
+    emit(
+        events,
+        options,
+        event_count,
+        BackendEvent::Completed {
+            request_id: request.context.request_id.clone(),
+            rounds,
+        },
+    )?;
+    Ok(response)
 }
 
 fn validate_runtime_request(
@@ -2478,6 +2510,70 @@ mod tests {
 
     fn accepted(approve_all: bool) -> ConfirmationDecision {
         ConfirmationDecision { operation_id: "call-1".into(), accepted: true, hunk_ids: Vec::new(), approve_all, suggestion: None }
+    }
+
+    /// An answer written along with only a note of the agent (here, how the
+    /// person talks) ends the turn: the note is saved and the person gets the
+    /// answer once, not a note and then the same answer again.
+    #[test]
+    fn an_answer_with_only_its_own_notes_ends_the_turn() {
+        let note = |id: &str| ProviderToolCall {
+            id: id.into(),
+            name: "add_agent_talk".into(),
+            arguments: serde_json::json!({"observation": "Saluda simple: «hola»."}),
+        };
+        let provider = Provider {
+            responses: Mutex::new(vec![
+                assistant("¡Hola! ¿En qué te ayudo?", vec![note("call-1")]),
+                assistant("¡Hola! ¿En qué te ayudo hoy?", Vec::new()),
+            ]),
+            calls: Mutex::new(0),
+        };
+        let executor = read_executor();
+        let events = VecEventSink::default();
+        let response = run_agent_inner(
+            &provider,
+            &executor,
+            &NoopAgentState,
+            &events,
+            &request(vec![tool("add_agent_talk", false), tool("read_library_documents", true)]),
+            &principal(),
+            &RequestControl::new(None),
+            &AgentRuntimeOptions::default(),
+            None,
+            None,
+            None,
+        )
+        .expect("answered");
+        assert_eq!(response.response.markdown, "¡Hola! ¿En qué te ayudo?");
+        assert_eq!(*provider.calls.lock().expect("calls"), 1, "no second round");
+        assert_eq!(*executor.executions.lock().expect("executions"), 1, "the note is saved");
+        assert!(!events.events().iter().any(|event| matches!(event, BackendEvent::AssistantNote { .. })));
+
+        // An answer that only announces a step keeps working after its note.
+        let provider = Provider {
+            responses: Mutex::new(vec![
+                assistant("Voy a crear la nota con lo que me contaste.", vec![note("call-1")]),
+                assistant("Listo, quedó la nota.", Vec::new()),
+            ]),
+            calls: Mutex::new(0),
+        };
+        let response = run_agent_inner(
+            &provider,
+            &read_executor(),
+            &NoopAgentState,
+            &VecEventSink::default(),
+            &request(vec![tool("add_agent_talk", false), tool("read_library_documents", true)]),
+            &principal(),
+            &RequestControl::new(None),
+            &AgentRuntimeOptions::default(),
+            None,
+            None,
+            None,
+        )
+        .expect("answered");
+        assert_eq!(response.response.markdown, "Listo, quedó la nota.");
+        assert_eq!(*provider.calls.lock().expect("calls"), 2);
     }
 
     #[test]
