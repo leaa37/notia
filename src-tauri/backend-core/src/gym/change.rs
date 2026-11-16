@@ -3,6 +3,8 @@
 //! acá y se traduce en operaciones que el adaptador guarda en una
 //! transacción.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 use super::{
@@ -44,7 +46,16 @@ pub enum GymMutation {
     ResumeSession,
     FinishSession,
     RestartSession,
-    ToggleSetDone { routine_id: String, item_id: String, index: usize },
+    /// Marca o desmarca una serie. En un ejercicio de a un lado, el primer
+    /// toque marca un lado y el segundo, la serie; con `whole` se marca o
+    /// desmarca entera (la IA, que no va lado por lado).
+    ToggleSetDone {
+        routine_id: String,
+        item_id: String,
+        index: usize,
+        #[serde(default)]
+        whole: bool,
+    },
     AdjustRestTimer { delta_ms: i64 },
     SkipRest,
     /// Una rutina entera, nueva o cambiada (herramientas de la IA). `items`,
@@ -167,6 +178,19 @@ fn parse_value(value: &str, field: SetField) -> GymResult<Option<f64>> {
     Ok(Some((number * 100.0).round() / 100.0))
 }
 
+/// Pone la marca de una serie, con la lista del tamaño de las series del
+/// ítem. Una lista que queda sin marcas se quita.
+fn set_flag(flags: &mut BTreeMap<String, Vec<bool>>, item_id: &str, index: usize, sets: usize, value: bool) {
+    let list = flags.entry(item_id.to_string()).or_default();
+    if list.len() < sets {
+        list.resize(sets, false);
+    }
+    list[index] = value;
+    if !list.iter().any(|flag| *flag) {
+        flags.remove(item_id);
+    }
+}
+
 /// Las series que faltan hacer de una rutina con la sesión.
 fn pending_sets(routine: &Routine, session: &Session) -> usize {
     routine.items.iter().map(|item| (0..item.sets.len()).filter(|index| !session.is_done(&item.id, *index)).count()).sum()
@@ -185,10 +209,7 @@ pub fn workout_of(routine: &Routine, session: &Session, catalog: &Catalog, now_m
             continue;
         }
         let exercise = catalog.exercise(&item.exercise);
-        let weighted_reps = exercise.is_some_and(|exercise| exercise.tracking.weighted() && !exercise.tracking.timed());
-        if weighted_reps {
-            volume += done.iter().map(|set| set.weight.unwrap_or(0.0) * set.reps.unwrap_or(0.0)).sum::<f64>();
-        }
+        volume += exercise.map(|exercise| exercise.volume(&done)).unwrap_or(0.0);
         kcal_rates.push(exercise.map(|exercise| exercise.kcal_per_min).unwrap_or(5.0));
         sets += done.len() as u32;
         exercises.push(WorkoutExercise { exercise: item.exercise.clone(), sets: done });
@@ -241,6 +262,7 @@ fn session_for(data: &GymData, routine_id: &str, now_ms: i64) -> GymResult<Sessi
             rest_left_ms: None,
             rest_total_ms: 0,
             done: Default::default(),
+            sides: Default::default(),
         }),
     }
 }
@@ -442,7 +464,7 @@ pub fn plan_change(data: &GymData, catalog: &Catalog, mutation: &GymMutation, cl
             Change { ops, routine_id: None }
         }
         GymMutation::RestartSession => Change { ops: vec![StoreOp::PutSession(None)], routine_id: None },
-        GymMutation::ToggleSetDone { routine_id, item_id, index } => {
+        GymMutation::ToggleSetDone { routine_id, item_id, index, whole } => {
             let routine = routine(data, routine_id)?;
             let item = routine.items.iter().find(|item| &item.id == item_id).ok_or_else(|| GymError::not_found("El ejercicio ya no está en la rutina."))?;
             if *index >= item.sets.len() {
@@ -461,11 +483,16 @@ pub fn plan_change(data: &GymData, catalog: &Catalog, mutation: &GymMutation, cl
                 session.started_ms = now;
                 session.rest_left_ms = None;
             }
-            let flags = session.done.entry(item_id.clone()).or_insert_with(Vec::new);
-            if flags.len() < item.sets.len() {
-                flags.resize(item.sets.len(), false);
+            let unilateral = catalog.exercise(&item.exercise).is_some_and(|exercise| exercise.unilateral);
+            let first_side = unilateral && !*whole && !was_done && !session.is_one_side(item_id, *index);
+            set_flag(&mut session.sides, item_id, *index, item.sets.len(), first_side);
+            if first_side {
+                // Sigue enseguida con el otro lado: el descanso va después.
+                session.rest_end_ms = None;
+                session.rest_left_ms = None;
+                return Ok(Change { ops: vec![StoreOp::PutSession(Some(session))], routine_id: None });
             }
-            flags[*index] = !was_done;
+            set_flag(&mut session.done, item_id, *index, item.sets.len(), !was_done);
             if !was_done {
                 let rest_ms = item.rest_s as i64 * 1000;
                 if pending_sets(routine, &session) > 0 && rest_ms > 0 {
@@ -734,9 +761,7 @@ fn logged_workout(
     for item in exercises {
         let exercise = catalog.exercise(&item.exercise).ok_or_else(|| GymError::not_found(format!("El ejercicio «{}» no está en Gym/exercises.", item.exercise)))?;
         let item_sets = checked_sets(&item.sets)?;
-        if exercise.tracking.weighted() && !exercise.tracking.timed() {
-            volume += item_sets.iter().map(|set| set.weight.unwrap_or(0.0) * set.reps.unwrap_or(0.0)).sum::<f64>();
-        }
+        volume += exercise.volume(&item_sets);
         rates.push(exercise.kcal_per_min);
         sets += item_sets.len() as u32;
         done.push(WorkoutExercise { exercise: item.exercise.clone(), sets: item_sets });
@@ -773,6 +798,8 @@ pub enum ExerciseEdit {
     Group { value: String },
     Weighted { value: bool },
     Timed { value: bool },
+    /// De a un lado (un brazo o una pierna) o con los dos a la vez.
+    Unilateral { value: bool },
     /// Ninguno → principal → secundario → ninguno.
     CycleMuscle { muscle: String },
     ToggleEquipment { equipment_id: String },
@@ -821,6 +848,7 @@ pub fn apply_exercise_edit(exercise: &mut super::Exercise, edit: &ExerciseEdit, 
                 (false, false) => super::Tracking::Reps,
             };
         }
+        ExerciseEdit::Unilateral { value } => exercise.unilateral = *value,
         ExerciseEdit::CycleMuscle { muscle } => {
             let key = super::muscle_key(muscle).ok_or_else(|| GymError::validation("El músculo no existe."))?.to_string();
             match exercise.muscle_level(&key) {

@@ -10776,6 +10776,7 @@ Ejercicio (`backend-core/src/gym/markdown.rs`):
 id: bench_press
 grupo: pecho            # pecho, espalda, piernas, hombros, brazos, core, completo, cardio, estiramiento
 registro: peso-reps     # peso-reps, reps, tiempo, peso-tiempo
+unilateral: sí          # opcional: de a un lado (un brazo o una pierna); sin la línea, con los dos a la vez
 kcalPorMinuto: 6
 principales: Pecho superior, Pecho inferior   # los 21 músculos por nombre (también clave o nombre del SVG)
 secundarios: Tríceps, Deltoide anterior
@@ -10796,12 +10797,13 @@ contexto: "#Personal"                         # líneas de nota: se conservan al
 - `parse_exercise(path, text, with_image)`: sin `id` o sin nombre no es un ejercicio. Las listas no cargan la imagen (`has_image`); la ficha sí.
 - `render_exercise` reescribe el archivo completo con la imagen que tenga `Exercise.image`, así que quien edita lee antes el ejercicio con imagen.
 - **Video por id** (2026-11-13): un ejercicio sin `video:` usa el video de `Gym/exercises` que se llama como su `id`, sin importar mayúsculas: `<id>.mp4`, si no `<id>.webm`, si no `<id>.mov` (`video_by_id`, `VIDEO_EXTENSIONS` en `gym/mod.rs`). Un `video:` escrito tiene prioridad. `render_exercise` no escribe `video:` cuando el nombre sigue esa regla (`is_video_of_id`), así que editar la ficha no lo agrega. El adaptador lista los videos junto con los `.md` de la carpeta (`catalog_file_name`, en escritorio y en Android con `shallow_stamps` y `flat_stamps`), no los lee, y `assemble_catalog` completa `Exercise.video`; `full_exercise` toma ese video del catálogo para la ficha. Como el video entra en la lista, agregarlo o quitarlo fuera de Notia se ve en hasta 5 s (`LISTING_TTL`). Borrar el ejercicio o quitar su demostración borra también ese video, igual que el nombrado. `gym_set_media` sigue guardando el video subido como `<nombre del .md>.<ext>` con su `video:`. Pruebas: `a_video_named_after_the_id_needs_no_video_line` (núcleo), `a_video_named_after_the_id_is_found_in_the_listing` y `android_listings_keep_only_the_catalog_folder` (adaptador).
+- **De a un lado** (2026-11-16): `unilateral: sí` (también `si`, `true`, `yes` o `1`, sin importar mayúsculas ni acentos) marca un ejercicio que se hace con un lado y después con el otro (`Exercise.unilateral`). Las repeticiones y el peso de cada serie son por lado. `render_exercise` escribe `unilateral: sí` solo cuando es verdadero. Ver «Ejercicios de a un lado» en el núcleo.
 - Equipamiento: `id`, `categoria` (`libres`, `estructuras`, `maquinas`, `accesorios`, `otros`), `origen`, título y foto.
 - `read_library_documents` ya quita las imágenes embebidas antes de dárselas al modelo.
 
 ### Datos (migración 31)
 
-- `gym_settings(owner_user_id PK, owned_json, session_json, updated_at)`: ids del equipamiento propio y la `Session` en curso. La sesión guarda el estado `running|paused|done`, `started_ms`, `acc_ms`, el descanso (`rest_end_ms`, `rest_left_ms`, `rest_total_ms`) y las series hechas por ítem.
+- `gym_settings(owner_user_id PK, owned_json, session_json, updated_at)`: ids del equipamiento propio y la `Session` en curso. La sesión guarda el estado `running|paused|done`, `started_ms`, `acc_ms`, el descanso (`rest_end_ms`, `rest_left_ms`, `rest_total_ms`), las series hechas por ítem (`done`) y, en los ejercicios de a un lado, las series con un solo lado hecho (`sides`, opcional en el JSON: una sesión guardada antes se lee igual).
 - `gym_routines(id PK, owner_user_id, position, routine_json, updated_at)`: la `Routine`, con:
   - días (0 = lunes);
   - un color de la paleta (`azul`, `violeta`, `oro`, `verde`, `ambar`, `teal`, `coral`);
@@ -10810,7 +10812,7 @@ contexto: "#Personal"                         # líneas de nota: se conservan al
   - las series hechas;
   - los minutos (mínimo 1);
   - las calorías: minutos × promedio de kcal/min de los ejercicios hechos;
-  - el volumen: peso × repeticiones, en los ejercicios con peso y repeticiones.
+  - el volumen: peso × repeticiones, en los ejercicios con peso y repeticiones; × 2 en los de a un lado (`Exercise::volume`, el mismo cálculo en la rutina, el entrenamiento en curso, el historial y el entrenamiento registrado por la IA).
 - Todas las tablas tienen `ON DELETE CASCADE` sobre `library_users`, y cada usuario ve solo lo suyo.
 
 ### Núcleo (`backend-core/src/gym`)
@@ -10819,7 +10821,8 @@ contexto: "#Personal"                         # líneas de nota: se conservan al
   - `GymMutation` (rutinas, ítems, series, días, descanso, equipamiento y atajos, sesión) se traduce en `StoreOp`s, guardadas en una transacción.
   - Si hay una sesión activa de otra rutina, la nueva se rechaza con «Terminá primero el entrenamiento de …».
   - Marcar una serie arranca la sesión si hace falta, y el descanso del ítem si quedan series.
-  - `CatalogMutation`/`ExerciseEdit` cambian la ficha: músculos en ciclo (ninguno → principal → secundario → ninguno), equipamiento, peso, tiempo, kcal (0–40), pasos (hasta 20) y quitar la demostración.
+  - **Ejercicios de a un lado** (2026-11-16): en un ejercicio con `unilateral`, el primer `ToggleSetDone` marca un lado (`Session.sides`), corta el descanso que corría y no arranca otro: el otro lado va enseguida. El segundo marca la serie (`done`), limpia el lado y arranca el descanso. Tocar una serie hecha la desmarca entera. `ToggleSetDone { whole: true }` marca o desmarca la serie entera de una vez; lo usa `mark_set`/`unmark_set` de la IA, que no va lado por lado. Las vistas: `ItemView.unilateral` y el resumen «3 series de 10 reps por lado»; en Entrenar, `TrainSet.oneSide`, `TrainItem.unilateral` y `TrainItem.sideText` («Ahora con el otro lado: serie N de M. Tocala de nuevo cuando termines.»), y `nextText` termina en «, con el otro lado». `ExerciseEdit::Unilateral` lo cambia desde la ficha (`ExerciseDetail.unilateral`, y la descripción suma «de a un lado…»). Pruebas: `a_one_side_exercise_takes_both_sides_before_the_rest` y `a_one_side_exercise_is_written_in_its_file`. En la web, `TrainingScreen.test.tsx` cubre el aviso y las etiquetas de cada lado. Validado: `cargo test` del núcleo y del adaptador (fallan solo las 3 pruebas ajenas que ya fallaban: generación de imágenes, reunión y token de Telegram), Vitest de Gimnasio, `tsc` y ESLint. Pendiente: verlo en un teléfono.
+  - `CatalogMutation`/`ExerciseEdit` cambian la ficha: músculos en ciclo (ninguno → principal → secundario → ninguno), equipamiento, peso, tiempo, de a un lado, kcal (0–40), pasos (hasta 20) y quitar la demostración.
 - `view.rs`: `build_view(data, catalog, query, today, now_ms)` arma solo la pantalla pedida (`panel`, `rutinas`, `editar`, `entrenar`, `equipo`).
   - Panel:
     - la racha cuenta semanas seguidas con al menos tantos días entrenados como días asignados;
@@ -10896,7 +10899,7 @@ El área de routing `gimnasio` (`ToolArea::Gym`) agrupa 16 herramientas.
   - `read_tool` arma lo que lee el modelo.
   - `save_gym_routine` con `exercises` reemplaza la lista completa: los ejercicios que siguen conservan su id y, si no se dan, sus series y su descanso (`GymMutation::SaveRoutine`).
   - `log_gym_workout` registra un entrenamiento pasado (`LogWorkout`: fecha no futura, 1 a 600 minutos, calorías y volumen como en la sesión). Sin `exercises`, usa las series planificadas de la rutina.
-  - `control_gym_session` maneja la sesión: `start`, `pause`, `resume`, `finish`, `restart`, `mark_set`, `unmark_set`, `set_value` y `skip_rest`. `mark_set` sobre una serie ya hecha se rechaza.
+  - `control_gym_session` maneja la sesión: `start`, `pause`, `resume`, `finish`, `restart`, `mark_set`, `unmark_set`, `set_value` y `skip_rest`. `mark_set` sobre una serie ya hecha se rechaza. `mark_set` y `unmark_set` marcan la serie entera también en un ejercicio de a un lado (`whole: true`); la lectura de la rutina da `unilateral` por ejercicio y `oneSideDone` por serie, y `save_gym_exercise` acepta `unilateral`.
   - `SetEquipment` y `DeleteWorkout` completan los cambios. Las series validan peso (0–1000 kg), repeticiones (0–10000) y hasta 20 por ejercicio.
 - **Adaptador** (`app/src/gym.rs`):
   - `preview_tool` resuelve la llamada y prueba `plan_change` sin guardar, así un rechazo vuelve al modelo antes de preguntar.

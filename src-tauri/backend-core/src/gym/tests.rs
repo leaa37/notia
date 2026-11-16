@@ -94,6 +94,82 @@ fn an_exercise_file_round_trips_keeping_its_image_and_note_lines() {
     assert_eq!(parse_equipment(&equipment.path, &render_equipment(&equipment), true), Some(equipment));
 }
 
+/// An exercise done one side at a time: each set is marked once per side,
+/// the rest starts after the second side and the volume counts both.
+#[test]
+fn a_one_side_exercise_takes_both_sides_before_the_rest() {
+    let mut catalog = catalog();
+    catalog.exercises.push(Exercise {
+        id: "one_arm_row".into(),
+        name: "Remo a una mano".into(),
+        group: "espalda".into(),
+        tracking: Tracking::WeightReps,
+        unilateral: true,
+        kcal_per_min: 6.0,
+        primary: vec!["lats".into()],
+        equipment: vec!["dumbbell".into()],
+        path: "Gym/exercises/Remo a una mano.md".into(),
+        ..Exercise::default()
+    });
+    let mut data = GymData::default();
+    let today = "2026-10-01";
+    let date = parse_date(today).expect("date");
+    let routine = apply(&mut data, &catalog, GymMutation::CreateRoutine, 1_000, today).expect("routine");
+    apply(&mut data, &catalog, GymMutation::AddExercise { routine_id: routine.clone(), exercise_id: "one_arm_row".into() }, 1_000, today);
+    let row = data.routines[0].items[0].id.clone();
+    apply(&mut data, &catalog, GymMutation::SetValue { routine_id: routine.clone(), item_id: row.clone(), index: 0, field: SetField::Weight, value: "20".into() }, 1_000, today);
+    let edit = build_view(&data, &catalog, &GymQuery { screen: Screen::Editar, routine_id: Some(routine.clone()), ..GymQuery::default() }, date, 1_000);
+    let item = &edit.routine.expect("routine").items[0];
+    assert!(item.unilateral);
+    assert!(item.summary.contains("reps por lado"), "{}", item.summary);
+    assert_eq!(item.sets[0].volume_label, "400 kg", "20 kg × 10 reps with each side");
+    assert_eq!(item.total_label, "Volumen: 400 kg (los dos lados)");
+
+    let toggle = |index: usize, whole: bool| GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: row.clone(), index, whole };
+    // The first touch is one side: no rest, the other side comes right away.
+    apply(&mut data, &catalog, toggle(0, false), 10_000, today);
+    let session = data.session.clone().expect("session");
+    assert!(session.is_one_side(&row, 0) && !session.is_done(&row, 0));
+    assert_eq!(session.rest_end_ms, None);
+    let training = build_view(&data, &catalog, &GymQuery { resume: true, ..GymQuery::default() }, date, 20_000).training.expect("training");
+    let item = &training.items[0];
+    assert!(item.unilateral && item.sets[0].one_side && !item.sets[0].done && item.sets[0].next);
+    assert_eq!(item.side_text.as_deref(), Some("Ahora con el otro lado: serie 1 de 3. Tocala de nuevo cuando termines."));
+    assert_eq!(training.next_text.as_deref(), Some("serie 1 de 3 de Remo a una mano, con el otro lado"));
+    assert_eq!(training.done_sets, 0);
+
+    // The second side completes the set and starts the rest.
+    apply(&mut data, &catalog, toggle(0, false), 40_000, today);
+    let session = data.session.clone().expect("session");
+    assert!(session.is_done(&row, 0) && !session.is_one_side(&row, 0) && session.sides.is_empty());
+    assert_eq!(session.rest_end_ms, Some(40_000 + 90_000));
+    // The assistant marks a whole set; touching a done set clears it.
+    apply(&mut data, &catalog, toggle(1, true), 200_000, today);
+    assert!(data.session.as_ref().is_some_and(|session| session.is_done(&row, 1)));
+    apply(&mut data, &catalog, toggle(1, false), 210_000, today);
+    let session = data.session.clone().expect("session");
+    assert!(!session.is_done(&row, 1) && !session.is_one_side(&row, 1));
+    apply(&mut data, &catalog, toggle(1, true), 220_000, today);
+    apply(&mut data, &catalog, GymMutation::FinishSession, 600_000, today);
+    let workout = data.workouts.last().expect("workout");
+    assert_eq!((workout.sets, workout.volume), (2, 400.0), "only the first set has a weight");
+}
+
+#[test]
+fn a_one_side_exercise_is_written_in_its_file() {
+    let text = EXERCISE.replace("registro: peso-reps\n", "registro: peso-reps\nunilateral: Sí\n");
+    let mut exercise = parse_exercise("Gym/exercises/Press.md", &text, true).expect("exercise");
+    assert!(exercise.unilateral);
+    let rendered = render_exercise(&exercise);
+    assert!(rendered.contains("unilateral: sí\n"), "{rendered}");
+    assert_eq!(parse_exercise("Gym/exercises/Press.md", &rendered, true).as_ref(), Some(&exercise));
+    assert!(!parse_exercise("Gym/exercises/Press.md", EXERCISE, false).expect("exercise").unilateral);
+    assert!(!parse_exercise("Gym/exercises/Press.md", &EXERCISE.replace("registro: peso-reps\n", "registro: peso-reps\nunilateral: no\n"), false).expect("exercise").unilateral);
+    apply_exercise_edit(&mut exercise, &ExerciseEdit::Unilateral { value: false }, &catalog()).expect("edit");
+    assert!(!render_exercise(&exercise).contains("unilateral"));
+    assert!(exercise_detail(&parse_exercise("Gym/exercises/Press.md", &text, false).expect("exercise"), &catalog(), &GymData::default()).meta.ends_with("de a un lado (cada serie con un lado y después con el otro)"));
+}
+
 /// A video named after the id belongs to the exercise without `video:` in
 /// its file, and rewriting the file does not add it.
 #[test]
@@ -145,7 +221,7 @@ fn a_routine_is_edited_trained_and_logged() {
     assert_eq!(data.routines[0].items[1].sets[0].reps, Some(30.0), "a timed exercise starts with 30 s");
 
     // Marcar una serie arranca la sesión y el descanso.
-    apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 0 }, 10_000, today);
+    apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 0, whole: false }, 10_000, today);
     let session = data.session.clone().expect("session");
     assert_eq!(session.status, SessionStatus::Running);
     assert_eq!(session.rest_end_ms, Some(10_000 + 90_000));
@@ -154,7 +230,7 @@ fn a_routine_is_edited_trained_and_logged() {
     assert_eq!((paused.acc_ms, paused.rest_left_ms), (30_000, Some(60_000)));
     apply(&mut data, &catalog, GymMutation::ResumeSession, 100_000, today);
     assert_eq!(data.session.as_ref().and_then(|session| session.rest_end_ms), Some(160_000));
-    apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 1 }, 400_000, today);
+    apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 1, whole: false }, 400_000, today);
     apply(&mut data, &catalog, GymMutation::FinishSession, 1_330_000, today);
     let workout = data.workouts.last().expect("workout");
     assert_eq!((workout.sets, workout.minutes, workout.date.as_str()), (2, 21.0, today));
@@ -170,12 +246,12 @@ fn a_routine_is_edited_trained_and_logged() {
         format!("t-{clock_ids}")
     };
     let mut clock = Clock { now_ms: 1_400_000, today: today.into(), new_id: &mut new_id };
-    let late = GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 2 };
+    let late = GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 2, whole: false };
     assert!(plan_change(&data, &catalog, &late, &mut clock).expect_err("finished").message.contains("Empezar de nuevo"));
 
     // Un entrenamiento en curso se retoma al abrir, en su pantalla, mientras tenga actividad reciente.
     apply(&mut data, &catalog, GymMutation::RestartSession, 1_500_000, today);
-    apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 0 }, 1_600_000, today);
+    apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: bench.clone(), index: 0, whole: false }, 1_600_000, today);
     let resumed = build_view(&data, &catalog, &GymQuery { resume: true, ..GymQuery::default() }, parse_date(today).expect("date"), 1_700_000);
     assert_eq!((resumed.screen, resumed.routine_id.as_deref()), (Screen::Entrenar, Some(routine.as_str())));
     assert_eq!(resumed.training.as_ref().map(|training| (training.status.as_str(), training.done_sets)), Some(("running", 1)));
@@ -601,7 +677,7 @@ fn dump_preview_fixtures() {
     // Un entrenamiento en curso de la rutina del miércoles.
     let wednesday = &routines[1];
     for index in 0..2 {
-        apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: wednesday.id.clone(), item_id: wednesday.items[0].id.clone(), index }, now - 400_000 + index as i64 * 200_000, today_text);
+        apply(&mut data, &catalog, GymMutation::ToggleSetDone { routine_id: wednesday.id.clone(), item_id: wednesday.items[0].id.clone(), index, whole: false }, now - 400_000 + index as i64 * 200_000, today_text);
     }
     let write = |name: &str, value: &dyn erased::Json| {
         std::fs::write(out.join(name), value.json()).expect("write");

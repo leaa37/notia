@@ -5,6 +5,7 @@
 //! id: bench_press
 //! grupo: pecho
 //! registro: peso-reps
+//! unilateral: sí
 //! kcalPorMinuto: 6
 //! principales: Pecho superior, Pecho inferior
 //! secundarios: Tríceps, Deltoide anterior
@@ -22,6 +23,10 @@
 //! 1. Acostate en el banco…
 //! ```
 //!
+//! `unilateral: sí` marca un ejercicio que se hace de a un lado (un brazo o
+//! una pierna): cada serie se hace con un lado y después con el otro. Sin la
+//! línea (o con `no`), se hace con los dos a la vez.
+//!
 //! `video` es opcional: un video de la misma carpeta que se llama como el id
 //! (`bench_press.mp4`, `.webm` o `.mov`) es el del ejercicio sin nombrarlo, y
 //! al reescribir la ficha no se agrega. Un `video` escrito tiene prioridad.
@@ -35,8 +40,8 @@ use super::{fold, is_category, is_group, muscle_key, muscle_label, parse_number,
 const IMAGE_MARKER: &str = "](data:image/";
 const STEPS_HEADING: &str = "como se hace";
 
-const EXERCISE_KEYS: [&str; 10] =
-    ["id", "nombre", "grupo", "registro", "kcalporminuto", "principales", "secundarios", "equipamiento", "video", "alias"];
+const EXERCISE_KEYS: [&str; 11] =
+    ["id", "nombre", "grupo", "registro", "unilateral", "kcalporminuto", "principales", "secundarios", "equipamiento", "video", "alias"];
 const EQUIPMENT_KEYS: [&str; 4] = ["id", "nombre", "categoria", "origen"];
 
 /// Las líneas `clave: valor` del frontmatter, en orden, y el cuerpo.
@@ -92,6 +97,11 @@ fn list(value: Option<&str>) -> Vec<String> {
         .map(|item| unquote(item.trim()).trim().to_string())
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+/// Un sí del frontmatter: `sí`, `si`, `true`, `yes` o `1`.
+fn yes(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(fold(value.trim()).as_str(), "si" | "true" | "yes" | "1"))
 }
 
 fn extra_front(fields: &[(String, String)], known: &[&str]) -> Vec<(String, String)> {
@@ -171,6 +181,7 @@ pub fn parse_exercise(path: &str, text: &str, with_image: bool) -> Option<Exerci
         name,
         group,
         tracking: field(&fields, "registro").and_then(Tracking::parse).unwrap_or_default(),
+        unilateral: yes(field(&fields, "unilateral")),
         kcal_per_min: field(&fields, "kcalPorMinuto").and_then(parse_number).filter(|kcal| *kcal >= 0.0).unwrap_or(5.0),
         primary,
         secondary,
@@ -211,6 +222,7 @@ pub fn render_exercise(exercise: &Exercise) -> String {
             ("id", exercise.id.clone()),
             ("grupo", exercise.group.clone()),
             ("registro", exercise.tracking.id().to_string()),
+            ("unilateral", if exercise.unilateral { "sí" } else { "" }.to_string()),
             ("kcalPorMinuto", super::fmt(exercise.kcal_per_min, 1).replace(',', ".")),
             ("principales", muscle_names(&exercise.primary)),
             ("secundarios", muscle_names(&exercise.secondary)),

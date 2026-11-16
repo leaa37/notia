@@ -50,6 +50,7 @@ pub struct ExercisePatch {
     pub group: Option<String>,
     pub weighted: Option<bool>,
     pub timed: Option<bool>,
+    pub unilateral: Option<bool>,
     pub kcal_per_min: Option<f64>,
     pub primary: Option<Vec<String>>,
     pub secondary: Option<Vec<String>>,
@@ -337,7 +338,7 @@ fn session_action(arguments: &Value, data: &GymData, catalog: &Catalog) -> GymRe
             if done == (action == "mark_set") {
                 return Err(invalid(if done { "Esa serie ya está hecha." } else { "Esa serie no estaba hecha." }));
             }
-            GymMutation::ToggleSetDone { routine_id: routine.id.clone(), item_id: item.id.clone(), index: set - 1 }
+            GymMutation::ToggleSetDone { routine_id: routine.id.clone(), item_id: item.id.clone(), index: set - 1, whole: true }
         }
         "set_value" => {
             let routine = routine_for()?;
@@ -400,6 +401,7 @@ fn exercise_patch(arguments: &Value, catalog: &Catalog) -> GymResult<ExercisePat
         group,
         weighted: optional_bool(arguments, "weighted"),
         timed: optional_bool(arguments, "timed"),
+        unilateral: optional_bool(arguments, "unilateral"),
         kcal_per_min: kcal,
         primary: string_list(arguments, "primaryMuscles")?.map(|muscles| muscle_keys(&muscles)).transpose()?,
         secondary: string_list(arguments, "secondaryMuscles")?.map(|muscles| muscle_keys(&muscles)).transpose()?,
@@ -434,6 +436,9 @@ pub fn apply_patch(exercise: &mut Exercise, patch: &ExercisePatch) -> GymResult<
             (false, true) => super::Tracking::WeightReps,
             (false, false) => super::Tracking::Reps,
         };
+    }
+    if let Some(unilateral) = patch.unilateral {
+        exercise.unilateral = unilateral;
     }
     if let Some(kcal) = patch.kcal_per_min {
         exercise.kcal_per_min = (kcal * 10.0).round() / 10.0;
@@ -673,7 +678,7 @@ pub fn action_summary(action: &GymToolAction, data: &GymData, catalog: &Catalog)
             GymMutation::FinishSession => "Terminar el entrenamiento y guardarlo en el historial.".to_string(),
             GymMutation::RestartSession => "Descartar el entrenamiento en curso y volver a empezar.".to_string(),
             GymMutation::SkipRest => "Saltar el descanso.".to_string(),
-            GymMutation::ToggleSetDone { routine_id, item_id, index } => {
+            GymMutation::ToggleSetDone { routine_id, item_id, index, .. } => {
                 let exercise = data.routine(routine_id).and_then(|routine| routine.items.iter().find(|item| &item.id == item_id)).map(|item| exercise_name(&item.exercise)).unwrap_or_default();
                 let done = data.session.as_ref().is_some_and(|session| session.is_done(item_id, *index));
                 format!("{} la serie {} de {exercise}.", if done { "Desmarcar" } else { "Marcar como hecha" }, index + 1)
@@ -717,6 +722,9 @@ pub fn action_summary(action: &GymToolAction, data: &GymData, catalog: &Catalog)
             }
             if let Some(timed) = patch.timed {
                 parts.push(if timed { "por tiempo".to_string() } else { "por repeticiones".to_string() });
+            }
+            if let Some(unilateral) = patch.unilateral {
+                parts.push(if unilateral { "de a un lado".to_string() } else { "con los dos lados a la vez".to_string() });
             }
             if let Some(kcal) = patch.kcal_per_min {
                 parts.push(format!("{} kcal por minuto", fmt(kcal, 1)));
@@ -786,6 +794,7 @@ fn exercise_row(exercise: &Exercise, catalog: &Catalog, data: &GymData) -> Value
         "name": exercise.name,
         "group": exercise.group,
         "tracking": exercise.tracking.id(),
+        "unilateral": exercise.unilateral,
         "primaryMuscles": names(&exercise.primary),
         "secondaryMuscles": names(&exercise.secondary),
         "equipment": exercise.equipment.iter().filter_map(|id| catalog.equipment_name(id)).collect::<Vec<_>>(),
@@ -809,12 +818,14 @@ fn routine_json(routine: &Routine, catalog: &Catalog, data: &GymData) -> Value {
                 "exercise": item.exercise,
                 "name": exercise.map(|exercise| exercise.name.as_str()).unwrap_or("Ejercicio eliminado"),
                 "tracking": exercise.map(|exercise| exercise.tracking.id()),
+                "unilateral": exercise.is_some_and(|exercise| exercise.unilateral),
                 "restSeconds": item.rest_s,
                 "sets": item.sets.iter().enumerate().map(|(index, set)| json!({
                     "set": index + 1,
                     "weight": set.weight,
                     "reps": set.reps,
                     "done": session.map(|session| session.is_done(&item.id, index)),
+                    "oneSideDone": session.is_some_and(|session| session.is_one_side(&item.id, index)),
                 })).collect::<Vec<_>>(),
                 "missingEquipment": exercise.map(|exercise| missing_equipment(exercise, catalog, &data.owned)).unwrap_or_default(),
             })
@@ -899,6 +910,7 @@ pub fn read_tool(name: &str, arguments: &Value, data: &GymData, catalog: &Catalo
                 "name": detail.name,
                 "group": detail.group_label,
                 "tracking": detail.tracking,
+                "unilateral": detail.unilateral,
                 "kcalPerMinute": exercise.kcal_per_min,
                 "primaryMuscles": detail.primary_text,
                 "secondaryMuscles": detail.secondary_text,

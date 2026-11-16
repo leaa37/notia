@@ -12,7 +12,7 @@ use crate::health::shift_days;
 
 use super::{
     category_label, count, fmt, fold, group_label, hours_minutes, lower_first, muscle_label, parse_date, rest_clock, span, Catalog,
-    Equipment, Exercise, GymData, Routine, RoutineItem, Session, SessionStatus, SetPlan, Tracking, Workout, EQUIPMENT_CATEGORIES,
+    Equipment, Exercise, GymData, Routine, RoutineItem, Session, SessionStatus, SetPlan, Workout, EQUIPMENT_CATEGORIES,
     GROUPS, HOME_PRESET, MUSCLES, PRESETS,
 };
 
@@ -251,6 +251,8 @@ pub struct ItemView {
     pub summary: String,
     pub weighted: bool,
     pub timed: bool,
+    /// Se hace de a un lado: las series son por lado.
+    pub unilateral: bool,
     pub sets: Vec<SetView>,
     pub total_label: String,
 }
@@ -313,6 +315,8 @@ pub struct TrainSet {
     pub weight: String,
     pub reps: String,
     pub done: bool,
+    /// Un lado hecho; falta el otro para que la serie cuente.
+    pub one_side: bool,
     pub next: bool,
 }
 
@@ -329,10 +333,13 @@ pub struct TrainItem {
     pub missing: Option<String>,
     pub weighted: bool,
     pub timed: bool,
+    pub unilateral: bool,
     pub count: String,
     pub all_done: bool,
     pub current: bool,
     pub sets: Vec<TrainSet>,
+    /// «Ahora con el otro lado…» mientras una serie tiene un solo lado hecho.
+    pub side_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -479,7 +486,8 @@ fn unit_label(value: f64, timed: bool) -> String {
     }
 }
 
-fn set_view(set: &SetPlan, tracking: Tracking) -> SetView {
+fn set_view(set: &SetPlan, exercise: &Exercise) -> SetView {
+    let tracking = exercise.tracking;
     let reps = set.reps.unwrap_or(0.0);
     let weight = set.weight.unwrap_or(0.0);
     let weight_label = if !tracking.weighted() {
@@ -489,22 +497,15 @@ fn set_view(set: &SetPlan, tracking: Tracking) -> SetView {
     } else {
         "Sin peso".to_string()
     };
-    let volume_label = if tracking.weighted() && !tracking.timed() { format!("{} kg", fmt(weight * reps, 1)) } else { unit_label(reps, tracking.timed()) };
+    let volume_label = if tracking.weighted() && !tracking.timed() { format!("{} kg", fmt(exercise.volume([set]), 1)) } else { unit_label(reps, tracking.timed()) };
     SetView { weight: input_value(set.weight), reps: input_value(set.reps), weight_label, reps_label: unit_label(reps, tracking.timed()), volume_label }
 }
 
-fn item_volume(item: &RoutineItem, tracking: Tracking) -> f64 {
-    if tracking.weighted() && !tracking.timed() {
-        item.sets.iter().map(|set| set.weight.unwrap_or(0.0) * set.reps.unwrap_or(0.0)).sum()
-    } else {
-        0.0
-    }
-}
-
-fn item_summary(item: &RoutineItem, tracking: Tracking) -> String {
+fn item_summary(item: &RoutineItem, exercise: &Exercise) -> String {
+    let tracking = exercise.tracking;
     let reps = item.sets.iter().map(|set| set.reps.unwrap_or(0.0)).collect::<Vec<_>>();
     let unit = if tracking.timed() { "s" } else { "reps" };
-    let mut summary = format!("{} de {} {unit}", count(item.sets.len(), "serie", "series"), span(&reps));
+    let mut summary = format!("{} de {} {unit}{}", count(item.sets.len(), "serie", "series"), span(&reps), per_side(exercise));
     if tracking.weighted() {
         let weights = item.sets.iter().map(|set| set.weight.unwrap_or(0.0)).collect::<Vec<_>>();
         if weights.iter().any(|weight| *weight > 0.0) {
@@ -518,14 +519,24 @@ fn item_summary(item: &RoutineItem, tracking: Tracking) -> String {
     summary
 }
 
-fn item_total(item: &RoutineItem, tracking: Tracking) -> String {
+/// « por lado» si el ejercicio se hace de a un lado.
+fn per_side(exercise: &Exercise) -> &'static str {
+    if exercise.unilateral {
+        " por lado"
+    } else {
+        ""
+    }
+}
+
+fn item_total(item: &RoutineItem, exercise: &Exercise) -> String {
+    let tracking = exercise.tracking;
     let reps: f64 = item.sets.iter().map(|set| set.reps.unwrap_or(0.0)).sum();
     if tracking.weighted() && !tracking.timed() {
-        format!("Volumen: {} kg", fmt(item_volume(item, tracking), 1))
+        format!("Volumen: {} kg{}", fmt(exercise.volume(&item.sets), 1), if exercise.unilateral { " (los dos lados)" } else { "" })
     } else if tracking.timed() {
-        format!("Total: {} s", fmt(reps, 1))
+        format!("Total: {} s{}", fmt(reps, 1), per_side(exercise))
     } else {
-        format!("Total: {} repeticiones", fmt(reps, 1))
+        format!("Total: {} repeticiones{}", fmt(reps, 1), per_side(exercise))
     }
 }
 
@@ -937,7 +948,7 @@ fn routine_view(data: &GymData, catalog: &Catalog, routine: &Routine) -> Routine
             let fallback = removed_exercise(&item.exercise);
             let exercise = exercise_of(catalog, &item.exercise, &fallback);
             total_sets += item.sets.len();
-            total_volume += item_volume(item, exercise.tracking);
+            total_volume += exercise.volume(&item.sets);
             for muscle in exercise.primary.iter().chain(&exercise.secondary) {
                 let level = exercise.muscle_level(muscle);
                 let current = levels.entry(muscle.clone()).or_default();
@@ -958,11 +969,12 @@ fn routine_view(data: &GymData, catalog: &Catalog, routine: &Routine) -> Routine
                 rest_s: item.rest_s,
                 rest_label: rest_clock(item.rest_s as i64),
                 missing: missing_text(&missing_equipment(exercise, catalog, &data.owned)),
-                summary: item_summary(item, exercise.tracking),
+                summary: item_summary(item, exercise),
                 weighted: exercise.tracking.weighted(),
                 timed: exercise.tracking.timed(),
-                sets: item.sets.iter().map(|set| set_view(set, exercise.tracking)).collect(),
-                total_label: item_total(item, exercise.tracking),
+                unilateral: exercise.unilateral,
+                sets: item.sets.iter().map(|set| set_view(set, exercise)).collect(),
+                total_label: item_total(item, exercise),
             }
         })
         .collect::<Vec<_>>();
@@ -1044,7 +1056,9 @@ fn clock(ms: i64) -> String {
 fn training(data: &GymData, catalog: &Catalog, routine: &Routine) -> TrainingView {
     let session: Option<&Session> = data.session.as_ref().filter(|session| session.routine_id == routine.id);
     let done = |item: &RoutineItem, index: usize| session.is_some_and(|session| session.is_done(&item.id, index));
+    let one_side = |item: &RoutineItem, index: usize| session.is_some_and(|session| session.is_one_side(&item.id, index));
     let mut next: Option<(String, usize, String, usize)> = None;
+    let mut next_one_side = false;
     let mut done_sets = 0;
     let mut total_sets = 0;
     let mut volume = 0.0;
@@ -1057,11 +1071,10 @@ fn training(data: &GymData, catalog: &Catalog, routine: &Routine) -> TrainingVie
             total_sets += 1;
             if done(item, index) {
                 done_sets += 1;
-                if exercise.tracking.weighted() && !exercise.tracking.timed() {
-                    volume += set.weight.unwrap_or(0.0) * set.reps.unwrap_or(0.0);
-                }
+                volume += exercise.volume([set]);
             } else if next.is_none() {
                 next = Some((item.id.clone(), index, exercise.name.clone(), item.sets.len()));
+                next_one_side = one_side(item, index);
             }
         }
     }
@@ -1074,6 +1087,9 @@ fn training(data: &GymData, catalog: &Catalog, routine: &Routine) -> TrainingVie
             let exercise = exercise_of(catalog, &item.exercise, &fallback);
             let done_count = (0..item.sets.len()).filter(|index| done(item, *index)).count();
             let current = next.as_ref().is_some_and(|(id, _, _, _)| *id == item.id);
+            let side_text = (0..item.sets.len())
+                .find(|index| one_side(item, *index))
+                .map(|index| format!("Ahora con el otro lado: serie {} de {}. Tocala de nuevo cuando termines.", index + 1, item.sets.len()));
             TrainItem {
                 id: item.id.clone(),
                 n: position + 1,
@@ -1085,6 +1101,7 @@ fn training(data: &GymData, catalog: &Catalog, routine: &Routine) -> TrainingVie
                 missing: missing_text(&missing_equipment(exercise, catalog, &data.owned)),
                 weighted: exercise.tracking.weighted(),
                 timed: exercise.tracking.timed(),
+                unilateral: exercise.unilateral,
                 count: format!("{done_count}/{}", item.sets.len()),
                 all_done: done_count == item.sets.len() && !item.sets.is_empty(),
                 current,
@@ -1096,9 +1113,11 @@ fn training(data: &GymData, catalog: &Catalog, routine: &Routine) -> TrainingVie
                         weight: input_value(set.weight),
                         reps: input_value(set.reps),
                         done: done(item, index),
+                        one_side: one_side(item, index),
                         next: current && next.as_ref().is_some_and(|(_, next_index, _, _)| *next_index == index),
                     })
                     .collect(),
+                side_text,
             }
         })
         .collect();
@@ -1126,7 +1145,7 @@ fn training(data: &GymData, catalog: &Catalog, routine: &Routine) -> TrainingVie
         volume: format!("{} kg", fmt(volume, 1)),
         kcal_per_min: if rates.is_empty() { 0.0 } else { rates.iter().sum::<f64>() / rates.len() as f64 },
         items,
-        next_text: next.map(|(_, index, name, of)| format!("serie {} de {of} de {name}", index + 1)),
+        next_text: next.map(|(_, index, name, of)| format!("serie {} de {of} de {name}{}", index + 1, if next_one_side { ", con el otro lado" } else { "" })),
         current_rest,
         done_text: format!("Hiciste {done_sets} de {total_sets} series en {}.", clock(acc_ms)),
     }
@@ -1310,6 +1329,7 @@ pub struct ExerciseDetail {
     pub tracking: String,
     pub weighted: bool,
     pub timed: bool,
+    pub unilateral: bool,
     pub kcal: String,
     pub image: Option<String>,
     pub has_video: bool,
@@ -1353,6 +1373,7 @@ pub fn exercise_detail(exercise: &Exercise, catalog: &Catalog, data: &GymData) -
         tracking: tracking.id().to_string(),
         weighted: tracking.weighted(),
         timed: tracking.timed(),
+        unilateral: exercise.unilateral,
         kcal: fmt(exercise.kcal_per_min, 1),
         image: exercise.image.clone(),
         has_video: exercise.video.is_some(),
@@ -1369,7 +1390,7 @@ pub fn exercise_detail(exercise: &Exercise, catalog: &Catalog, data: &GymData) -
         primary_text: names(2, "Sin cargar"),
         secondary_text: names(1, "Ninguno"),
         meta: format!(
-            "{}, {}, {}",
+            "{}, {}, {}{}",
             group_label(&exercise.group),
             lower_first(&equipment_label(exercise, catalog)),
             match (tracking.weighted(), tracking.timed()) {
@@ -1377,7 +1398,8 @@ pub fn exercise_detail(exercise: &Exercise, catalog: &Catalog, data: &GymData) -
                 (false, false) => "con peso corporal",
                 (true, true) => "con peso y por tiempo",
                 (false, true) => "por tiempo",
-            }
+            },
+            if exercise.unilateral { ", de a un lado (cada serie con un lado y después con el otro)" } else { "" }
         ),
         equipment: chips,
         required_text: if required.is_empty() { "No necesita equipamiento".to_string() } else { required.join(", ") },

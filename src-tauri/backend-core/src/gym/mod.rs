@@ -184,6 +184,9 @@ pub struct Exercise {
     pub name: String,
     pub group: String,
     pub tracking: Tracking,
+    /// Se hace de a un lado (un brazo o una pierna): cada serie es una vez
+    /// con cada lado.
+    pub unilateral: bool,
     pub kcal_per_min: f64,
     /// Claves de `MUSCLES`.
     pub primary: Vec<String>,
@@ -205,6 +208,25 @@ pub struct Exercise {
 }
 
 impl Exercise {
+    /// Cuántas veces se hace cada serie: dos si es de a un lado.
+    pub fn sides(&self) -> f64 {
+        if self.unilateral {
+            2.0
+        } else {
+            1.0
+        }
+    }
+
+    /// El volumen (kg × repeticiones) de unas series de este ejercicio, con
+    /// los dos lados si es de a un lado. Cero si no se registra con peso y
+    /// repeticiones.
+    pub fn volume<'a>(&self, sets: impl IntoIterator<Item = &'a SetPlan>) -> f64 {
+        if !self.tracking.weighted() || self.tracking.timed() {
+            return 0.0;
+        }
+        sets.into_iter().map(|set| set.weight.unwrap_or(0.0) * set.reps.unwrap_or(0.0)).sum::<f64>() * self.sides()
+    }
+
     /// 2 = principal, 1 = secundario, 0 = no lo trabaja.
     pub fn muscle_level(&self, key: &str) -> u8 {
         if self.primary.iter().any(|muscle| muscle == key) {
@@ -374,6 +396,10 @@ pub struct Session {
     /// Series hechas por ítem de la rutina.
     #[serde(default)]
     pub done: BTreeMap<String, Vec<bool>>,
+    /// Series de un ejercicio de a un lado con el primer lado hecho: falta
+    /// el otro para que la serie cuente.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sides: BTreeMap<String, Vec<bool>>,
 }
 
 impl Session {
@@ -383,6 +409,11 @@ impl Session {
 
     pub fn is_done(&self, item_id: &str, index: usize) -> bool {
         self.done.get(item_id).and_then(|sets| sets.get(index)).copied().unwrap_or(false)
+    }
+
+    /// La serie tiene un lado hecho y le falta el otro.
+    pub fn is_one_side(&self, item_id: &str, index: usize) -> bool {
+        !self.is_done(item_id, index) && self.sides.get(item_id).and_then(|sets| sets.get(index)).copied().unwrap_or(false)
     }
 
     pub fn active(&self) -> bool {

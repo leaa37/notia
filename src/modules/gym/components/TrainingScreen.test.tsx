@@ -10,7 +10,7 @@ vi.mock('../../../context/confirmation/useConfirmationEngine', () => ({
   useConfirmationEngine: () => confirmation,
 }))
 
-function training(status: TrainingView['status']): TrainingView {
+function training(status: TrainingView['status'], oneSide = false): TrainingView {
   return {
     routineId: 'r1',
     name: 'Pecho',
@@ -40,22 +40,24 @@ function training(status: TrainingView['status']): TrainingView {
       missing: null,
       weighted: true,
       timed: false,
+      unilateral: oneSide,
       count: '1/3',
       allDone: false,
       current: true,
       sets: [
-        { weight: '60', reps: '10', done: true, next: false },
-        { weight: '60', reps: '10', done: false, next: true },
-        { weight: '60', reps: '10', done: false, next: false },
+        { weight: '60', reps: '10', done: true, oneSide: false, next: false },
+        { weight: '60', reps: '10', done: false, oneSide, next: true },
+        { weight: '60', reps: '10', done: false, oneSide: false, next: false },
       ],
+      sideText: oneSide ? 'Ahora con el otro lado: serie 2 de 3. Tocala de nuevo cuando termines.' : null,
     }],
   }
 }
 
-function renderScreen(status: TrainingView['status'], applying = false) {
+function renderScreen(status: TrainingView['status'], applying = false, oneSide = false) {
   const apply = vi.fn<(mutation: GymMutation) => void>()
   render(
-    <TrainingScreen training={training(status)} clockOffsetMs={0} apply={apply} applying={applying} onBack={() => undefined} onOpenExercise={() => undefined} />,
+    <TrainingScreen training={training(status, oneSide)} clockOffsetMs={0} apply={apply} applying={applying} onBack={() => undefined} onOpenExercise={() => undefined} />,
   )
   return apply
 }
@@ -85,6 +87,15 @@ describe('TrainingScreen', () => {
     // The sets keep taking taps.
     fireEvent.click(screen.getByRole('button', { name: 'Marcar como hecha la serie 2' }))
     expect(apply).toHaveBeenCalledWith({ type: 'toggle-set-done', routineId: 'r1', itemId: 'i1', index: 1 })
+  })
+
+  it('asks for the other side of a set done with one side', () => {
+    const apply = renderScreen('running', false, true)
+    expect(screen.getAllByText('Ahora con el otro lado: serie 2 de 3. Tocala de nuevo cuando termines.').length).toBeGreaterThan(0)
+    expect(screen.getByText('Por lado')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Marcar el otro lado de la serie 2' }))
+    expect(apply).toHaveBeenCalledWith({ type: 'toggle-set-done', routineId: 'r1', itemId: 'i1', index: 1 })
+    expect(screen.getByRole('button', { name: 'Marcar el primer lado de la serie 3' })).toBeTruthy()
   })
 
   it('does not take set taps once the workout is finished', () => {

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronUp, Clock, Info, Pause, Play } from 'lucide-react'
-import type { GymMutation, TrainItem, TrainingView } from '../types/gymTypes'
+import type { GymMutation, TrainItem, TrainingView, TrainSet } from '../types/gymTypes'
 import { CommitInput } from './GymInputs'
 import { useConfirmationEngine } from '../../../context/confirmation/useConfirmationEngine'
 
@@ -99,8 +99,10 @@ export function TrainingScreen({ training, clockOffsetMs, apply, applying, onBac
                       <span className="gym-item-meta">
                         <span className="gym-item-group"><span className="gym-dot gym-dot--group" aria-hidden="true" />{item.groupLabel}</span>
                         <span className="gym-item-rest"><Clock size={12} aria-hidden="true" />{item.restLabel} de descanso</span>
+                        {item.unilateral ? <span>Por lado</span> : null}
                       </span>
                       {item.missing ? <span className="gym-missing"><AlertTriangle size={13} aria-hidden="true" />{item.missing}</span> : null}
+                      {item.sideText ? <span className="gym-side-text" role="status">{item.sideText}</span> : null}
                     </span>
                     <span className="gym-item-count">{item.count}</span>
                     {expanded ? <ChevronUp size={18} aria-hidden="true" /> : <ChevronDown size={18} aria-hidden="true" />}
@@ -131,10 +133,11 @@ export function TrainingScreen({ training, clockOffsetMs, apply, applying, onBac
                           className="gym-check"
                           disabled={training.status === 'done'}
                           aria-pressed={set.done}
-                          aria-label={set.done ? `Desmarcar serie ${index + 1}` : `Marcar como hecha la serie ${index + 1}`}
+                          data-side={set.oneSide || undefined}
+                          aria-label={checkLabel(item, set, index)}
                           onClick={() => apply({ type: 'toggle-set-done', routineId, itemId: item.id, index })}
                         >
-                          <Check size={20} aria-hidden="true" />
+                          {set.oneSide ? null : <Check size={20} aria-hidden="true" />}
                         </button>
                       </div>
                     ))}
@@ -238,6 +241,14 @@ function SessionClock({ training, clockOffsetMs, apply, applying }: ControlProps
   )
 }
 
+/** Qué hace tocar la serie: en un ejercicio de a un lado, cada lado. */
+function checkLabel(item: TrainItem, set: TrainSet, index: number) {
+  const n = index + 1
+  if (set.done) return `Desmarcar serie ${n}`
+  if (set.oneSide) return `Marcar el otro lado de la serie ${n}`
+  return item.unilateral ? `Marcar el primer lado de la serie ${n}` : `Marcar como hecha la serie ${n}`
+}
+
 /** El descanso que corre o terminó, con la hora de Rust. */
 function useRest(training: TrainingView, clockOffsetMs: number) {
   const now = useServerNow(clockOffsetMs, training.restEndMs !== null)
@@ -246,11 +257,12 @@ function useRest(training: TrainingView, clockOffsetMs: number) {
   const remaining = training.restEndMs !== null ? Math.max(0, training.restEndMs - now) : (training.restLeftMs ?? 0)
   const fraction = resting ? remaining / Math.max(1, training.restTotalMs) : ready ? 1 : 0
   const nextText = training.nextText
-  const text = resting
+  const side = training.items.find((item) => item.sideText)?.sideText ?? null
+  const text = side ?? (resting
     ? `Después: ${nextText ?? 'terminaste'}.`
     : ready
       ? nextText ? `Seguí con la ${nextText}.` : 'Completaste todas las series.'
-      : nextText ? 'Marcá una serie como hecha y el descanso arranca solo.' : 'Completaste todas las series.'
+      : nextText ? 'Marcá una serie como hecha y el descanso arranca solo.' : 'Completaste todas las series.')
   const sub = resting ? (training.restLeftMs !== null ? 'Pausado' : `de ${restClock(training.restTotalMs)}`) : ready ? 'Terminó el descanso' : 'Sin descanso activo'
   return { resting, ready, fraction, text, sub, center: resting ? restClock(remaining) : ready ? '0:00' : '–' }
 }

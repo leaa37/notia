@@ -6230,6 +6230,10 @@
           "type": "boolean",
           "description": "Se mide en segundos en vez de repeticiones."
         },
+        "unilateral": {
+          "type": "boolean",
+          "description": "Se hace de a un lado (un brazo o una pierna): cada serie va con un lado y después con el otro, y las repeticiones y el peso son por lado."
+        },
         "kcalPerMinute": {
           "type": "number",
           "minimum": 0,

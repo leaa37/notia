@@ -107,6 +107,9 @@ export function ExerciseCard({ library, exerciseId, editable, canEdit, groups, b
                   <button type="button" className="gym-switch" aria-pressed={detail.timed} onClick={() => void edit({ field: 'timed', value: !detail.timed })}>
                     <span className="gym-switch-track" aria-hidden="true"><span className="gym-switch-knob" /></span>Por tiempo
                   </button>
+                  <button type="button" className="gym-switch" aria-pressed={detail.unilateral} onClick={() => void edit({ field: 'unilateral', value: !detail.unilateral })}>
+                    <span className="gym-switch-track" aria-hidden="true"><span className="gym-switch-knob" /></span>De a un lado
+                  </button>
                 </div>
               </>
             ) : (

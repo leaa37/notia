@@ -386,6 +386,9 @@ button.gym-day-chip { cursor: pointer; }
 }
 .gym-set-row--train[data-next] .gym-check { border-color: var(--gym-teal); color: var(--gym-teal); }
 .gym-check[aria-pressed="true"] { background: var(--gym-teal); border-color: var(--gym-teal); color: var(--gym-on-teal); }
+/* Un lado hecho en un ejercicio de a un lado: medio círculo lleno. */
+.gym-check[data-side] { border-color: var(--gym-teal); background: linear-gradient(90deg, var(--gym-teal) 50%, transparent 50%); }
+.gym-side-text { font-size: 13px; font-weight: 600; color: var(--gym-teal); }
 
 .gym-side {
   background: var(--gym-panel); border-left: 1px solid var(--gym-line); display: flex; flex-direction: column; gap: 22px; padding: 24px 20px;

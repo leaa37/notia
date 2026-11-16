@@ -1222,7 +1222,7 @@ mod tests {
         step(GymMutation::AddExercise { routine_id: routine.clone(), exercise_id: "push_ups".into() }, 0);
         step(GymMutation::ToggleEquipment { equipment_id: "dumbbell".into() }, 0);
         let item = load(&connection, owner).expect("load").routines[0].items[0].id.clone();
-        step(GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: item, index: 0 }, 1_000);
+        step(GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: item, index: 0, whole: false }, 1_000);
         step(GymMutation::FinishSession, 600_000);
 
         let data = load(&connection, owner).expect("load");

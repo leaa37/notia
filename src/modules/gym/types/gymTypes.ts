@@ -148,6 +148,8 @@ export interface ItemView {
   summary: string
   weighted: boolean
   timed: boolean
+  /** Se hace de a un lado: las series son por lado. */
+  unilateral: boolean
   sets: SetView[]
   totalLabel: string
 }
@@ -184,6 +186,8 @@ export interface TrainSet {
   weight: string
   reps: string
   done: boolean
+  /** Un lado hecho; falta el otro para que la serie cuente. */
+  oneSide: boolean
   next: boolean
 }
 
@@ -198,10 +202,13 @@ export interface TrainItem {
   missing: string | null
   weighted: boolean
   timed: boolean
+  unilateral: boolean
   count: string
   allDone: boolean
   current: boolean
   sets: TrainSet[]
+  /** «Ahora con el otro lado…» mientras una serie tiene un solo lado hecho. */
+  sideText: string | null
 }
 
 export interface TrainingView {
@@ -278,6 +285,7 @@ export interface ExerciseDetail {
   tracking: string
   weighted: boolean
   timed: boolean
+  unilateral: boolean
   kcal: string
   image: string | null
   hasVideo: boolean
@@ -344,6 +352,7 @@ export type ExerciseEdit =
   | { field: 'group'; value: string }
   | { field: 'weighted'; value: boolean }
   | { field: 'timed'; value: boolean }
+  | { field: 'unilateral'; value: boolean }
   | { field: 'cycle-muscle'; muscle: string }
   | { field: 'toggle-equipment'; equipmentId: string }
   | { field: 'kcal'; value: string }
