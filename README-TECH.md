@@ -592,7 +592,7 @@ Detalle del transporte de publicación:
 - Con ventana nativa (`hasHostWindow()`, en `services/window`) se carga `App` como siempre, ahora de forma diferida.
 - En un navegador se carga `RemoteApp`, que sigue estos pasos:
   1. comprueba que la dirección sea un servidor Notia;
-  2. si no hay sesión, pide la contraseña del dueño con `input` accesible, foco visible y botones de 44 px;
+  2. si no hay sesión, pide la contraseña del dueño con `input` accesible, foco visible y botones de 44 px. La pantalla dice «Contraseña del servidor» y el botón «Iniciar» («Iniciando…» mientras espera), sin la dirección del servidor (2026-11-16): es el inicio del servidor, no el ingreso de un usuario, que viene después con el usuario de la biblioteca;
   3. lee las capacidades e instala el transporte remoto;
   4. recién entonces carga `App`.
 - Los módulos de la interfaz leen el transporte al cargarse (por ejemplo, el hook de dictado y el riel lateral). Por eso `App` se importa después de instalarlo.

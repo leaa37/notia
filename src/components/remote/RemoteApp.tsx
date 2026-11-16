@@ -136,9 +136,8 @@ export function RemoteApp() {
 
   return (
     <RemoteScreen>
-      <p className="notia-remote-text">Servidor en {window.location.host}</p>
       <form className="notia-remote-form" onSubmit={(event) => { void submit(event) }}>
-        <label className="notia-remote-label" htmlFor="notia-remote-password">Contraseña del dueño</label>
+        <label className="notia-remote-label" htmlFor="notia-remote-password">Contraseña del servidor</label>
         <input
           id="notia-remote-password"
           className="notia-remote-input"
@@ -151,7 +150,7 @@ export function RemoteApp() {
         />
         {loginError ? <p className="notia-remote-error" role="alert">{loginError}</p> : null}
         <NotiaButton type="submit" variant="primary" disabled={!password || isSubmitting}>
-          {isSubmitting ? 'Entrando…' : 'Entrar'}
+          {isSubmitting ? 'Iniciando…' : 'Iniciar'}
         </NotiaButton>
       </form>
     </RemoteScreen>
