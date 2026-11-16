@@ -5236,8 +5236,13 @@ pub(crate) fn execute_backend_request(
         OllamaProviderConfig::new(
             http,
             provider_settings.model,
-            // A conversational turn answers without thinking.
-            if request.thinking == Some(false) { Value::Bool(false) } else { provider_settings.think },
+            // A light turn thinks less but still apart from the answer: with
+            // `think: false` some models write their reasoning in it.
+            if request.thinking == Some(false) {
+                notia_backend_core::ai_settings::light_think(&provider_settings.think)
+            } else {
+                provider_settings.think
+            },
         )?
         .with_image_model(&provider_settings.image_model)
         .with_max_context(max_context),

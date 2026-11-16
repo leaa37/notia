@@ -225,6 +225,18 @@ pub fn think_value(settings: &AiSettings, model: &str) -> Value {
     }
 }
 
+/// `think` of a turn the router judged light (a greeting, a simple
+/// question): a lower level where the model has levels, otherwise the
+/// configured value. Never `false` when thinking is on: a model asked not to
+/// think may write its reasoning in the answer (glm-5.3-flash does), and the
+/// person reads the assistant talking to itself before it answers.
+pub fn light_think(configured: &Value) -> Value {
+    match configured {
+        Value::String(_) => Value::String(ThinkingLevel::Low.as_str().to_string()),
+        other => other.clone(),
+    }
+}
+
 /// Model a one-shot task uses: the selected one, or the first available.
 pub fn resolve_model(settings: &AiSettings, available: &[String]) -> Result<String, BackendError> {
     if !settings.selected_model.is_empty() {
@@ -349,6 +361,15 @@ mod tests {
         assert_eq!(options(40_000, 0, Some(8_192)), 8_192);
         // The answer is never capped: a model may reason before it answers.
         assert!(task_options(10, 0, None).get("num_predict").is_none());
+    }
+
+    /// A light turn thinks less, never «not at all» behind the person's back.
+    #[test]
+    fn a_light_turn_lowers_the_level_but_does_not_turn_thinking_off() {
+        assert_eq!(light_think(&Value::String("high".into())), Value::String("low".into()));
+        assert_eq!(light_think(&Value::Bool(true)), Value::Bool(true));
+        // Thinking turned off in the settings stays off.
+        assert_eq!(light_think(&Value::Bool(false)), Value::Bool(false));
     }
 
     /// A chat round asks for a context that holds its prompt and tools, never
