@@ -348,6 +348,8 @@ En Linux el binario solo servidor no necesita D-Bus ni WebKit. Si no hay un comp
 
 `--resource-dir` indica dónde están los modelos de voz y los runtimes; por defecto, la carpeta del ejecutable. Sin `--static-dir`, se usa `dist/` junto al ejecutable si existe.
 
+**Imagen de Docker** (2026-11-16): el repo no trae `Dockerfile` (cada servidor arma el suyo), pero sí `.dockerignore`, porque Docker no lee `.gitignore` y un `COPY .` copia todo el clon. Deja afuera del contexto `data` (la carpeta de `--data-root` cuando vive dentro del clon), `.git`, `node_modules`, `dist`, `src-tauri/target`, credenciales locales y logs. Sin él, los datos que Notia escribe mientras corre cambiaban el contexto: cada `docker compose up --build` recompilaba todo (unos 8 minutos con el perfil release, `lto = true`) y la imagen guardaba una copia de los datos de ese momento, tapada por el volumen pero presente en la capa. `data` excluye solo la carpeta de la raíz del contexto. Validado: ninguna ruta excluida está en el repositorio y la compilación no usa `.git`. Con una imagen de prueba (`FROM scratch` + `COPY . /app/`, exportada a una carpeta) el contexto de un clon con dependencias y compilados quedó en 20 MB, sin `data`, `.git`, `node_modules`, `dist` ni `src-tauri/target`, y cambiar archivos de `data` entre dos builds dejó el `COPY` en caché. Pendiente: confirmarlo en el servidor con el Dockerfile real.
+
 ### Servidor con carpeta única de datos (`--data-root`)
 
 Objetivo: que todo lo que el servidor headless persiste quede bajo una sola carpeta, para respaldarla, moverla o conservarla entre reinstalaciones. Solo cambia el modo `--headless`; la ventana de Windows y Android sigue usando su carpeta de datos de siempre.

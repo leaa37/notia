@@ -1,0 +1,22 @@
+# Lo que no entra al contexto de una imagen de Notia. Docker no lee .gitignore:
+# sin este archivo, COPY . copia también lo que no está en el repositorio.
+
+# Datos del servidor (--data-root dentro del clon). Cambian mientras Notia
+# corre, así que rompían la caché en cada build, y no deben quedar copiados
+# en la imagen.
+data
+
+# Historial de git: cambia con cada fetch y la compilación no lo usa.
+.git
+
+# Se generan dentro de la imagen.
+node_modules
+dist
+src-tauri/target
+
+# Credenciales y registros locales.
+.secrets
+**/*.jks
+**/*.keystore
+android-signing.properties
+**/*.log

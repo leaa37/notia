@@ -1009,6 +1009,8 @@ En **Configuraciones → General → Modo de ejecución** elegís cómo corre No
 
 El mismo `notia.exe` puede quedar corriendo como servidor, sin abrir la ventana, para que otros equipos de la red usen Notia. En Linux se compila solo el servidor. Usa las mismas bibliotecas y datos que la aplicación, así que no pueden estar abiertas las dos a la vez sobre la misma carpeta de datos. Si se intenta, Notia avisa que ya está en uso.
 
+Si lo corrés en Docker, el repositorio trae un `.dockerignore`: la carpeta `data` (los datos del servidor, si la tenés dentro del clon), `.git` y lo que se compila quedan afuera de la imagen. Así una reconstrucción sin cambios de código sale de la caché en segundos y la imagen no lleva una copia de tus datos.
+
 1. Definí la contraseña del dueño: `notia --headless --set-owner-password`.
 2. Si hace falta, agregá bibliotecas de ese equipo: `notia --headless --add-library "D:\Notas"`.
 3. Arrancá el servidor: `notia --headless`. Muestra la dirección `https://<ip>:52480/`. Con `--static-dir` sirve también la interfaz web, y `--bind` cambia la dirección o el puerto.
