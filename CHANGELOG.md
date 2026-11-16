@@ -378,3 +378,4 @@
 [2026-11-16 14:11:43 -03:00] Servidor en el navegador: la primera pantalla dice «Contraseña del servidor» y «Iniciar», sin la dirección del servidor.
 [2026-11-16 14:25:05 -03:00] Chat IA: un saludo o una pregunta simple ya no apaga el razonamiento del modelo (lo baja a low): con think false el modelo en uso escribía su razonamiento en la respuesta y la IA parecía hablar sola. El chequeo de anuncios lee su respuesta aunque el modelo razone antes.
 [2026-11-16 15:26:20 -03:00] Chat IA: una respuesta que llega con solo notas del agente (memoria, forma de hablar) termina el turno y ya no se duplica; el cartel «Progreso» mide lo justo cuando solo muestra los puntos. Verificado con modelos reales de Ollama Cloud.
+[2026-11-16 16:07:32 -03:00] Servidor: cada turno de chat deja en el registro el modelo, el think, las áreas y las herramientas usadas (target notia_turn, sin contenido), para diagnosticar respuestas raras.

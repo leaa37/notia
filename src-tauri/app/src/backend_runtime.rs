@@ -5232,17 +5232,27 @@ pub(crate) fn execute_backend_request(
         api_key: provider_settings.api_key,
     };
     let max_context = crate::ai_tasks::model_context_of(app, &http, &provider_settings.model);
+    let think = if request.thinking == Some(false) {
+        notia_backend_core::ai_settings::light_think(&provider_settings.think)
+    } else {
+        provider_settings.think.clone()
+    };
+    log::info!(
+        target: "notia_turn",
+        "[notia:turno] {} con {} (think {think}, contexto máximo {:?}), {} herramientas, áreas {:?}",
+        request.context.request_id,
+        provider_settings.model,
+        max_context,
+        request.tools.len(),
+        request.tool_areas,
+    );
     let provider = OllamaAgentProvider::with_transport(
         OllamaProviderConfig::new(
             http,
             provider_settings.model,
             // A light turn thinks less but still apart from the answer: with
             // `think: false` some models write their reasoning in it.
-            if request.thinking == Some(false) {
-                notia_backend_core::ai_settings::light_think(&provider_settings.think)
-            } else {
-                provider_settings.think
-            },
+            think,
         )?
         .with_image_model(&provider_settings.image_model)
         .with_max_context(max_context),
@@ -5466,6 +5476,7 @@ fn route_turn_areas(app: &AppHandle, state: &BackendRuntimeState, request: &Agen
     };
     let conversational = offers_conversation && decision.conversational == Some(true);
     log::info!(
+        target: "notia_turn",
         "[notia:router] áreas {:?} elegidas por {source}; thinking {:?}; prompt {}",
         areas.iter().map(|area| area.id()).collect::<Vec<_>>(),
         decision.thinking,
@@ -5648,6 +5659,19 @@ pub(crate) fn log_request_failure(runtime: &BackendRuntimeState, channel: &str, 
         context.request_id,
         error.code,
         if system_error { format!(": {}", error.message) } else { String::new() },
+        tool_usage(events.iter().map(|envelope| &envelope.event)),
+    );
+}
+
+/// Logs how an agent request ended: its rounds and how many times it ran
+/// each tool, never content. With the turn's line (model and areas), it
+/// tells why an answer went wrong.
+pub(crate) fn log_request_done(runtime: &BackendRuntimeState, channel: &str, context: &BackendRequestContext, rounds: u32) {
+    let events = runtime.request_events(context, 0).unwrap_or_default();
+    log::info!(
+        target: "notia_turn",
+        "[notia:{channel}] la solicitud {} terminó en {rounds} rondas; herramientas: {}",
+        context.request_id,
         tool_usage(events.iter().map(|envelope| &envelope.event)),
     );
 }

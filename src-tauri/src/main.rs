@@ -21,6 +21,9 @@ fn main() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Error)
             .filter_module("notia_telegram_ai", log::LevelFilter::Info)
+            // One line per chat turn (model, areas, tools), without content:
+            // what is needed to tell why an answer went wrong.
+            .filter_module("notia_turn", log::LevelFilter::Info)
             .try_init();
     }
 

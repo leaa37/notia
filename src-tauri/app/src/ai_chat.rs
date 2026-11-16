@@ -615,7 +615,10 @@ fn run_agent(
             }
         }
         match response? {
-            BackendResponse::Result { response } => return Ok(response),
+            BackendResponse::Result { response } => {
+                crate::backend_runtime::log_request_done(runtime, "chat", &identity.context, response.rounds);
+                return Ok(response);
+            }
             BackendResponse::Error { error, .. } => return Err(error),
             BackendResponse::Cancelled { .. } => return Err(cancelled()),
             BackendResponse::Operation { status } | BackendResponse::Resumed { status, .. } => {
