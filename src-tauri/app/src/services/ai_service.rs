@@ -708,6 +708,16 @@ pub async fn run_ollama_chat(
     Ok(AiChatResult { answer })
 }
 
+/// A `/api/chat` body with Ollama's model `options` (`num_ctx`), when there
+/// are any.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn with_options(mut body: serde_json::Value, options: &serde_json::Value) -> serde_json::Value {
+    if !options.is_null() {
+        body["options"] = options.clone();
+    }
+    body
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub async fn run_ollama_tool_chat(
     settings: &AiHttpSettings,
@@ -715,6 +725,7 @@ pub async fn run_ollama_tool_chat(
     messages: &serde_json::Value,
     tools: &serde_json::Value,
     think: &serde_json::Value,
+    options: &serde_json::Value,
     timeout_secs: u64,
 ) -> Result<serde_json::Value, String> {
     let normalized_model = model.trim();
@@ -735,13 +746,16 @@ pub async fn run_ollama_tool_chat(
             .post(endpoint)
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&serde_json::json!({
-                "model": normalized_model,
-                "stream": false,
-                "think": think,
-                "messages": messages,
-                "tools": tools,
-            })),
+            .json(&with_options(
+                serde_json::json!({
+                    "model": normalized_model,
+                    "stream": false,
+                    "think": think,
+                    "messages": messages,
+                    "tools": tools,
+                }),
+                options,
+            )),
         settings,
     )
     .send()
@@ -878,6 +892,7 @@ pub async fn stream_ollama_tool_chat_with_cancellation<F>(
     messages: &serde_json::Value,
     tools: &serde_json::Value,
     think: &serde_json::Value,
+    options: &serde_json::Value,
     timeout_secs: u64,
     cancellation: Arc<AtomicBool>,
     mut on_delta: F,
@@ -900,13 +915,16 @@ where
             .post(endpoint)
             .header(reqwest::header::ACCEPT, "application/x-ndjson")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&serde_json::json!({
-                "model": normalized_model,
-                "stream": true,
-                "think": think,
-                "messages": messages,
-                "tools": tools,
-            })),
+            .json(&with_options(
+                serde_json::json!({
+                    "model": normalized_model,
+                    "stream": true,
+                    "think": think,
+                    "messages": messages,
+                    "tools": tools,
+                }),
+                options,
+            )),
         settings,
     )
     .send()

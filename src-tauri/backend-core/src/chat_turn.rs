@@ -96,6 +96,17 @@ pub fn memory_window(document: &StoredChatDocument) -> &[StoredChatMessage] {
     &document.messages[document.messages.len().saturating_sub(count)..]
 }
 
+/// What «Reintentar» answers again: the last message the person wrote,
+/// taken out of the chat together with the replies after it. The turn runs
+/// again with the conversation before it, and its new replies are saved in
+/// place of the old ones. `None` when the person wrote nothing yet.
+pub fn take_last_request(document: &mut StoredChatDocument) -> Option<StoredChatMessage> {
+    let index = document.messages.iter().rposition(|message| message.role == ChatRole::User)?;
+    let request = document.messages[index].clone();
+    document.messages.truncate(index);
+    Some(request)
+}
+
 /// Last messages of a transient conversation.
 pub fn transient_window(messages: &[StoredChatMessage]) -> &[StoredChatMessage] {
     &messages[messages.len().saturating_sub(MAX_TRANSIENT_MESSAGES)..]
@@ -614,6 +625,30 @@ Respondé corto."));
         assert_eq!(memory_window(&document).iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), ["2", "3"]);
         document.context_memory_enabled = false;
         assert!(memory_window(&document).is_empty());
+    }
+
+    /// «Reintentar» takes the last request out with the replies after it,
+    /// so the turn runs again on the conversation before it.
+    #[test]
+    fn the_last_request_is_taken_out_to_be_answered_again() {
+        let mut document = StoredChatDocument::new("Chat".into(), true, true, 10);
+        document.messages = vec![
+            message(ChatRole::User, "hola"),
+            message(ChatRole::Assistant, "¡Hola!"),
+            message(ChatRole::User, "¿qué puede hacer este módulo?"),
+            message(ChatRole::Assistant, "article 4 hola"),
+            message(ChatRole::Assistant, "otra nota del mismo turno"),
+        ];
+        let request = take_last_request(&mut document).expect("request");
+        assert_eq!(request.content, "¿qué puede hacer este módulo?");
+        assert_eq!(document.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), ["hola", "¡Hola!"]);
+        // A request without an answer yet (the turn failed) is taken as well.
+        document.messages.push(message(ChatRole::User, "otra vez"));
+        assert_eq!(take_last_request(&mut document).map(|m| m.content), Some("otra vez".to_string()));
+        let mut empty = StoredChatDocument::new("Chat".into(), true, true, 10);
+        empty.messages = vec![message(ChatRole::Assistant, "Bienvenido")];
+        assert_eq!(take_last_request(&mut empty), None);
+        assert_eq!(empty.messages.len(), 1);
     }
 
     #[test]

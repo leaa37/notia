@@ -260,10 +260,53 @@ const IMAGE_TOKENS: usize = 1_536;
 /// context limit, when Ollama reports it: the request never asks beyond
 /// it, and nothing else caps the size. Cloud models ignore both values.
 pub fn task_options(prompt_chars: usize, images: usize, max_context: Option<usize>) -> Value {
-    let needed = prompt_chars.div_ceil(CHARS_PER_TOKEN) + images * IMAGE_TOKENS + TASK_OUTPUT_TOKENS;
+    round_options(prompt_chars, images, max_context, None)
+}
+
+/// Tokens a prompt of `prompt_chars` characters and `images` images takes,
+/// without the answer.
+pub fn prompt_tokens(prompt_chars: usize, images: usize) -> usize {
+    prompt_chars.div_ceil(CHARS_PER_TOKEN) + images * IMAGE_TOKENS
+}
+
+/// Ollama `options` of an agent round or a check beside it, like
+/// [`task_options`]: the system prompt, the conversation and the tools of a
+/// chat turn are tens of thousands of tokens, and without `num_ctx` a local
+/// model keeps only the end of them and answers something else. `floor` is
+/// the context the model last ran with: a request never asks for less, so a
+/// local model is not reloaded between the router, the rounds and the
+/// checks of a turn.
+pub fn round_options(prompt_chars: usize, images: usize, max_context: Option<usize>, floor: Option<usize>) -> Value {
+    let needed = prompt_tokens(prompt_chars, images) + TASK_OUTPUT_TOKENS;
     let num_ctx = TASK_CONTEXT_TOKENS.into_iter().find(|size| *size >= needed).unwrap_or(needed);
+    let num_ctx = floor.map_or(num_ctx, |floor| num_ctx.max(floor));
     let num_ctx = max_context.map_or(num_ctx, |max| num_ctx.min(max));
     serde_json::json!({ "num_ctx": num_ctx })
+}
+
+/// The error of a prompt the model cannot read whole: Ollama would drop its
+/// start, with the instructions and the tools, and the answer would make no
+/// sense. `None` when it fits or the model's context is unknown.
+pub fn context_overflow(prompt_chars: usize, images: usize, max_context: Option<usize>, model: &str) -> Option<String> {
+    let needed = prompt_tokens(prompt_chars, images);
+    let max = max_context.filter(|max| needed > *max)?;
+    Some(format!(
+        "Este pedido necesita unos {} tokens de contexto y el modelo «{model}» lee como máximo {}: la IA no vería el principio de las instrucciones y respondería cualquier cosa. Elegí en Configuración → IA un modelo con más contexto, o empezá un chat nuevo si la conversación ya es larga.",
+        thousands(needed),
+        thousands(max)
+    ))
+}
+
+fn thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push('.');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 pub const INKMATH_SYSTEM_PROMPT: &str = "Sos un transcriptor preciso de formulas matematicas manuscritas a LaTeX.";
@@ -306,6 +349,23 @@ mod tests {
         assert_eq!(options(40_000, 0, Some(8_192)), 8_192);
         // The answer is never capped: a model may reason before it answers.
         assert!(task_options(10, 0, None).get("num_predict").is_none());
+    }
+
+    /// A chat round asks for a context that holds its prompt and tools, never
+    /// less than the model last ran with (no reload between the checks and
+    /// the rounds of a turn) and never more than the model reads.
+    #[test]
+    fn a_chat_round_asks_for_its_whole_prompt() {
+        let num_ctx = |chars: usize, max: Option<usize>, floor: Option<usize>| round_options(chars, 0, max, floor)["num_ctx"].as_u64().unwrap();
+        // The general chat with every module's tools: ~107.000 characters.
+        assert_eq!(num_ctx(107_000, None, None), 65_536);
+        assert_eq!(num_ctx(4_000, None, None), 16_384);
+        assert_eq!(num_ctx(4_000, None, Some(65_536)), 65_536);
+        assert_eq!(num_ctx(107_000, Some(40_960), Some(65_536)), 40_960);
+        assert_eq!(context_overflow(107_000, 0, Some(131_072), "qwen3"), None);
+        assert_eq!(context_overflow(107_000, 0, None, "qwen3"), None);
+        let error = context_overflow(107_000, 0, Some(8_192), "llama3.2:3b").expect("too long");
+        assert!(error.contains("unos 35.667 tokens") && error.contains("«llama3.2:3b» lee como máximo 8.192"), "{error}");
     }
 
     #[test]

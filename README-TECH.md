@@ -1191,7 +1191,7 @@ Tercer paso del plan de separación. Las tareas de IA del proveedor, Multichat y
 
 | Comando | Entrada (`payload`) | Salida |
 | --- | --- | --- |
-| `ai_chat_send` | `{ libraryId, requestId, mode, settings?, scope, message, context?, attachments, promptName?, undoOperationId?, workspace?, selection, libraryUserId?, chat }` | `{ answer, dataChanged, document?, undoneOperationId? }` |
+| `ai_chat_send` | `{ libraryId, requestId, mode, settings?, scope, message, context?, attachments, promptName?, undoOperationId?, workspace?, selection, libraryUserId?, chat, retry? }` (`retry`: volver a responder el último pedido del chat guardado) | `{ answer, dataChanged, document?, undoneOperationId? }` |
 | `ai_chat_answer` | `{ requestId, answer }` con `answer` de tipo `clarification { answer }`, `confirmation { accepted, hunkIds }` o `plan { accepted, stepIds? }` | — |
 | `ai_chat_cancel` | `{ requestId }` | cancela la pregunta pendiente o la ejecución |
 
@@ -7464,7 +7464,7 @@ Reemplaza el ruteo por palabras de Telegram (sección anterior), que ahora queda
 2. **Cuándo se rutea.** En un turno nuevo del scope biblioteca, después de proyectar el catálogo para el actor y aplicar los interruptores del chat, si quedan más de 64 herramientas (`ROUTING_THRESHOLD`) de más de un área (`needs_routing`).
 3. **Consulta al modelo.** `router_prompt` le da al mismo modelo del agente la lista de áreas ofrecidas, cada una con una línea que la describe, y los últimos 6 mensajes, de 600 caracteres como máximo cada uno. Así un «sí, borralos» hereda el área del pedido anterior. El modelo responde `{"areas": [...]}` por relevancia y puede elegir varias áreas. La llamada va sin herramientas ni razonamiento (`complete_with`), por el transporte de la plataforma (en Android, el puente Kotlin), con 45 s como máximo.
 4. **Armado del turno.** `tools_for_areas` deja las herramientas comunes y agrega las áreas en orden mientras entren en el límite.
-5. **Respaldo.** Si el modelo no responde, su respuesta no se puede leer o no elige ninguna, deciden las palabras (`fallback_areas`):
+5. **Respaldo.** Si el modelo no responde o su respuesta no se puede leer, deciden las palabras (`fallback_areas`). Desde el 2026-11-16, una lista vacía es una respuesta (ninguna área), no un respaldo:
    - correo o calendario: correo y biblioteca;
    - finanzas: finanzas y rutina;
    - cualquier otro pedido: biblioteca, tareas, rutina y correo.
@@ -10453,6 +10453,46 @@ Sigue el canvas `SaludDashboard.jsx` que pasó el usuario (un componente React c
 - Sin cambios de frontend.
 - **Pendiente:** probar con el modelo real que el chat de Finanzas elige Salud ante «almorcé…» y que un turno mal ruteado usa `change_tool_areas` y termina bien, en la app y por Telegram.
 
+## Chat: respuestas sin sentido con modelos de contexto chico, «este módulo» y «Volver a responder» (2026-11-16)
+
+**Reporte.** En el chat de la web, a «¿qué puede hacer este módulo? ¿para qué sirve y qué datos necesita?» la IA respondió «article 4 hola», y a «eh?», «article 5 hola». El saludo anterior sí lo había respondido bien.
+
+**Reproducción.** Servidor headless con un Ollama falso que guarda cada pedido (`/api/chat`, `/api/tags`, `/api/show`) y el chat manejado con Playwright, con la misma conversación. No se reprodujo la respuesta exacta: depende del modelo de la persona, que no se pudo usar acá. Sí aparecieron tres fallas que la explican y que se arreglaron:
+
+1. **Un pedido sin áreas cargaba todas.** El prompt del router pide `{"areas": []}` para un saludo o una pregunta general, pero `parse_router_answer` tomaba la lista vacía como respuesta ilegible y `fallback_areas` elegía biblioteca, tareas, rutina, agenda, correo, acciones, salud y gimnasio. Con un modelo que obedece al pie de la letra, cada saludo salía con 96 herramientas: unos 107.000 caracteres (~36.000 tokens) entre el prompt (31.000) y los esquemas (76.000).
+2. **Los turnos del agente no mandaban `num_ctx`.** Solo las tareas sueltas lo hacían (`task_options`; la sección del 2026-10-16 ya decía «el agente del chat sigue sin `options`»). Sin ese valor, un modelo local de Ollama lee su contexto por defecto (2.048 o 4.096 tokens) y descarta el principio del pedido, con las instrucciones y las herramientas: responde cualquier cosa. Telegram andaba porque sus pedidos concretos («registrá 500 ml») cargan una sola área y entran mejor.
+3. **El chat general no sabía qué módulo estaba abierto.** El snapshot del workspace llegaba con `view`, pero ni el router ni el prompt lo usaban; «este módulo» solo se podía averiguar con `get_workspace_context`.
+
+**Arreglo.**
+- **Sin áreas es una respuesta** (`tool_routing::parse_router_answer`). `RouterDecision.areas` es `Some([])` cuando el modelo responde una lista vacía: la ronda lleva solo las herramientas de todos los turnos y `change_tool_areas`, con la que el agente carga un área si la necesita. Sigue siendo `None` (deciden las palabras) cuando no se puede leer o nombra solo áreas desconocidas. Medido con el Ollama falso: el turno de un saludo pasó de 96 herramientas y ~36.000 tokens a 24 y ~13.700.
+- **Contexto de cada ronda** (`backend_ollama::OllamaAgentProvider::round_options`, `ai_settings::round_options`). Las cuatro llamadas del proveedor del agente (`chat`, `stream_chat`, `tool_chat` y la ronda con herramientas en streaming) mandan `num_ctx` para el prompt entero: texto de los mensajes y de las llamadas a herramientas, esquemas de las herramientas e imágenes, con los escalones de las tareas (16.384, 32.768, 65.536, 131.072) y como techo el contexto del modelo (`ai_tasks::model_context_of`, `/api/show`, cacheado 10 minutos).
+  - **Sin recargas.** Un modelo local se recarga cuando cambia `num_ctx`. Cada endpoint y modelo recuerda el tamaño con el que corrió por última vez (`last_context`, 10 minutos), y ningún pedido pide menos: el router, las rondas y los chequeos de un turno usan el mismo.
+  - **Pedido que no entra.** Si el contexto del modelo es conocido y el prompt no entra, la ronda falla sin enviarse (`ai_settings::context_overflow`): «Este pedido necesita unos N tokens de contexto y el modelo «X» lee como máximo M…». Antes Ollama lo cortaba en silencio.
+  - **Transporte.** `OllamaTransport::tool_chat` y `stream_tool_chat` reciben `options`. En escritorio van en el cuerpo de `/api/chat` (`run_ollama_tool_chat`, `stream_ollama_tool_chat_with_cancellation`, `with_options`, solo si no es nulo); en Android, en el payload del puente, que `AiBridgePlugin.kt` ya pasaba al cuerpo en `toolChat` y `streamRawChat` (sin cambios en Kotlin).
+  - Los modelos de nube ignoran `num_ctx`, como ya se había comprobado con las tareas.
+- **El módulo en pantalla** (solo canal App; Telegram no tiene pantalla).
+  - `tool_routing::viewed_area(view)` da el área de la vista: Gimnasio, Salud, Recetas, Finanzas, Agenda, Rutina, Task Manager, Acciones IA, Meeting, y biblioteca para el editor y el grafo. Inicio, Chat, ColdPass y Tareas IA no tienen área.
+  - `router_prompt(áreas, conversación, home, viewed)` agrega «La persona tiene abierto el módulo «X»: si el pedido habla de «este módulo», de «esto» o de lo que ve en pantalla, elegí esa área», salvo que coincida con el módulo del chat. `fallback_areas(…, home, viewed)` la pone después del módulo del chat.
+  - `prompt_guidance::on_screen` agrega al prompt «La persona tiene abierto en Notia: <módulo> (<qué hace>). Si pregunta por «este módulo»… se refiere a eso…», con `tool_routing::view_summary`, que también describe Inicio, Chat, ColdPass, Tareas IA, el grafo y el editor.
+- **«Volver a responder».** El último mensaje de Notia en el chat tiene, junto a «Copiar», un botón que pide otra respuesta al último pedido.
+  - `ChatSendPayload.retry` (`ai_chat_send`): Rust saca del chat guardado el último mensaje de la persona y las respuestas que lo siguen (`chat_turn::take_last_request`) y corre el turno con ese mensaje y sus adjuntos sobre la conversación anterior. Las respuestas nuevas reemplazan a las viejas y el archivo se reescribe entero; el título del chat se conserva, también si era el primer pedido.
+  - Solo en modo `chat`, con chat guardado y sin `undoOperationId`; si no, `invalid-input`. Un chat sin mensajes de la persona responde «Este chat no tiene un mensaje para volver a responder.».
+  - En la web, `useChatSubmitMessage.retryLastReply` manda `retry: true` y muestra el pedido sin las respuestas viejas mientras corre; no toca el compositor ni sus adjuntos. El mensaje que muestra lo decide la interfaz solo para verlo; el que se responde es el que guarda Rust.
+
+**Contratos.**
+- `RouterDecision.areas`: `Some([])` = ninguna área; `None` = sin respuesta útil.
+- `router_prompt` y `fallback_areas` reciben `viewed: Option<ToolArea>`. Nuevas: `viewed_area`, `view_summary`.
+- `ai_settings`: `prompt_tokens`, `round_options(caracteres, imágenes, contexto_máximo, piso)`, `context_overflow`. `task_options` es `round_options` sin piso.
+- `OllamaTransport::tool_chat`/`stream_tool_chat`: parámetro `options` después de `think`. `OllamaProviderConfig::with_max_context`.
+- `ai_chat_send`: `retry?: boolean` (`ChatTurnInput.retry` en TypeScript). `ChatThread.onRetryLastReply`.
+
+**Validaciones.**
+- `cargo test -p notia-backend-core`: pruebas nuevas `no_areas_is_an_answer_and_unknown_areas_are_not`, `the_module_on_screen_guides_the_router`, `the_module_on_screen_is_named_in_the_app`, `a_chat_round_asks_for_its_whole_prompt` y `the_last_request_is_taken_out_to_be_answered_again`; se ajustaron las del router que esperaban `None` para `[]`.
+- `cargo test -p notia-app`: `every_round_asks_for_a_context_that_holds_its_prompt` (tamaño por ronda, piso sin recarga, error sin envío cuando no entra).
+- Vitest del chat (54, uno nuevo: `answers the last request again without touching the composer`), `tsc` y ESLint.
+- De punta a punta con el servidor headless, el Ollama falso y Playwright: el saludo y la pregunta general salen con 24 herramientas, `num_ctx` 32.768 en todas las llamadas del turno, el prompt nombra Inicio o Gimnasio según la vista, el router recibe el módulo abierto, y «Volver a responder» reemplaza la respuesta en pantalla y en el archivo del chat, sin mandarle al modelo la respuesta vieja.
+- **Pendiente:** confirmar con el modelo real de la persona que la respuesta tiene sentido; si sigue fallando, mirar el registro del servidor de Ollama («truncating input prompt») y el modelo elegido en el selector del chat.
+
 ## Comidas: receta en Recetas y registro en Salud en una sola llamada (2026-09-28)
 
 **Pedido del usuario.**
@@ -12050,7 +12090,7 @@ Pedido en una lista de mejoras sobre el tablero; como el tablero publicado usa e
 **Corrección.**
 
 - `ai_settings::task_options(caracteres, imágenes, contexto_máximo)` arma `{"num_ctx"}`. Estima 3 caracteres por token, 1536 tokens por imagen y reserva `TASK_OUTPUT_TOKENS` (4096) de contexto para la respuesta; la respuesta en sí no tiene tope. Elige el menor escalón de 16.384, 32.768, 65.536 o 131.072 que alcance (pocos tamaños para que el modelo local no se recargue en cada pedido); un pedido mayor que todos los escalones pide lo que necesita. El único techo es el contexto máximo del modelo: `ai_tasks::model_context` lo consulta a Ollama (`/api/show`, clave `*.context_length` de `model_info`; en Android la agrega `inspectModel` del puente como `contextLength`) y lo cachea 10 minutos por modelo. Sin dato (modelo de nube, endpoint caído, valor menor a 2048) no hay techo. Los modelos de nube ignoran ambos valores; se comprobó que aceptan el campo.
-- `OllamaTransport::chat` y `stream_chat` reciben `options`, y `Value::Null` no manda nada. En escritorio van en `OllamaChatRequest` y en Android en el payload del puente. `AiBridgePlugin.kt` los agrega al cuerpo en `toolChat` y `rawChatStreaming`. El agente del chat sigue sin `options`.
+- `OllamaTransport::chat` y `stream_chat` reciben `options`, y `Value::Null` no manda nada. En escritorio van en `OllamaChatRequest` y en Android en el payload del puente. `AiBridgePlugin.kt` los agrega al cuerpo en `toolChat` y `rawChatStreaming`. El agente del chat sigue sin `options`. (Desde el 2026-11-16 sí los manda: ver «Chat: respuestas sin sentido con modelos de contexto chico…».)
 - `meeting::json_object_expecting(respuesta, claves)` recorre todos los objetos parseables de la respuesta: gana el más largo que tenga alguna de las claves esperadas y, sin ninguna, el más largo. Saltea las llaves que caen dentro de un objeto ya encontrado y tolera el texto, las llaves sueltas y el bloque de código alrededor. Las notas esperan `objective…tasks`, el resumen `summary/keyPoints/tasks`, la limpieza `segments` y los nombres `speakers`; así un objeto de ejemplo del razonamiento no tapa la respuesta real.
 
 **Validaciones (2026-10-16):**

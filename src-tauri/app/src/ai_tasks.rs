@@ -132,13 +132,13 @@ fn provider_capabilities(_app: &AppHandle, settings: &AiSettings, model: &str) -
 }
 
 #[cfg(not(target_os = "android"))]
-fn provider_context_length(_app: &AppHandle, settings: &AiSettings, model: &str) -> Result<Option<u64>, String> {
-    crate::host::async_runtime::block_on(crate::services::ai_service::inspect_ollama_model(&http(settings), model))
+fn provider_context_length(_app: &AppHandle, settings: &AiHttpSettings, model: &str) -> Result<Option<u64>, String> {
+    crate::host::async_runtime::block_on(crate::services::ai_service::inspect_ollama_model(settings, model))
         .map(|result| result.context_length)
 }
 
 #[cfg(target_os = "android")]
-fn provider_context_length(app: &AppHandle, settings: &AiSettings, model: &str) -> Result<Option<u64>, String> {
+fn provider_context_length(app: &AppHandle, settings: &AiHttpSettings, model: &str) -> Result<Option<u64>, String> {
     let raw = crate::mobile_ai_bridge::call_android_ai_plugin(
         app,
         "inspectModel",
@@ -151,8 +151,18 @@ fn provider_context_length(app: &AppHandle, settings: &AiSettings, model: &str) 
 /// more. `None` when the provider does not report one (a cloud model, an
 /// unreachable endpoint): the task then asks for what it needs.
 fn model_context(app: &AppHandle, settings: &AiSettings, model: &str) -> Option<usize> {
+    model_context_of(app, &http(settings), model)
+}
+
+/// [`model_context`] for an endpoint already resolved: the agent's rounds
+/// use it too. Remembered for a while per endpoint and model.
+pub(crate) fn model_context_of(app: &AppHandle, settings: &AiHttpSettings, model: &str) -> Option<usize> {
     let state = app.state::<AiTasksState>();
-    let key = format!("{}::{model}", models_key(settings));
+    let key = format!(
+        "{}::{}::{model}",
+        settings.ollama_url,
+        if settings.api_key.is_empty() { "missing" } else { "configured" }
+    );
     if let Ok(guard) = state.contexts.lock() {
         if let Some((at, context)) = guard.get(&key) {
             if at.elapsed() < MODEL_CONTEXT_CACHE_TTL {

@@ -191,6 +191,50 @@ pub fn home_area(scope: &BackendScope, channel: &BackendChannel) -> Option<ToolA
     }
 }
 
+/// The area of the module the person has on screen in the app (the view of
+/// the workspace snapshot), so «este módulo» or «esto» means something even
+/// in the general chat. `None` for views without their own tools: Inicio,
+/// the chat itself, ColdPass and Tareas IA.
+pub fn viewed_area(view: &str) -> Option<ToolArea> {
+    Some(match view {
+        "documents" | "editor" | "graph" => ToolArea::Library,
+        "task-manager" => ToolArea::Tasks,
+        "meeting" => ToolArea::Meeting,
+        "finance" => ToolArea::Finance,
+        "agenda" => ToolArea::Agenda,
+        "routine" => ToolArea::Routine,
+        "ai-actions" => ToolArea::Actions,
+        "recipes" => ToolArea::Recipes,
+        "health" => ToolArea::Health,
+        "gym" => ToolArea::Gym,
+        _ => return None,
+    })
+}
+
+/// What the person has on screen, as the assistant reads it: the module's
+/// name and what it does. `None` for an unknown view.
+pub fn view_summary(view: &str) -> Option<String> {
+    let (name, what) = match view {
+        "home" => ("Inicio", "el tablero que junta lo de hoy de los otros módulos: el clima, la Agenda de los próximos 7 días, las tareas urgentes de Task Manager, el pomodoro, los gastos del mes y el dólar de Finanzas, la Rutina del día, Salud y Gimnasio, y un acceso rápido al asistente"),
+        "chat" => ("Chat", "las conversaciones con el asistente, con su historial, sus agentes y el contexto de biblioteca de cada chat"),
+        "coldpass" => ("ColdPass", "el gestor de contraseñas cifradas del dispositivo; el asistente no tiene acceso a sus credenciales"),
+        "ai-tasks" => ("Tareas IA", "los trabajos largos que la IA hace fuera del chat, con su plan, sus pasos y su revisión"),
+        "graph" => ("Vista de grafo", "el mapa de las notas de la biblioteca y sus enlaces"),
+        "documents" | "editor" => ("el editor de documentos", "las notas y archivos abiertos de la biblioteca"),
+        "task-manager" => ("Task Manager", ToolArea::Tasks.description()),
+        "meeting" => ("Meeting", ToolArea::Meeting.description()),
+        "finance" => ("Finanzas", ToolArea::Finance.description()),
+        "agenda" => ("Agenda", ToolArea::Agenda.description()),
+        "routine" => ("Rutina", ToolArea::Routine.description()),
+        "ai-actions" => ("Acciones IA", ToolArea::Actions.description()),
+        "recipes" => ("Recetas", ToolArea::Recipes.description()),
+        "health" => ("Salud", ToolArea::Health.description()),
+        "gym" => ("Gimnasio", ToolArea::Gym.description()),
+        _ => return None,
+    };
+    Some(format!("{name} ({what})"))
+}
+
 /// Areas by id, in order, without repeats or unknown ids.
 pub fn parse_area_ids(ids: &[String]) -> Vec<ToolArea> {
     let mut areas = Vec::new();
@@ -392,12 +436,23 @@ fn clipped(text: &str, limit: usize) -> String {
 
 /// System and user prompts of the routing call: the offered areas, the
 /// module the chat is open in, if any, and the end of the conversation.
-pub fn router_prompt(areas: &[ToolArea], conversation: &[RouterMessage<'_>], home: Option<ToolArea>) -> (String, String) {
+pub fn router_prompt(
+    areas: &[ToolArea],
+    conversation: &[RouterMessage<'_>],
+    home: Option<ToolArea>,
+    viewed: Option<ToolArea>,
+) -> (String, String) {
     let listed = areas.iter().map(|area| format!("- {}: {}", area.id(), area.description())).collect::<Vec<_>>().join("\n");
-    let home = home
-        .filter(|area| areas.contains(area))
+    let home_area = home.filter(|area| areas.contains(area));
+    let mut home = home_area
         .map(|area| format!(" El chat está abierto en el módulo «{}»: elegí esa área salvo que el pedido sea claramente de otra.", area.id()))
         .unwrap_or_default();
+    if let Some(area) = viewed.filter(|area| areas.contains(area) && home_area != Some(*area)) {
+        home.push_str(&format!(
+            " La persona tiene abierto el módulo «{}»: si el pedido habla de «este módulo», de «esto» o de lo que ve en pantalla, elegí esa área.",
+            area.id()
+        ));
+    }
     let system = format!(
         "Elegís qué áreas de herramientas necesita un asistente para responder el último mensaje del usuario.\n\
          Áreas disponibles:\n{listed}\n\n\
@@ -458,8 +513,10 @@ pub fn with_prompt_choice(system: String) -> String {
 /// What the routing call decided for the turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouterDecision {
-    /// Areas picked among the offered ones; `None` when the answer cannot be
-    /// read or names none (words decide then).
+    /// Areas picked among the offered ones: empty when the model said the
+    /// request needs none (the round keeps the tools of every turn and
+    /// `change_tool_areas`); `None` when the answer cannot be read or names
+    /// only unknown areas (words decide then).
     pub areas: Option<Vec<ToolArea>>,
     /// Whether the turn needs thinking; `None` keeps the settings.
     pub thinking: Option<bool>,
@@ -483,19 +540,25 @@ pub fn parse_router_answer(answer: &str, offered: &[ToolArea]) -> RouterDecision
     let Some(value) = router_json(answer) else {
         return RouterDecision::default();
     };
+    let listed = value.get("areas").and_then(Value::as_array);
     let mut areas = Vec::new();
-    let listed = value.get("areas").and_then(Value::as_array).into_iter().flatten();
-    for area in listed.filter_map(Value::as_str).filter_map(ToolArea::parse) {
+    for area in listed.into_iter().flatten().filter_map(Value::as_str).filter_map(ToolArea::parse) {
         if offered.contains(&area) && !areas.contains(&area) {
             areas.push(area);
         }
     }
+    // `[]` is an answer: the request needs no area (a greeting, a general
+    // question). A list whose names are all unknown is not.
+    let areas = match listed {
+        Some(listed) if listed.is_empty() => Some(Vec::new()),
+        _ => (!areas.is_empty()).then_some(areas),
+    };
     let conversational = match value.get("prompt").and_then(Value::as_str).map(|mode| mode.trim().to_lowercase()) {
         Some(mode) if mode.starts_with("conversaci") => Some(true),
         Some(mode) if mode == "asistente" => Some(false),
         _ => None,
     };
-    RouterDecision { areas: (!areas.is_empty()).then_some(areas), thinking: value.get("thinking").and_then(Value::as_bool), conversational }
+    RouterDecision { areas, thinking: value.get("thinking").and_then(Value::as_bool), conversational }
 }
 
 /// Whether a message names the browser or a site to work on.
@@ -527,10 +590,10 @@ fn is_image_request(message: &str) -> bool {
 }
 
 /// Areas chosen when the router gives no answer: the module the chat is
-/// open in first, then by words: mail and calendar requests, finance
+/// open in first, then the one the person has on screen, then by words: mail and calendar requests, finance
 /// requests, or the library, tasks, routine and mail. A message with
 /// attachments starts with Finanzas, where most documents go.
-pub fn fallback_areas(message: &str, offered: &[ToolArea], with_attachments: bool, home: Option<ToolArea>) -> Vec<ToolArea> {
+pub fn fallback_areas(message: &str, offered: &[ToolArea], with_attachments: bool, home: Option<ToolArea>, viewed: Option<ToolArea>) -> Vec<ToolArea> {
     let wanted: &[ToolArea] = if crate::telegram_bot::is_mail_request(message) {
         &[ToolArea::Mail, ToolArea::Agenda, ToolArea::Library]
     } else if crate::telegram_bot::is_finance_request(message) {
@@ -547,6 +610,9 @@ pub fn fallback_areas(message: &str, offered: &[ToolArea], with_attachments: boo
         &[ToolArea::Library, ToolArea::Tasks, ToolArea::Routine, ToolArea::Agenda, ToolArea::Mail, ToolArea::Actions, ToolArea::Health, ToolArea::Gym]
     };
     let mut areas = home.into_iter().collect::<Vec<_>>();
+    if let Some(area) = viewed.filter(|area| !areas.contains(area)) {
+        areas.push(area);
+    }
     // A photo is a ticket or a dish (a recipe or what the person ate)
     // more often than anything else.
     if with_attachments {
@@ -650,7 +716,7 @@ mod tests {
             RouterMessage { from_user: false, content: "Sí, 12 en la cuenta personal.", attachments: 0 },
             RouterMessage { from_user: true, content: "Borralos", attachments: 0 },
         ];
-        let (system, user) = router_prompt(&[ToolArea::Library, ToolArea::Mail], &conversation, None);
+        let (system, user) = router_prompt(&[ToolArea::Library, ToolArea::Mail], &conversation, None, None);
         assert!(system.contains("- correo: Gmail") && !system.contains("- finanzas"));
         assert!(user.contains("Usuario: ¿Tengo correos de Tienda Vapor?") && user.ends_with("Último mensaje del usuario:\nBorralos"));
         let offered = [ToolArea::Library, ToolArea::Mail];
@@ -661,7 +727,7 @@ mod tests {
         // A greeting needs no area and no thinking.
         assert_eq!(
             parse_router_answer("{\"areas\": [], \"thinking\": false}", &offered),
-            RouterDecision { areas: None, thinking: Some(false), conversational: None }
+            RouterDecision { areas: Some(Vec::new()), thinking: Some(false), conversational: None }
         );
         assert_eq!(parse_router_answer("{\"areas\": [\"correo\"]}", &offered).thinking, None);
         assert_eq!(parse_router_answer("no sé", &offered), RouterDecision::default());
@@ -675,14 +741,14 @@ mod tests {
             content: "Me llegó la heladera 😭😭 estoy muy feliz, al fin voy a tener paz y tranquilidad",
             attachments: 0,
         }];
-        let (system, _) = router_prompt(&[ToolArea::Library, ToolArea::Health], &conversation, None);
+        let (system, _) = router_prompt(&[ToolArea::Library, ToolArea::Health], &conversation, None, None);
         assert!(!system.contains("\"prompt\""));
         let system = with_prompt_choice(system);
         assert!(system.contains("\"prompt\" con el modo de respuesta") && system.contains("\"conversacion\" cuando la persona cuenta algo de su vida"));
         let offered = [ToolArea::Library, ToolArea::Health];
         assert_eq!(
             parse_router_answer("{\"areas\": [], \"thinking\": false, \"prompt\": \"conversacion\"}", &offered),
-            RouterDecision { areas: None, thinking: Some(false), conversational: Some(true) }
+            RouterDecision { areas: Some(Vec::new()), thinking: Some(false), conversational: Some(true) }
         );
         assert_eq!(parse_router_answer("{\"areas\": [\"salud\"], \"prompt\": \"Conversación\"}", &offered).conversational, Some(true));
         assert_eq!(parse_router_answer("{\"areas\": [\"salud\"], \"prompt\": \"asistente\"}", &offered).conversational, Some(false));
@@ -692,7 +758,7 @@ mod tests {
     #[test]
     fn an_answer_with_the_reasoning_written_before_it_still_reads() {
         let offered = [ToolArea::Library, ToolArea::Finance];
-        let decided = RouterDecision { areas: None, thinking: Some(false), conversational: Some(true) };
+        let decided = RouterDecision { areas: Some(Vec::new()), thinking: Some(false), conversational: Some(true) };
         let closed = "Comparte una alegría. Opción: {\"areas\": [\"finanzas\"]}? No.\n{\"areas\": [], \"thinking\": false, \"prompt\": \"conversacion\"}</think>{\"areas\": [], \"thinking\": false, \"prompt\": \"conversacion\"}";
         assert_eq!(parse_router_answer(closed, &offered), decided);
         let open = "Lo pienso: {no es json} y al final\n{\"areas\": [], \"thinking\": false, \"prompt\": \"conversacion\"}";
@@ -707,7 +773,7 @@ mod tests {
             RouterMessage { from_user: true, content: "hola", attachments: 0 },
             RouterMessage { from_user: true, content: &document, attachments: 3 },
         ];
-        let (system, user) = router_prompt(&ToolArea::ALL, &conversation, None);
+        let (system, user) = router_prompt(&ToolArea::ALL, &conversation, None, None);
         assert!(system.contains("un recibo de sueldo o un resumen de tarjeta es finanzas"));
         assert!(system.contains("una captura de una agenda o un calendario para copiar sus reuniones es correo"));
         assert!(user.contains("Último mensaje del usuario (trae 3 adjuntos):\n[Origen: documento de Telegram sin texto.]"));
@@ -737,37 +803,76 @@ mod tests {
         // A module's chat suggests its area to the router and falls back to it.
         assert_eq!(home_area(&BackendScope::Finance, &BackendChannel::App), Some(ToolArea::Finance));
         assert_eq!(home_area(&BackendScope::Library, &BackendChannel::Meeting), Some(ToolArea::Meeting));
-        let (system, _) = router_prompt(&offered, &[RouterMessage { from_user: true, content: "almorcé milanesa", attachments: 0 }], Some(ToolArea::Finance));
+        let (system, _) = router_prompt(&offered, &[RouterMessage { from_user: true, content: "almorcé milanesa", attachments: 0 }], Some(ToolArea::Finance), None);
         assert!(system.contains("abierto en el módulo «finanzas»"));
-        assert_eq!(fallback_areas("almorcé milanesa", &offered, false, Some(ToolArea::Finance))[0], ToolArea::Finance);
+        assert_eq!(fallback_areas("almorcé milanesa", &offered, false, Some(ToolArea::Finance), None)[0], ToolArea::Finance);
         assert_eq!(parse_area_ids(&["salud".into(), "x".into(), "salud".into()]), vec![ToolArea::Health]);
+    }
+
+    /// The module on screen guides the general chat: «este módulo» goes to
+    /// its area, and it comes right after the chat's own module when words
+    /// decide.
+    #[test]
+    fn the_module_on_screen_guides_the_router() {
+        assert_eq!(viewed_area("gym"), Some(ToolArea::Gym));
+        assert_eq!(viewed_area("task-manager"), Some(ToolArea::Tasks));
+        assert_eq!(viewed_area("home"), None);
+        assert_eq!(viewed_area("coldpass"), None);
+        assert!(view_summary("home").is_some_and(|summary| summary.starts_with("Inicio (") && summary.contains("Agenda")));
+        assert!(view_summary("gym").is_some_and(|summary| summary.starts_with("Gimnasio (Gimnasio: rutinas")));
+        assert_eq!(view_summary("otra"), None);
+        let offered = [ToolArea::Library, ToolArea::Health, ToolArea::Gym];
+        let asked = [RouterMessage { from_user: true, content: "¿qué puede hacer este módulo?", attachments: 0 }];
+        let (system, _) = router_prompt(&offered, &asked, None, Some(ToolArea::Gym));
+        assert!(system.contains("tiene abierto el módulo «gimnasio»"), "{system}");
+        // The chat's own module already says it; an area not offered says nothing.
+        let (system, _) = router_prompt(&offered, &asked, Some(ToolArea::Gym), Some(ToolArea::Gym));
+        assert!(!system.contains("tiene abierto"));
+        let (system, _) = router_prompt(&offered, &asked, None, Some(ToolArea::Finance));
+        assert!(!system.contains("tiene abierto"));
+        assert_eq!(fallback_areas("¿qué puede hacer este módulo?", &offered, false, None, Some(ToolArea::Gym))[0], ToolArea::Gym);
+        assert_eq!(&fallback_areas("anotá 500 ml", &offered, false, Some(ToolArea::Health), Some(ToolArea::Gym))[..2], [ToolArea::Health, ToolArea::Gym]);
+    }
+
+    /// A request that needs no area gets a light round: the tools of every
+    /// turn and `change_tool_areas`, not every module's tools; only an answer
+    /// that names nothing known falls back to words.
+    #[test]
+    fn no_areas_is_an_answer_and_unknown_areas_are_not() {
+        let offered = [ToolArea::Library, ToolArea::Health];
+        assert_eq!(parse_router_answer("{\"areas\": []}", &offered).areas, Some(Vec::new()));
+        assert_eq!(parse_router_answer("{\"areas\": [\"astrologia\"]}", &offered).areas, None);
+        assert_eq!(parse_router_answer("{\"thinking\": false}", &offered).areas, None);
+        let pool = [tool("read_library_documents"), tool("log_water"), tool("search_web")];
+        let round = turn_tools(&pool, &[], 20);
+        assert_eq!(round.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), ["search_web", SWITCH_AREA_TOOL]);
     }
 
     #[test]
     fn words_decide_when_the_router_does_not_answer() {
         let all = ToolArea::ALL;
         assert_eq!(
-            fallback_areas("de mi cuenta de gmail borrá los mails de Tienda Vapor", &all, false, None),
+            fallback_areas("de mi cuenta de gmail borrá los mails de Tienda Vapor", &all, false, None, None),
             vec![ToolArea::Mail, ToolArea::Agenda, ToolArea::Library]
         );
-        assert_eq!(fallback_areas("pagué la cuenta de la luz", &all, false, None), vec![ToolArea::Finance, ToolArea::Routine]);
-        assert_eq!(fallback_areas("dibujame un gato astronauta", &all, false, None), vec![ToolArea::Images, ToolArea::Library]);
-        assert_eq!(fallback_areas("abrí el navegador y entrá a mi homebanking", &all, false, None), vec![ToolArea::Browser, ToolArea::Library]);
-        assert_eq!(fallback_areas("qué me escribió Juan por WhatsApp", &all, false, None), vec![ToolArea::WhatsApp, ToolArea::Library]);
-        assert_eq!(fallback_areas("corré el script de los CSV", &all, false, None), vec![ToolArea::Scripts, ToolArea::Library]);
+        assert_eq!(fallback_areas("pagué la cuenta de la luz", &all, false, None, None), vec![ToolArea::Finance, ToolArea::Routine]);
+        assert_eq!(fallback_areas("dibujame un gato astronauta", &all, false, None, None), vec![ToolArea::Images, ToolArea::Library]);
+        assert_eq!(fallback_areas("abrí el navegador y entrá a mi homebanking", &all, false, None, None), vec![ToolArea::Browser, ToolArea::Library]);
+        assert_eq!(fallback_areas("qué me escribió Juan por WhatsApp", &all, false, None, None), vec![ToolArea::WhatsApp, ToolArea::Library]);
+        assert_eq!(fallback_areas("corré el script de los CSV", &all, false, None, None), vec![ToolArea::Scripts, ToolArea::Library]);
         assert_eq!(
-            fallback_areas("resumí la nota de ayer", &all, false, None),
+            fallback_areas("resumí la nota de ayer", &all, false, None, None),
             vec![ToolArea::Library, ToolArea::Tasks, ToolArea::Routine, ToolArea::Agenda, ToolArea::Mail, ToolArea::Actions, ToolArea::Health, ToolArea::Gym]
         );
         // Without #Confidencial, finance and mail are not offered.
-        assert_eq!(fallback_areas("pagué la cuenta de la luz", &[ToolArea::Library, ToolArea::Tasks, ToolArea::Routine], false, None), vec![ToolArea::Routine]);
+        assert_eq!(fallback_areas("pagué la cuenta de la luz", &[ToolArea::Library, ToolArea::Tasks, ToolArea::Routine], false, None, None), vec![ToolArea::Routine]);
         // Attachments start with Finanzas; the words add the rest.
         assert_eq!(
-            fallback_areas("", &all, true, None),
+            fallback_areas("", &all, true, None, None),
             vec![ToolArea::Finance, ToolArea::Recipes, ToolArea::Health, ToolArea::Library, ToolArea::Tasks, ToolArea::Routine, ToolArea::Agenda, ToolArea::Mail, ToolArea::Actions, ToolArea::Gym]
         );
         assert_eq!(
-            fallback_areas("pasá esto a mi calendario", &all, true, None),
+            fallback_areas("pasá esto a mi calendario", &all, true, None, None),
             vec![ToolArea::Finance, ToolArea::Recipes, ToolArea::Health, ToolArea::Mail, ToolArea::Agenda, ToolArea::Library]
         );
         // The Agenda of Notia has an area of its own.

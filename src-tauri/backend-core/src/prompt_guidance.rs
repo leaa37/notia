@@ -50,6 +50,7 @@ pub fn scope_guidance(
         lines: Vec::new(),
     };
     general(&mut guidance, context);
+    on_screen(&mut guidance, context, snapshot);
     if context.channel == BackendChannel::Telegram {
         telegram(&mut guidance);
     }
@@ -71,6 +72,20 @@ pub fn scope_guidance(
     ai_action_tools(&mut guidance, today);
     ai_task_tools(&mut guidance);
     guidance.lines.join("\n")
+}
+
+/// What the person has on screen in the app, so «este módulo» or «esto»
+/// means something without a tool. Only the app knows the view.
+fn on_screen(guidance: &mut Guidance, context: &BackendRequestContext, snapshot: Option<&BackendSnapshot>) {
+    if context.channel != BackendChannel::App {
+        return;
+    }
+    let Some(summary) = snapshot.and_then(|snapshot| crate::tool_routing::view_summary(&snapshot.view)) else {
+        return;
+    };
+    guidance.push(format!(
+        "La persona tiene abierto en Notia: {summary}. Si pregunta por «este módulo», «esta pantalla» o «esto» sin nombrar otra cosa, se refiere a eso: explicá para qué sirve, qué puede hacer ahí y qué datos usa, y si para responder hacen falta sus datos, usá sus herramientas."
+    ));
 }
 
 /// Tareas IA: what is too long for one turn becomes a task the agent works
@@ -585,6 +600,31 @@ mod tests {
         assert!(text.contains("Canal Telegram"));
         assert!(!text.contains("<b>"));
         assert!(!text.contains("llamá set_agent_execution_plan"));
+    }
+
+    /// «Este módulo» in the app is the module on screen; Telegram has no screen.
+    #[test]
+    fn the_module_on_screen_is_named_in_the_app() {
+        let snapshot = |view: &str| BackendSnapshot {
+            snapshot_version: 1,
+            view: view.into(),
+            scope: BackendScope::Library,
+            library_id: "library-1".into(),
+            active_document: None,
+            open_tabs: Vec::new(),
+            capabilities: Default::default(),
+            captured_at: 0,
+            selection: None,
+        };
+        let gym = scope_guidance(&context(BackendScope::Library, BackendChannel::App), &tools(&[]), Some(&snapshot("gym")), "2026-11-16");
+        assert!(gym.contains("La persona tiene abierto en Notia: Gimnasio (Gimnasio: rutinas"), "{gym}");
+        assert!(gym.contains("«este módulo»"));
+        let home = scope_guidance(&context(BackendScope::Library, BackendChannel::App), &tools(&[]), Some(&snapshot("home")), "2026-11-16");
+        assert!(home.contains("tiene abierto en Notia: Inicio ("));
+        let telegram = scope_guidance(&context(BackendScope::Library, BackendChannel::Telegram), &tools(&[]), Some(&snapshot("gym")), "2026-11-16");
+        assert!(!telegram.contains("tiene abierto en Notia"));
+        let unknown = scope_guidance(&context(BackendScope::Library, BackendChannel::App), &tools(&[]), Some(&snapshot("otra")), "2026-11-16");
+        assert!(!unknown.contains("tiene abierto en Notia"));
     }
 
     #[test]

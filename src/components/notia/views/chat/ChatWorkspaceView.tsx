@@ -449,7 +449,7 @@ export function ChatWorkspaceViewComponent({
     attachmentMenuPanelRef,
   )
 
-  const { submitMessage, cancelActiveReply, interjectMessage } = useChatSubmitMessage(
+  const { submitMessage, retryLastReply, cancelActiveReply, interjectMessage } = useChatSubmitMessage(
     {
       agentCorpusPaths,
       agentScope,
@@ -915,6 +915,7 @@ export function ChatWorkspaceViewComponent({
     <ChatThread
       messages={displayedMessages}
       isSubmitting={isSubmitting}
+      onRetryLastReply={selectedChatFilePath ? () => { void retryLastReply() } : undefined}
       isChatLoading={isChatLoading}
       isCheckingAiHealth={isCheckingAiHealth}
       aiAvailabilityMessage={aiAvailabilityMessage}

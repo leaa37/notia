@@ -38,6 +38,8 @@ pub struct OllamaProviderConfig {
     image_model: Option<String>,
     think: Value,
     tool_timeout_secs: u64,
+    /// The model's own context limit, when Ollama reports it.
+    max_context: Option<usize>,
 }
 
 impl OllamaProviderConfig {
@@ -66,7 +68,16 @@ impl OllamaProviderConfig {
             image_model: None,
             think,
             tool_timeout_secs,
+            max_context: None,
         })
+    }
+
+    /// The model reads at most `max_context` tokens: rounds never ask for
+    /// more, and a prompt longer than that fails with a clear error instead
+    /// of losing its start.
+    pub fn with_max_context(mut self, max_context: Option<usize>) -> Self {
+        self.max_context = max_context;
+        self
     }
 
     /// Images go to `image_model` when it is set and differs from the model:
@@ -76,6 +87,24 @@ impl OllamaProviderConfig {
             notia_backend_core::ai_settings::separate_image_model(&self.model, image_model).map(str::to_string);
         self
     }
+}
+
+/// How long the context a model last ran with keeps being asked for. A local
+/// model reloads when `num_ctx` changes, so the checks and rounds of a turn
+/// keep the largest recent size; after a pause, a request asks only for
+/// what it needs.
+const LAST_CONTEXT_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// The context `key` (endpoint and model) last ran with, if recent; with
+/// `remember`, stores that size instead.
+fn last_context(key: &str, remember: Option<usize>) -> Option<usize> {
+    static CONTEXTS: OnceLock<Mutex<HashMap<String, (std::time::Instant, usize)>>> = OnceLock::new();
+    let mut contexts = CONTEXTS.get_or_init(Default::default).lock().ok()?;
+    if let Some(size) = remember {
+        contexts.insert(key.to_string(), (std::time::Instant::now(), size));
+        return Some(size);
+    }
+    contexts.get(key).filter(|(at, _)| at.elapsed() < LAST_CONTEXT_TTL).map(|(_, size)| *size)
 }
 
 /// Descriptions the image model already wrote, by model and image: an image
@@ -135,6 +164,8 @@ pub trait OllamaTransport: Send + Sync {
         control: &RequestControl,
     ) -> Result<AiChatResult, BackendError>;
 
+    /// `options` as in `chat`.
+    #[allow(clippy::too_many_arguments)]
     fn tool_chat(
         &self,
         settings: &AiHttpSettings,
@@ -142,6 +173,7 @@ pub trait OllamaTransport: Send + Sync {
         messages: &Value,
         tools: &Value,
         think: &Value,
+        options: &Value,
         timeout_secs: u64,
         control: &RequestControl,
     ) -> Result<Value, BackendError>;
@@ -168,12 +200,13 @@ pub trait OllamaTransport: Send + Sync {
         messages: &Value,
         tools: &Value,
         think: &Value,
+        options: &Value,
         timeout_secs: u64,
         control: &RequestControl,
         on_delta: &mut dyn FnMut(AiChatStreamDelta) -> Result<(), BackendError>,
     ) -> Result<Value, BackendError> {
         let _ = on_delta;
-        self.tool_chat(settings, model, messages, tools, think, timeout_secs, control)
+        self.tool_chat(settings, model, messages, tools, think, options, timeout_secs, control)
     }
 }
 
@@ -293,6 +326,7 @@ impl OllamaTransport for NativeOllamaTransport {
         messages: &Value,
         tools: &Value,
         think: &Value,
+        options: &Value,
         timeout_secs: u64,
         control: &RequestControl,
     ) -> Result<Value, BackendError> {
@@ -301,6 +335,7 @@ impl OllamaTransport for NativeOllamaTransport {
         let messages = messages.clone();
         let tools = tools.clone();
         let think = think.clone();
+        let options = options.clone();
         run_with_control(
             move || {
                 crate::host::async_runtime::block_on(crate::services::ai_service::run_ollama_tool_chat(
@@ -309,6 +344,7 @@ impl OllamaTransport for NativeOllamaTransport {
                     &messages,
                     &tools,
                     &think,
+                    &options,
                     timeout_secs,
                 ))
             },
@@ -363,6 +399,7 @@ impl OllamaTransport for NativeOllamaTransport {
         messages: &Value,
         tools: &Value,
         think: &Value,
+        options: &Value,
         timeout_secs: u64,
         control: &RequestControl,
         on_delta: &mut dyn FnMut(AiChatStreamDelta) -> Result<(), BackendError>,
@@ -372,6 +409,7 @@ impl OllamaTransport for NativeOllamaTransport {
         let messages = messages.clone();
         let tools = tools.clone();
         let think = think.clone();
+        let options = options.clone();
         let result = drive_native_stream(control, on_delta, move |cancellation, on_delta| {
             crate::host::async_runtime::block_on(
                 crate::services::ai_service::stream_ollama_tool_chat_with_cancellation(
@@ -380,6 +418,7 @@ impl OllamaTransport for NativeOllamaTransport {
                     &messages,
                     &tools,
                     &think,
+                    &options,
                     timeout_secs,
                     cancellation,
                     on_delta,
@@ -475,8 +514,7 @@ impl OllamaTransport for AndroidOllamaTransport {
         let messages = serde_json::to_value(messages).map_err(|_| {
             BackendError::invalid_input("Los mensajes no se pudieron serializar para Ollama.")
         })?;
-        let mut payload = Self::tool_chat_payload(settings, model, &messages, &Value::Array(Vec::new()), think, DEFAULT_TOOL_TIMEOUT_SECS);
-        payload["options"] = options.clone();
+        let payload = Self::tool_chat_payload(settings, model, &messages, &Value::Array(Vec::new()), think, options, DEFAULT_TOOL_TIMEOUT_SECS);
         let response = self.call_tool_chat(payload, control)?;
         if response
             .get("error")
@@ -505,10 +543,11 @@ impl OllamaTransport for AndroidOllamaTransport {
         messages: &Value,
         tools: &Value,
         think: &Value,
+        options: &Value,
         timeout_secs: u64,
         control: &RequestControl,
     ) -> Result<Value, BackendError> {
-        self.call_tool_chat(Self::tool_chat_payload(settings, model, messages, tools, think, timeout_secs), control)
+        self.call_tool_chat(Self::tool_chat_payload(settings, model, messages, tools, think, options, timeout_secs), control)
     }
 
     fn stream_chat(
@@ -548,6 +587,7 @@ impl OllamaTransport for AndroidOllamaTransport {
         messages: &Value,
         tools: &Value,
         think: &Value,
+        options: &Value,
         timeout_secs: u64,
         control: &RequestControl,
         on_delta: &mut dyn FnMut(AiChatStreamDelta) -> Result<(), BackendError>,
@@ -557,6 +597,7 @@ impl OllamaTransport for AndroidOllamaTransport {
             "apiKey": settings.api_key,
             "model": model,
             "think": think,
+            "options": options,
             "messagesJson": messages.to_string(),
             "toolsJson": tools.to_string(),
             "timeoutSeconds": timeout_secs,
@@ -577,6 +618,7 @@ impl AndroidOllamaTransport {
         messages: &Value,
         tools: &Value,
         think: &Value,
+        options: &Value,
         timeout_secs: u64,
     ) -> Value {
         json!({
@@ -584,6 +626,7 @@ impl AndroidOllamaTransport {
             "apiKey": settings.api_key,
             "model": model,
             "think": think,
+            "options": options,
             "messagesJson": messages.to_string(),
             "toolsJson": tools.to_string(),
             "timeoutSeconds": timeout_secs,
@@ -680,13 +723,15 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
         control: &RequestControl,
     ) -> Result<ProviderResponse, BackendError> {
         control.check()?;
-        let messages = translate_messages(&self.readable_messages(&request.messages, control)?);
+        let readable = self.readable_messages(&request.messages, control)?;
+        let options = self.round_options(&readable, &Value::Null)?;
+        let messages = translate_messages(&readable);
         let answer = self.transport.chat(
             &self.config.settings,
             &self.config.model,
             &messages,
             &self.config.think,
-            &Value::Null,
+            &options,
             control,
         )?;
         control.check()?;
@@ -711,13 +756,15 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
         if !request.tools.is_empty() {
             return self.stream_tool_round(request, control, on_delta);
         }
-        let messages = translate_messages(&self.readable_messages(&request.messages, control)?);
+        let readable = self.readable_messages(&request.messages, control)?;
+        let options = self.round_options(&readable, &Value::Null)?;
+        let messages = translate_messages(&readable);
         let answer = self.transport.stream_chat(
             &self.config.settings,
             &self.config.model,
             &messages,
             &self.config.think,
-            &Value::Null,
+            &options,
             control,
             &mut |delta| {
                 control.check()?;
@@ -748,17 +795,18 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
         control: &RequestControl,
     ) -> Result<ProviderResponse, BackendError> {
         control.check()?;
-        let messages =
-            serde_json::to_value(translate_messages(&self.readable_messages(&request.messages, control)?)).map_err(|_| {
-                BackendError::invalid_input("Los mensajes no se pudieron serializar para Ollama.")
-            })?;
+        let readable = self.readable_messages(&request.messages, control)?;
         let tools = translate_tools(&request.tools);
+        let options = self.round_options(&readable, &tools)?;
+        let messages = serde_json::to_value(translate_messages(&readable))
+            .map_err(|_| BackendError::invalid_input("Los mensajes no se pudieron serializar para Ollama."))?;
         let response = self.transport.tool_chat(
             &self.config.settings,
             &self.config.model,
             &messages,
             &tools,
             &self.config.think,
+            &options,
             self.config.tool_timeout_secs,
             control,
         )?;
@@ -769,6 +817,33 @@ impl<T: OllamaTransport> AgentProvider for OllamaAgentProvider<T> {
 }
 
 impl<T: OllamaTransport> OllamaAgentProvider<T> {
+    /// Ollama `options` of a round: a context that holds its whole prompt
+    /// (system prompt, conversation, tool results and the tools' schemas),
+    /// at least as large as the one the model last ran with (see
+    /// [`last_context`]). A prompt the model cannot read whole is an error:
+    /// Ollama would drop its start and the answer would make no sense.
+    fn round_options(&self, messages: &[ProviderMessage], tools: &Value) -> Result<Value, BackendError> {
+        let text = messages
+            .iter()
+            .map(|message| {
+                message.content.chars().count()
+                    + message.tool_calls.iter().map(|call| call.name.len() + call.arguments.to_string().chars().count()).sum::<usize>()
+            })
+            .sum::<usize>();
+        let tools = if tools.is_null() { 0 } else { tools.to_string().chars().count() };
+        let images = messages.iter().map(|message| message.images.len()).sum::<usize>();
+        let max_context = self.config.max_context;
+        if let Some(error) = notia_backend_core::ai_settings::context_overflow(text + tools, images, max_context, &self.config.model) {
+            return Err(BackendError::new(BackendErrorCode::ProviderUnavailable, error, false));
+        }
+        let key = format!("{}::{}", self.config.settings.ollama_url, self.config.model);
+        let options = notia_backend_core::ai_settings::round_options(text + tools, images, max_context, last_context(&key, None));
+        if let Some(num_ctx) = options.get("num_ctx").and_then(Value::as_u64) {
+            last_context(&key, Some(num_ctx as usize));
+        }
+        Ok(options)
+    }
+
     /// The messages as the model can read them: with a separate image model,
     /// each image becomes the text that model wrote about it.
     fn readable_messages<'a>(
@@ -850,17 +925,18 @@ impl<T: OllamaTransport> OllamaAgentProvider<T> {
         control: &RequestControl,
         on_delta: &mut dyn FnMut(ProviderStreamDelta) -> Result<(), BackendError>,
     ) -> Result<ProviderResponse, BackendError> {
-        let messages =
-            serde_json::to_value(translate_messages(&self.readable_messages(&request.messages, control)?)).map_err(|_| {
-                BackendError::invalid_input("Los mensajes no se pudieron serializar para Ollama.")
-            })?;
+        let readable = self.readable_messages(&request.messages, control)?;
         let tools = translate_tools(&request.tools);
+        let options = self.round_options(&readable, &tools)?;
+        let messages = serde_json::to_value(translate_messages(&readable))
+            .map_err(|_| BackendError::invalid_input("Los mensajes no se pudieron serializar para Ollama."))?;
         let response = self.transport.stream_tool_chat(
             &self.config.settings,
             &self.config.model,
             &messages,
             &tools,
             &self.config.think,
+            &options,
             self.config.tool_timeout_secs,
             control,
             &mut |delta| {
@@ -1189,6 +1265,7 @@ mod tests {
             messages: &Value,
             tools: &Value,
             _: &Value,
+            _: &Value,
             _: u64,
             _: &RequestControl,
         ) -> Result<Value, BackendError> {
@@ -1225,7 +1302,7 @@ mod tests {
             unreachable!()
         }
 
-        fn tool_chat(&self, _: &AiHttpSettings, _: &str, _: &Value, _: &Value, _: &Value, _: u64, _: &RequestControl) -> Result<Value, BackendError> {
+        fn tool_chat(&self, _: &AiHttpSettings, _: &str, _: &Value, _: &Value, _: &Value, _: &Value, _: u64, _: &RequestControl) -> Result<Value, BackendError> {
             unreachable!()
         }
 
@@ -1248,6 +1325,7 @@ mod tests {
             _: &str,
             _: &Value,
             tools: &Value,
+            _: &Value,
             _: &Value,
             _: u64,
             _: &RequestControl,
@@ -1311,6 +1389,94 @@ mod tests {
                 Vec::new()
             },
         }
+    }
+
+    /// Records the Ollama `options` of each call.
+    struct OptionsTransport {
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl OllamaTransport for OptionsTransport {
+        fn chat(&self, _: &AiHttpSettings, _: &str, _: &[AiChatMessage], _: &Value, options: &Value, _: &RequestControl) -> Result<AiChatResult, BackendError> {
+            self.seen.lock().expect("options lock").push(options.clone());
+            Ok(AiChatResult { answer: "listo".to_string() })
+        }
+
+        fn tool_chat(&self, _: &AiHttpSettings, _: &str, _: &Value, _: &Value, _: &Value, options: &Value, _: u64, _: &RequestControl) -> Result<Value, BackendError> {
+            self.seen.lock().expect("options lock").push(options.clone());
+            Ok(json!({"message": {"role": "assistant", "content": "listo"}}))
+        }
+
+        fn stream_chat(
+            &self,
+            _: &AiHttpSettings,
+            _: &str,
+            _: &[AiChatMessage],
+            _: &Value,
+            options: &Value,
+            _: &RequestControl,
+            _: &mut dyn FnMut(AiChatStreamDelta) -> Result<(), BackendError>,
+        ) -> Result<String, BackendError> {
+            self.seen.lock().expect("options lock").push(options.clone());
+            Ok("listo".to_string())
+        }
+
+        fn stream_tool_chat(
+            &self,
+            _: &AiHttpSettings,
+            _: &str,
+            _: &Value,
+            _: &Value,
+            _: &Value,
+            options: &Value,
+            _: u64,
+            _: &RequestControl,
+            _: &mut dyn FnMut(AiChatStreamDelta) -> Result<(), BackendError>,
+        ) -> Result<Value, BackendError> {
+            self.seen.lock().expect("options lock").push(options.clone());
+            Ok(json!({"message": {"role": "assistant", "content": "listo"}}))
+        }
+    }
+
+    /// Without `num_ctx` a local model keeps only the end of a chat turn's
+    /// prompt (tens of thousands of tokens with the tools) and answers
+    /// something else. Every round asks for a context that holds it, the
+    /// checks after it keep that size so the model is not reloaded, and a
+    /// prompt the model cannot read whole fails clearly without being sent.
+    #[test]
+    fn every_round_asks_for_a_context_that_holds_its_prompt() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = |model: &str, max_context: Option<usize>| {
+            let config = OllamaProviderConfig::new(
+                AiHttpSettings { ollama_url: "http://contexto.test:11434".to_string(), api_key: String::new() },
+                model,
+                json!(false),
+            )
+            .expect("config")
+            .with_max_context(max_context);
+            OllamaAgentProvider::with_transport(config, OptionsTransport { seen: Arc::clone(&seen) })
+        };
+        let mut long = request(true);
+        long.messages.insert(
+            0,
+            ProviderMessage { role: ProviderMessageRole::System, content: "x".repeat(100_000), images: Vec::new(), tool_calls: Vec::new(), tool_name: None },
+        );
+        let control = RequestControl::new(None);
+        let big = provider("contexto-grande:test", Some(131_072));
+        big.tool_chat(&long, &control).expect("round");
+        big.chat(&request(false), &control).expect("check");
+        big.stream_chat(&long, &control, &mut |_| Ok(())).expect("streamed round");
+        big.stream_chat(&request(false), &control, &mut |_| Ok(())).expect("streamed answer");
+        let sizes = seen.lock().expect("options lock").iter().map(|options| options["num_ctx"].as_u64()).collect::<Vec<_>>();
+        assert_eq!(sizes, vec![Some(65_536); 4]);
+        // A fresh model asks only for what a short request needs.
+        provider("contexto-nuevo:test", None).chat(&request(false), &control).expect("short");
+        assert_eq!(seen.lock().expect("options lock").last().and_then(|options| options["num_ctx"].as_u64()), Some(16_384));
+        // A model too small for the prompt: an error that says so, and nothing sent.
+        let before = seen.lock().expect("options lock").len();
+        let error = provider("contexto-chico:test", Some(8_192)).tool_chat(&long, &control).expect_err("too long");
+        assert!(error.message.contains("«contexto-chico:test» lee como máximo 8.192"), "{}", error.message);
+        assert_eq!(seen.lock().expect("options lock").len(), before);
     }
 
     #[test]
@@ -1504,7 +1670,7 @@ mod tests {
             Ok(AiChatResult { answer: "Listo.".to_string() })
         }
 
-        fn tool_chat(&self, _: &AiHttpSettings, _: &str, _: &Value, _: &Value, _: &Value, _: u64, _: &RequestControl) -> Result<Value, BackendError> {
+        fn tool_chat(&self, _: &AiHttpSettings, _: &str, _: &Value, _: &Value, _: &Value, _: &Value, _: u64, _: &RequestControl) -> Result<Value, BackendError> {
             unreachable!()
         }
 
@@ -1525,6 +1691,7 @@ mod tests {
             &self,
             _: &AiHttpSettings,
             _: &str,
+            _: &Value,
             _: &Value,
             _: &Value,
             _: &Value,

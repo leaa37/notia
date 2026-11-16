@@ -410,4 +410,66 @@ describe('useChatSubmitMessage lifecycle', () => {
     expect(setDialogMessage).toHaveBeenCalledWith('El movimiento financiero no es válido.')
     expect(setDraft).not.toHaveBeenCalledWith('dale')
   })
+
+  it('answers the last request again without touching the composer', async () => {
+    const photo = { name: 'plato.png', mimeType: 'image/png', base64: 'base64-fixture', kind: 'image' as const }
+    const chat = {
+      title: 'Saludo inicial', agentMemoryEnabled: true, contextMemoryEnabled: true, contextMemoryMessageCount: 10,
+      contextScopeKey: null, selectedContextMode: 'direct' as const, selectedContextFiles: [], selectedContextFolders: [],
+      libraryRagEnabled: true, toolsEnabled: true, writeEnabled: true, permanentContext: '', dynamic: null, agents: [],
+      messages: [
+        { role: 'user' as const, content: 'hola' },
+        { role: 'assistant' as const, content: '¡Hola! ¿En qué te ayudo?' },
+        { role: 'user' as const, content: '¿qué puede hacer este módulo?', attachments: [photo] },
+        { role: 'assistant' as const, content: 'article 4 hola' },
+      ],
+    }
+    const answered = { ...chat, messages: [...chat.messages.slice(0, 3), { role: 'assistant' as const, content: 'Inicio junta lo de hoy.' }] }
+    mocks.startChatTurn.mockReturnValue({
+      requestId: 'request-5',
+      abort: vi.fn(),
+      promise: Promise.resolve({ answer: 'Inicio junta lo de hoy.', dataChanged: false, document: answered }),
+    })
+    const setState = vi.fn()
+    const setDraft = vi.fn()
+    const setOptimisticThreadMessages = vi.fn()
+    const setSelectedImageAttachments = vi.fn()
+    const setActiveChatDocument = vi.fn()
+    const { retryLastReply } = useChatSubmitMessage({
+      agentCorpusPaths: [], agentScope: 'library', agentPromptFileName: 'default.md',
+      requestAgentClarification: vi.fn(), requestAgentConfirmation: vi.fn(), onAgentExecutionPlanChange: vi.fn(),
+      requestAgentExecutionPlanApproval: vi.fn(),
+      library: { id: 'library-1', name: 'Vault', path: 'C:/vault' } as never,
+      aiPreferences: {
+        ollamaUrl: 'http://localhost:11434', apiKey: '', selectedModel: 'qwen3',
+        thinkingEnabled: false, thinkingLevel: 'medium',
+      },
+      activeChatDocument: chat,
+      selectedChatFilePath: 'C:/vault/chat.md',
+      effectiveSelectedContextPaths: [], effectiveSelectedContextMode: 'direct', selectedLibraryFilePaths: [],
+      selectedLibraryFileOptions: [], selectedImageAttachments: [], selectedFileContextMode: 'direct',
+      preferredContextScopeKey: null, persistTransientContext: false, hasTransientContext: false,
+      activeMarkdownSource: null, workspaceSnapshot: null,
+    }, {
+      draft: 'algo que estoy escribiendo', setDraft, isSubmitting: false, setStreamingThinking: setState,
+      setStreamingAssistantMessage: setState, setOptimisticThreadMessages, setSelectedChatFilePath: setState,
+      setActiveChatDocument, setChatTitleOverrides: setState, setSelectedImageAttachments,
+      setSelectedLibraryFilePaths: setState, setSelectedLibraryFileOptions: setState, setSelectedFileContextMode: setState,
+      setPendingAutoCreatedChatFilePath: setState, setIsAttachmentMenuOpen: setState, setDialogMessage: setState,
+      setIsSubmitting: setState,
+    })
+
+    await retryLastReply()
+
+    // The backend takes the saved request; the payload only says to retry.
+    expect(mocks.startChatTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ retry: true, message: '¿qué puede hacer este módulo?', attachments: [], chat: { kind: 'saved', path: 'C:/vault/chat.md' } }),
+      expect.anything(),
+    )
+    // Meanwhile the thread shows the request without its old reply.
+    expect(setOptimisticThreadMessages).toHaveBeenCalledWith(chat.messages.slice(0, 3))
+    expect(setActiveChatDocument).toHaveBeenLastCalledWith(answered)
+    expect(setDraft).not.toHaveBeenCalled()
+    expect(setSelectedImageAttachments).not.toHaveBeenCalledWith([])
+  })
 })

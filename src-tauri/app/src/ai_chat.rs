@@ -183,6 +183,11 @@ pub(crate) struct ChatSendPayload {
     #[serde(default)]
     library_user_id: Option<String>,
     chat: ChatTarget,
+    /// «Reintentar»: answer the chat's last request again instead of a new
+    /// message; its new replies replace the old ones (`message` and
+    /// `attachments` are ignored: the saved request is the one sent).
+    #[serde(default)]
+    retry: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1121,31 +1126,50 @@ pub(crate) fn cancel_published_turn(app: &AppHandle, request_id: &str) -> Result
 }
 
 fn send_with(app: &AppHandle, payload: ChatSendPayload, forward: Option<TurnForward>) -> Result<ChatTurnOutcome, BackendError> {
-    // The message as the person wrote it (it may be empty when they sent
-    // only files) and the request the agent reads.
-    let message = payload.message.trim().to_string();
-    let request_text = chat_turn::turn_request(&message, payload.attachments.len())
-        .ok_or_else(|| BackendError::invalid_input("El mensaje no puede estar vacío."))?;
-    let title_seed = chat_turn::title_seed(
-        &message,
-        &payload.attachments.iter().map(|attachment| attachment.name.as_str()).collect::<Vec<_>>(),
-    );
     let library_id = payload.library_id.clone();
     let runtime = app.state::<BackendRuntimeState>().inner().clone();
     if let Some(settings) = &payload.settings {
         runtime.configure_fallback(&settings.normalize())?;
     }
+    let retry = payload.retry;
+    if retry && (payload.mode != TurnMode::Chat || payload.undo_operation_id.is_some()) {
+        return Err(BackendError::invalid_input("Solo se puede reintentar una respuesta de un chat."));
+    }
 
-    // The chat and the messages the agent sees.
-    let (chat, logical_path, history) = match payload.chat {
+    // The chat and the messages the agent sees. A retry takes the last
+    // request out of the chat, with the replies after it.
+    let (chat, logical_path, history, retried) = match payload.chat {
         ChatTarget::Saved { path } => {
             let logical_path = crate::chat_history::chat_logical_path(app, &library_id, &path)?;
-            let document = crate::chat_history::load(app, &library_id, &logical_path, chat_turn::DEFAULT_CHAT_TITLE)?;
+            let mut document = crate::chat_history::load(app, &library_id, &logical_path, chat_turn::DEFAULT_CHAT_TITLE)?;
+            let retried = match retry {
+                true => Some(
+                    chat_turn::take_last_request(&mut document)
+                        .ok_or_else(|| BackendError::invalid_input("Este chat no tiene un mensaje para volver a responder."))?,
+                ),
+                false => None,
+            };
             let history = chat_turn::memory_window(&document).to_vec();
-            (Some(document), Some(logical_path), history)
+            (Some(document), Some(logical_path), history, retried)
         }
-        ChatTarget::Transient { messages } => (None, None, chat_turn::transient_window(&messages).to_vec()),
+        ChatTarget::Transient { .. } if retry => {
+            return Err(BackendError::invalid_input("Solo se puede reintentar una respuesta de un chat guardado."));
+        }
+        ChatTarget::Transient { messages } => (None, None, chat_turn::transient_window(&messages).to_vec(), None),
     };
+
+    // The message as the person wrote it (it may be empty when they sent
+    // only files) and the request the agent reads.
+    let (message, attachments) = match retried {
+        Some(request) => (request.content.trim().to_string(), request.attachments),
+        None => (payload.message.trim().to_string(), payload.attachments.clone()),
+    };
+    let request_text = chat_turn::turn_request(&message, attachments.len())
+        .ok_or_else(|| BackendError::invalid_input("El mensaje no puede estar vacío."))?;
+    let title_seed = chat_turn::title_seed(
+        &message,
+        &attachments.iter().map(|attachment| attachment.name.as_str()).collect::<Vec<_>>(),
+    );
 
     let workspace = workspace_of(payload.mode, payload.workspace)?;
     let (channel, scope, route_policy) = chat_turn::turn_route(payload.mode, &payload.scope, Some(&workspace.view));
@@ -1202,7 +1226,7 @@ fn send_with(app: &AppHandle, payload: ChatSendPayload, forward: Option<TurnForw
     let user_message = StoredChatMessage {
         role: ChatRole::User,
         content: message.clone(),
-        attachments: payload.attachments.clone(),
+        attachments: attachments.clone(),
         agent: None,
     };
     // `/image` goes to the image model as written, without the agents.
@@ -1213,7 +1237,7 @@ fn send_with(app: &AppHandle, payload: ChatSendPayload, forward: Option<TurnForw
     let result: Result<TurnReplies, BackendError> = match (payload.undo_operation_id.as_deref(), image_command) {
         (Some(operation_id), _) => undo(app, &state, &runtime, operation_id)
             .map(|path| (vec![notia_reply(chat_turn::undo_answer(path.as_deref()))], true, None)),
-        (None, Some(command)) => Ok((vec![image_command_reply(app, &library_id, &payload.request_id, command, &payload.attachments)], false, None)),
+        (None, Some(command)) => Ok((vec![image_command_reply(app, &library_id, &payload.request_id, command, &attachments)], false, None)),
         (None, None) => {
             let library_context = library_context(app, &library_id, payload.mode, &payload.scope, &payload.selection);
             let setup = TurnSetup {
@@ -1226,7 +1250,7 @@ fn send_with(app: &AppHandle, payload: ChatSendPayload, forward: Option<TurnForw
             };
             if agents.is_empty() {
                 let prompt = setup.prompt(chat_turn::turn_prompt(payload.mode, &request_text, payload.context.as_deref()));
-                let request = setup.request(&identity, &history, &prompt, &payload.attachments, payload.prompt_name.clone());
+                let request = setup.request(&identity, &history, &prompt, &attachments, payload.prompt_name.clone());
                 let response = run_agent(app, &state, &runtime, &payload.request_id, &identity, request);
                 let worked = remember_undoable(&state, &runtime, &identity);
                 let response = response.map(|response| {
@@ -1270,11 +1294,13 @@ fn send_with(app: &AppHandle, payload: ChatSendPayload, forward: Option<TurnForw
             let previous_title = document.title.clone();
             let previous_messages = document.messages.clone();
             chat_turn::apply_turn_context(&mut document, &payload.selection);
-            document.title = chat_turn::persisted_title(&previous_title, !previous_messages.is_empty(), &title_seed);
+            // A retry keeps the chat's name, even of its first request.
+            document.title = chat_turn::persisted_title(&previous_title, retry || !previous_messages.is_empty(), &title_seed);
             document.messages.push(user_message);
             document.messages.extend(replies.iter().cloned());
             if let Some(logical_path) = &logical_path {
-                if document.title != previous_title {
+                // A retry replaces the old replies: the file is written whole.
+                if retry || document.title != previous_title {
                     crate::chat_history::save_chat(app, &library_id, logical_path, &document)?;
                 } else {
                     crate::chat_history::append_turn(app, &library_id, logical_path, &document, 1 + replies.len())?;
@@ -1283,7 +1309,7 @@ fn send_with(app: &AppHandle, payload: ChatSendPayload, forward: Option<TurnForw
             // Memory and rules belong to the global engine: the agent reads
             // `rules.md` and `memory.md` and writes them only with its
             // `add_agent_rule` / `add_agent_memory` tools.
-            if let Some(path) = logical_path.filter(|_| previous_messages.is_empty()) {
+            if let Some(path) = logical_path.filter(|_| previous_messages.is_empty() && !retry) {
                 schedule_chat_title(app, &library_id, path, title_seed.clone());
             }
             Some(document)

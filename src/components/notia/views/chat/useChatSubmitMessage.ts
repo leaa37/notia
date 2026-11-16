@@ -34,6 +34,7 @@ export function useChatSubmitMessage(
   state: UseChatSubmitMessageState,
 ): {
   submitMessage: (rawMessage: string, undoOperationId?: string, fromQueue?: boolean) => Promise<void>
+  retryLastReply: () => Promise<void>
   cancelActiveReply: () => void
   interjectMessage: (rawMessage: string) => Promise<ChatInterruptDecision>
 } {
@@ -149,11 +150,17 @@ export function useChatSubmitMessage(
     return interjectChatTurn(turn.requestId, message)
   }
 
-  /** `fromQueue`: a message the person typed during an earlier turn; the composer keeps what they write now. */
-  const submitMessage = async (rawMessage: string, undoOperationId?: string, fromQueue = false) => {
-    const trimmedMessage = rawMessage.trim()
+  /**
+   * `fromQueue`: a message the person typed during an earlier turn; the composer keeps what they write now.
+   * `retry`: answer the chat's last request again; the backend takes it and replaces its replies, and the
+   * thread shows it without the old replies meanwhile. The composer is left as it is.
+   */
+  const submitMessage = async (rawMessage: string, undoOperationId?: string, fromQueue = false, retry = false) => {
+    const retried = retry ? lastRequestOf(activeChatDocument) : null
+    if (retry && (!retried || !selectedChatFilePath)) return
+    const trimmedMessage = retried ? retried.message.content.trim() : rawMessage.trim()
     // Files alone are a message too; the backend decides what they ask for.
-    if ((!trimmedMessage && (fromQueue || selectedImageAttachments.length === 0)) || isSubmitting || !library) {
+    if ((!retried && !trimmedMessage && (fromQueue || selectedImageAttachments.length === 0)) || isSubmitting || !library) {
       return
     }
 
@@ -214,29 +221,29 @@ export function useChatSubmitMessage(
       }
     }
 
-    const userMessage = {
+    const userMessage: StoredChatMessage = retried?.message ?? {
       role: 'user',
       content: trimmedMessage,
       ...(selectedImageAttachments.length > 0 ? { attachments: selectedImageAttachments } : {}),
-    } satisfies StoredChatMessage
+    }
     const previousImageAttachments = selectedImageAttachments
     const previousLibraryFilePaths = selectedLibraryFilePaths
     const previousLibraryFileOptions = selectedLibraryFileOptions
     const previousFileContextMode = selectedFileContextMode
     const previousChatDocument: StoredChatDocument = targetChatDocument
-    const optimisticMessages = [...targetChatDocument.messages, userMessage]
+    const optimisticMessages = [...(retried ? targetChatDocument.messages.slice(0, retried.index) : targetChatDocument.messages), userMessage]
     const previousDraft = draft
     // Messages of the chat's agents, shown as each one finishes.
     let turnMessages = optimisticMessages
     let agentMessageCount = 0
 
-    if (!fromQueue) setDraft('')
+    if (!fromQueue && !retried) setDraft('')
     setIsSubmitting(true)
     setOptimisticThreadMessages(optimisticMessages)
     setIsAttachmentMenuOpen(false)
     setStreamingThinking('')
     setStreamingAssistantMessage('')
-    setSelectedImageAttachments([])
+    if (!retried) setSelectedImageAttachments([])
     setActiveChatDocument({ ...targetChatDocument, messages: optimisticMessages })
 
     const aiReplyMeasurement = startPerformanceMeasurement('chat.ai_reply', {
@@ -256,7 +263,8 @@ export function useChatSubmitMessage(
         scope: effectiveAgentScope,
         message: trimmedMessage,
         context: transientContextContent,
-        attachments: selectedImageAttachments,
+        attachments: retried ? [] : selectedImageAttachments,
+        ...(retried ? { retry: true } : {}),
         promptName: agentPromptFileName || undefined,
         undoOperationId,
         workspace: workspaceSnapshot,
@@ -403,5 +411,21 @@ export function useChatSubmitMessage(
     }
   }
 
-  return { submitMessage, cancelActiveReply, interjectMessage }
+  const retryLastReply = () => submitMessage('', undefined, false, true)
+
+  return { submitMessage, retryLastReply, cancelActiveReply, interjectMessage }
+}
+
+/**
+ * The request «Reintentar» answers again, as the thread shows it while the
+ * turn runs: the last message of the person and where it is. The backend
+ * takes the saved one.
+ */
+function lastRequestOf(document: StoredChatDocument | null): { message: StoredChatMessage; index: number } | null {
+  if (!document) return null
+  for (let index = document.messages.length - 1; index >= 0; index -= 1) {
+    const message = document.messages[index]
+    if (message.role === 'user') return { message, index }
+  }
+  return null
 }

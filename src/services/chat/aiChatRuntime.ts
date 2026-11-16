@@ -47,6 +47,12 @@ export interface ChatTurnInput {
   }
   libraryUserId?: string
   chat: ChatTurnTarget
+  /**
+   * Answer the saved chat's last request again: the backend takes it (with
+   * its attachments) and replaces the replies after it. `message` only
+   * shows it while the turn runs.
+   */
+  retry?: boolean
 }
 
 /** Agent of the chat that is answering. */

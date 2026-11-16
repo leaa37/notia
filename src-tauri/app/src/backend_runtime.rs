@@ -5227,17 +5227,20 @@ pub(crate) fn execute_backend_request(
     // The same model checks the replies that only announce a step, so the
     // agent keeps working instead of stopping on them.
     let continuation_judge = notia_backend_core::continuation::ContinuationJudge(Arc::new(quick_provider(app, &provider_settings)?));
+    let http = crate::services::ai_service::AiHttpSettings {
+        ollama_url: provider_settings.ollama_url,
+        api_key: provider_settings.api_key,
+    };
+    let max_context = crate::ai_tasks::model_context_of(app, &http, &provider_settings.model);
     let provider = OllamaAgentProvider::with_transport(
         OllamaProviderConfig::new(
-            crate::services::ai_service::AiHttpSettings {
-                ollama_url: provider_settings.ollama_url,
-                api_key: provider_settings.api_key,
-            },
+            http,
             provider_settings.model,
             // A conversational turn answers without thinking.
             if request.thinking == Some(false) { Value::Bool(false) } else { provider_settings.think },
         )?
-        .with_image_model(&provider_settings.image_model),
+        .with_image_model(&provider_settings.image_model)
+        .with_max_context(max_context),
         platform_ollama_transport(app),
     );
     let mut options = AgentRuntimeOptions::default();
@@ -5408,8 +5411,8 @@ const ROUTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 /// single area. See `backend_core::tool_routing`.
 fn route_turn_areas(app: &AppHandle, state: &BackendRuntimeState, request: &AgentRequest) -> Option<RoutedTurn> {
     use notia_backend_core::tool_routing::{
-        area_ids, fallback_areas, home_area, needs_routing, offered_areas, parse_router_answer, router_prompt, with_prompt_choice,
-        RouterMessage, MAX_ROUTER_IMAGES,
+        area_ids, fallback_areas, home_area, needs_routing, offered_areas, parse_router_answer, router_prompt, viewed_area,
+        with_prompt_choice, RouterMessage, MAX_ROUTER_IMAGES,
     };
     use notia_backend_core::{BackendMessage, MessageRole};
     // The published board only reaches its tickets.
@@ -5418,6 +5421,8 @@ fn route_turn_areas(app: &AppHandle, state: &BackendRuntimeState, request: &Agen
     }
     let offered = offered_areas(&request.tools);
     let home = home_area(&request.context.scope, &request.context.channel);
+    // The module the person has on screen in the app, for «este módulo».
+    let viewed = request.snapshot.as_ref().filter(|_| request.context.channel == notia_backend_core::BackendChannel::App).and_then(|snapshot| viewed_area(&snapshot.view));
     let attachment_count = |message: &BackendMessage| message.images.len() + message.attachments.len();
     // The last request goes with the text of its files and its first images:
     // the attachment itself tells what kind of request it is.
@@ -5439,7 +5444,7 @@ fn route_turn_areas(app: &AppHandle, state: &BackendRuntimeState, request: &Agen
             attachments: attachment_count(message),
         })
         .collect::<Vec<_>>();
-    let (system, user) = router_prompt(&offered, &conversation, home);
+    let (system, user) = router_prompt(&offered, &conversation, home, viewed);
     // Only a message the person wrote on Telegram may get the conversational prompt.
     let offers_conversation = request.context.channel == notia_backend_core::BackendChannel::Telegram
         && !request.autonomous
@@ -5452,7 +5457,7 @@ fn route_turn_areas(app: &AppHandle, state: &BackendRuntimeState, request: &Agen
         .unwrap_or_default();
     let (areas, source) = match decision.areas {
         Some(areas) => (areas, "modelo"),
-        None => (fallback_areas(&last_text, &offered, with_attachments, home), "palabras"),
+        None => (fallback_areas(&last_text, &offered, with_attachments, home, viewed), "palabras"),
     };
     let conversational = offers_conversation && decision.conversational == Some(true);
     log::info!(
@@ -5556,16 +5561,15 @@ pub(crate) fn classify_interrupt(
 /// Provider for short calls without tools or thinking: titles, memories and
 /// the checks that run beside the agent.
 fn quick_provider(app: &AppHandle, settings: &BackendProviderSettings) -> Result<OllamaAgentProvider, BackendError> {
+    let http = crate::services::ai_service::AiHttpSettings {
+        ollama_url: settings.ollama_url.clone(),
+        api_key: settings.api_key.clone(),
+    };
+    let max_context = crate::ai_tasks::model_context_of(app, &http, &settings.model);
     Ok(OllamaAgentProvider::with_transport(
-        OllamaProviderConfig::new(
-            crate::services::ai_service::AiHttpSettings {
-                ollama_url: settings.ollama_url.clone(),
-                api_key: settings.api_key.clone(),
-            },
-            settings.model.clone(),
-            Value::Bool(false),
-        )?
-        .with_image_model(&settings.image_model),
+        OllamaProviderConfig::new(http, settings.model.clone(), Value::Bool(false))?
+            .with_image_model(&settings.image_model)
+            .with_max_context(max_context),
         platform_ollama_transport(app),
     ))
 }

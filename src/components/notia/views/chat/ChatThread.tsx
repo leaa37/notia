@@ -1,5 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { Bot, Check, Circle, Copy, Files, LoaderCircle, OctagonX, Sparkles, SquareTerminal, User2 } from 'lucide-react'
+import { Bot, Check, Circle, Copy, Files, LoaderCircle, OctagonX, RotateCcw, Sparkles, SquareTerminal, User2 } from 'lucide-react'
 import { ChatMarkdownMessage } from './ChatMarkdownMessage'
 import type { StoredChatAttachment, StoredChatMessage } from '../../../../services/chat/chatDocumentStorage'
 import type { TaskExecutionStep } from '../../../../services/chat/chatAgentTypes'
@@ -55,6 +55,8 @@ interface ChatThreadProps {
   onSelectAgentClarificationOption?: (choice: string) => void
   threadRef: React.RefObject<HTMLDivElement | null>
   onOpenAiSettings?: () => void
+  /** Asks the backend to answer the last request again; shown on the last reply. */
+  onRetryLastReply?: () => void
 }
 
 export interface AiOperationHistoryDiff {
@@ -89,7 +91,7 @@ function AssistantAvatar({ agent }: { agent: ChatAgentLook | null }) {
     : <div className="notia-chat-message-avatar" aria-hidden="true"><Sparkles size={16} /></div>
 }
 
-function CopyMessageButton({ source }: { source: string }) {
+function CopyMessageButton({ source, onRetry }: { source: string; onRetry?: () => void }) {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
 
   useEffect(() => {
@@ -114,6 +116,17 @@ function CopyMessageButton({ source }: { source: string }) {
       >
         {copyState === 'copied' ? <Check size={14} /> : <Copy size={14} />}
       </button>
+      {onRetry ? (
+        <button
+          type="button"
+          className="notia-chat-icon-button notia-chat-icon-button--small"
+          aria-label="Volver a responder"
+          title="Pedir otra respuesta a tu último mensaje"
+          onClick={onRetry}
+        >
+          <RotateCcw size={14} />
+        </button>
+      ) : null}
       <span className="notia-chat-message-actions-status" role="status">
         {copyState === 'idle' ? '' : label}
       </span>
@@ -213,6 +226,7 @@ function ChatThreadComponent({
   onSelectAgentClarificationOption,
   threadRef,
   onOpenAiSettings,
+  onRetryLastReply,
 }: ChatThreadProps) {
   const hasMessages = messages.length > 0
   // Finance, routine and mail previews are applied whole; only note edits choose hunks.
@@ -348,7 +362,12 @@ function ChatThreadComponent({
                   </div>
                 ) : null}
                 <ChatMarkdownMessage source={message.content} />
-                {message.role === 'assistant' ? <CopyMessageButton source={message.content} /> : null}
+                {message.role === 'assistant' ? (
+                  <CopyMessageButton
+                    source={message.content}
+                    onRetry={index === messages.length - 1 && !isSubmitting ? onRetryLastReply : undefined}
+                  />
+                ) : null}
               </div>
             </article>
             )
