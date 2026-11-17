@@ -49,7 +49,7 @@ function training(status: TrainingView['status'], oneSide = false): TrainingView
         { weight: '60', reps: '10', done: false, oneSide, next: true },
         { weight: '60', reps: '10', done: false, oneSide: false, next: false },
       ],
-      sideText: oneSide ? 'Ahora con el otro lado: serie 2 de 3. Tocala de nuevo cuando termines.' : null,
+      sideText: oneSide ? 'Falta el otro lado de la serie 2 de 3: después del descanso, hacelo y tocá la serie de nuevo.' : null,
     }],
   }
 }
@@ -91,7 +91,7 @@ describe('TrainingScreen', () => {
 
   it('asks for the other side of a set done with one side', () => {
     const apply = renderScreen('running', false, true)
-    expect(screen.getAllByText('Ahora con el otro lado: serie 2 de 3. Tocala de nuevo cuando termines.').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Falta el otro lado de la serie 2 de 3: después del descanso, hacelo y tocá la serie de nuevo.').length).toBeGreaterThan(0)
     expect(screen.getByText('Por lado')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Marcar el otro lado de la serie 2' }))
     expect(apply).toHaveBeenCalledWith({ type: 'toggle-set-done', routineId: 'r1', itemId: 'i1', index: 1 })

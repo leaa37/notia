@@ -207,7 +207,7 @@ export interface TrainItem {
   allDone: boolean
   current: boolean
   sets: TrainSet[]
-  /** «Ahora con el otro lado…» mientras una serie tiene un solo lado hecho. */
+  /** «Falta el otro lado…» mientras una serie tiene un solo lado hecho. */
   sideText: string | null
 }
 

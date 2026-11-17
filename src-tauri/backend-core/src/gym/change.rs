@@ -486,13 +486,11 @@ pub fn plan_change(data: &GymData, catalog: &Catalog, mutation: &GymMutation, cl
             let unilateral = catalog.exercise(&item.exercise).is_some_and(|exercise| exercise.unilateral);
             let first_side = unilateral && !*whole && !was_done && !session.is_one_side(item_id, *index);
             set_flag(&mut session.sides, item_id, *index, item.sets.len(), first_side);
-            if first_side {
-                // Sigue enseguida con el otro lado: el descanso va después.
-                session.rest_end_ms = None;
-                session.rest_left_ms = None;
-                return Ok(Change { ops: vec![StoreOp::PutSession(Some(session))], routine_id: None });
+            // Un lado hecho no completa la serie, pero descansa lo mismo que
+            // entre series antes del otro lado.
+            if !first_side {
+                set_flag(&mut session.done, item_id, *index, item.sets.len(), !was_done);
             }
-            set_flag(&mut session.done, item_id, *index, item.sets.len(), !was_done);
             if !was_done {
                 let rest_ms = item.rest_s as i64 * 1000;
                 if pending_sets(routine, &session) > 0 && rest_ms > 0 {

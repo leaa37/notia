@@ -95,9 +95,9 @@ fn an_exercise_file_round_trips_keeping_its_image_and_note_lines() {
 }
 
 /// An exercise done one side at a time: each set is marked once per side,
-/// the rest starts after the second side and the volume counts both.
+/// each side is followed by the item's rest and the volume counts both.
 #[test]
-fn a_one_side_exercise_takes_both_sides_before_the_rest() {
+fn a_one_side_exercise_rests_after_each_side() {
     let mut catalog = catalog();
     catalog.exercises.push(Exercise {
         id: "one_arm_row".into(),
@@ -126,23 +126,23 @@ fn a_one_side_exercise_takes_both_sides_before_the_rest() {
     assert_eq!(item.total_label, "Volumen: 400 kg (los dos lados)");
 
     let toggle = |index: usize, whole: bool| GymMutation::ToggleSetDone { routine_id: routine.clone(), item_id: row.clone(), index, whole };
-    // The first touch is one side: no rest, the other side comes right away.
+    // The first touch is one side: the rest runs before the other side.
     apply(&mut data, &catalog, toggle(0, false), 10_000, today);
     let session = data.session.clone().expect("session");
     assert!(session.is_one_side(&row, 0) && !session.is_done(&row, 0));
-    assert_eq!(session.rest_end_ms, None);
+    assert_eq!((session.rest_end_ms, session.rest_total_ms), (Some(10_000 + 90_000), 90_000));
     let training = build_view(&data, &catalog, &GymQuery { resume: true, ..GymQuery::default() }, date, 20_000).training.expect("training");
     let item = &training.items[0];
     assert!(item.unilateral && item.sets[0].one_side && !item.sets[0].done && item.sets[0].next);
-    assert_eq!(item.side_text.as_deref(), Some("Ahora con el otro lado: serie 1 de 3. Tocala de nuevo cuando termines."));
+    assert_eq!(item.side_text.as_deref(), Some("Falta el otro lado de la serie 1 de 3: después del descanso, hacelo y tocá la serie de nuevo."));
     assert_eq!(training.next_text.as_deref(), Some("serie 1 de 3 de Remo a una mano, con el otro lado"));
     assert_eq!(training.done_sets, 0);
 
-    // The second side completes the set and starts the rest.
-    apply(&mut data, &catalog, toggle(0, false), 40_000, today);
+    // The second side completes the set and starts the rest again.
+    apply(&mut data, &catalog, toggle(0, false), 120_000, today);
     let session = data.session.clone().expect("session");
     assert!(session.is_done(&row, 0) && !session.is_one_side(&row, 0) && session.sides.is_empty());
-    assert_eq!(session.rest_end_ms, Some(40_000 + 90_000));
+    assert_eq!(session.rest_end_ms, Some(120_000 + 90_000));
     // The assistant marks a whole set; touching a done set clears it.
     apply(&mut data, &catalog, toggle(1, true), 200_000, today);
     assert!(data.session.as_ref().is_some_and(|session| session.is_done(&row, 1)));

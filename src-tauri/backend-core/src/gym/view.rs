@@ -338,7 +338,7 @@ pub struct TrainItem {
     pub all_done: bool,
     pub current: bool,
     pub sets: Vec<TrainSet>,
-    /// «Ahora con el otro lado…» mientras una serie tiene un solo lado hecho.
+    /// «Falta el otro lado…» mientras una serie tiene un solo lado hecho.
     pub side_text: Option<String>,
 }
 
@@ -1089,7 +1089,7 @@ fn training(data: &GymData, catalog: &Catalog, routine: &Routine) -> TrainingVie
             let current = next.as_ref().is_some_and(|(id, _, _, _)| *id == item.id);
             let side_text = (0..item.sets.len())
                 .find(|index| one_side(item, *index))
-                .map(|index| format!("Ahora con el otro lado: serie {} de {}. Tocala de nuevo cuando termines.", index + 1, item.sets.len()));
+                .map(|index| format!("Falta el otro lado de la serie {} de {}: después del descanso, hacelo y tocá la serie de nuevo.", index + 1, item.sets.len()));
             TrainItem {
                 id: item.id.clone(),
                 n: position + 1,
