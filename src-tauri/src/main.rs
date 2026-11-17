@@ -7,6 +7,7 @@ fn main() {
         let filter = android_logger::FilterBuilder::new()
             .filter_level(log::LevelFilter::Error)
             .filter_module("notia_telegram_ai", log::LevelFilter::Info)
+            .filter_module("notia_telegram", log::LevelFilter::Info)
             .build();
         android_logger::init_once(
             android_logger::Config::default()
@@ -24,6 +25,9 @@ fn main() {
             // One line per chat turn (model, areas, tools), without content:
             // what is needed to tell why an answer went wrong.
             .filter_module("notia_turn", log::LevelFilter::Info)
+            // The life of the Telegram bot: why it does not run, its stops,
+            // starts and recoveries, and Telegram failures.
+            .filter_module("notia_telegram", log::LevelFilter::Info)
             .try_init();
     }
 

@@ -240,57 +240,78 @@ pub async fn check_bot(token: &str) -> Result<TelegramIdentity, String> {
     decode::<TelegramUser>(response).await.map(identity)
 }
 
-pub async fn get_updates(token: &str, offset: i64) -> Result<Vec<IncomingTelegramUpdate>, String> {
+/// What one `getUpdates` call read.
+#[derive(Debug, Default)]
+pub struct UpdateBatch {
+    pub updates: Vec<IncomingTelegramUpdate>,
+    /// The offset that confirms every update of the answer, also the ones
+    /// that could not be read or carry nothing Notia answers: without it
+    /// Telegram would send them again on every call.
+    pub next_offset: Option<i64>,
+}
+
+pub async fn get_updates(token: &str, offset: i64) -> Result<UpdateBatch, String> {
     let response = Client::builder().timeout(Duration::from_secs(35)).build().map_err(|error| error.to_string())?
         .post(endpoint(token, "getUpdates")?)
         .json(&serde_json::json!({ "offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"] }))
         .send().await.map_err(|_| "Se interrumpio la conexion con Telegram.".to_string())?;
-    let updates = decode::<Vec<TelegramUpdate>>(response).await?;
-    Ok(updates
+    Ok(read_updates(decode::<Vec<serde_json::Value>>(response).await?))
+}
+
+/// Reads each update on its own: one Telegram sends in a shape Notia does
+/// not expect is skipped instead of failing the whole answer, which would
+/// leave the bot deaf (the same answer would come back on every call).
+fn read_updates(raw: Vec<serde_json::Value>) -> UpdateBatch {
+    let next_offset = raw.iter().filter_map(|update| update.get("update_id").and_then(serde_json::Value::as_i64)).max().map(|id| id + 1);
+    let updates = raw
         .into_iter()
-        .filter_map(|update| {
-            if let Some(message) = update.message {
-                let user = message.from.map(identity)?;
-                return Some(IncomingTelegramUpdate {
-                    update_id: update.update_id,
-                    chat_id: message.chat.id,
-                    user,
-                    message_id: Some(message.message_id),
-                    text: message.text.or(message.caption),
-                    audio: message.voice.or(message.audio),
-                    photo: message.photo.and_then(|photos| {
-                        photos
-                            .into_iter()
-                            .max_by_key(|photo| u64::from(photo.width) * u64::from(photo.height))
-                    }),
-                    document: message.document,
-                    media_group_id: message.media_group_id,
-                    reply_to_message_id: message.reply_to_message.map(|reply| reply.message_id),
-                    callback_query_id: None,
-                    callback_data: None,
-                    chat_type: message.chat.chat_type,
-                });
-            }
-            let callback = update.callback_query?;
-            let callback_message = callback.message?;
-            let chat_id = callback_message.chat.id;
-            Some(IncomingTelegramUpdate {
-                update_id: update.update_id,
-                chat_id,
-                user: identity(callback.from),
-                message_id: None,
-                text: None,
-                audio: None,
-                photo: None,
-                document: None,
-                media_group_id: None,
-                reply_to_message_id: None,
-                callback_query_id: Some(callback.id),
-                callback_data: callback.data,
-                chat_type: callback_message.chat.chat_type,
-            })
-        })
-        .collect())
+        .filter_map(|update| serde_json::from_value::<TelegramUpdate>(update).ok())
+        .filter_map(incoming)
+        .collect();
+    UpdateBatch { updates, next_offset }
+}
+
+fn incoming(update: TelegramUpdate) -> Option<IncomingTelegramUpdate> {
+    if let Some(message) = update.message {
+        let user = message.from.map(identity)?;
+        return Some(IncomingTelegramUpdate {
+            update_id: update.update_id,
+            chat_id: message.chat.id,
+            user,
+            message_id: Some(message.message_id),
+            text: message.text.or(message.caption),
+            audio: message.voice.or(message.audio),
+            photo: message.photo.and_then(|photos| {
+                photos
+                    .into_iter()
+                    .max_by_key(|photo| u64::from(photo.width) * u64::from(photo.height))
+            }),
+            document: message.document,
+            media_group_id: message.media_group_id,
+            reply_to_message_id: message.reply_to_message.map(|reply| reply.message_id),
+            callback_query_id: None,
+            callback_data: None,
+            chat_type: message.chat.chat_type,
+        });
+    }
+    let callback = update.callback_query?;
+    let callback_message = callback.message?;
+    let chat_id = callback_message.chat.id;
+    Some(IncomingTelegramUpdate {
+        update_id: update.update_id,
+        chat_id,
+        user: identity(callback.from),
+        message_id: None,
+        text: None,
+        audio: None,
+        photo: None,
+        document: None,
+        media_group_id: None,
+        reply_to_message_id: None,
+        callback_query_id: Some(callback.id),
+        callback_data: callback.data,
+        chat_type: callback_message.chat.chat_type,
+    })
 }
 
 pub async fn send_message(
@@ -667,9 +688,34 @@ pub async fn answer_callback(token: &str, callback_query_id: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::{
-        document_kind, edit_message, endpoint, send_message, DocumentKind, TelegramAudio, TelegramDocument,
+        document_kind, edit_message, endpoint, read_updates, send_message, DocumentKind, TelegramAudio, TelegramDocument,
         TelegramPhoto,
     };
+
+    #[test]
+    fn an_update_that_cannot_be_read_is_skipped_and_still_confirmed() {
+        let message = |id: i64, text: &str| {
+            serde_json::json!({
+                "update_id": id,
+                "message": { "message_id": id, "from": { "id": 7, "first_name": "Ana" }, "chat": { "id": 7, "type": "private" }, "text": text }
+            })
+        };
+        let batch = read_updates(vec![
+            message(10, "hola"),
+            // A shape Notia does not expect (no chat type) and an update
+            // with nothing to answer (no sender).
+            serde_json::json!({ "update_id": 11, "message": { "message_id": 11, "chat": { "id": 7 } } }),
+            serde_json::json!({ "update_id": 12, "message": { "message_id": 12, "chat": { "id": 7, "type": "private" } } }),
+            message(13, "chau"),
+        ]);
+        let read = batch.updates.iter().map(|update| (update.update_id, update.text.as_deref())).collect::<Vec<_>>();
+        assert_eq!(read, vec![(10, Some("hola")), (13, Some("chau"))]);
+        assert_eq!(batch.next_offset, Some(14));
+        let only_skipped = read_updates(vec![serde_json::json!({ "update_id": 20, "message": "?" })]);
+        assert!(only_skipped.updates.is_empty());
+        assert_eq!(only_skipped.next_offset, Some(21), "a lone unreadable update is confirmed too");
+        assert_eq!(read_updates(Vec::new()).next_offset, None);
+    }
 
     /// A Type0 font (2-byte codes) whose map has a 1-byte entry, as in
     /// Galicia's statements, keeps its text; a page lopdf cannot decode does

@@ -93,6 +93,7 @@
 - Asistente que ordena la biblioteca: mueve archivos y carpetas entre carpetas y subcarpetas, con confirmación, y crea la carpeta de destino si no existe.
 - Asistente que cambia propiedades, etiquetas, enlaces o frases de hasta 20 notas en una sola confirmación (varios cambios por nota, todo o nada), mostrando el diff antes de escribir.
 - Integración de Telegram con acceso transversal a biblioteca, Task Manager y Finanzas, chat, progreso editable que se borra al llegar la respuesta, confirmaciones, notas de voz e imágenes, funcionando sin la ventana abierta en Windows y Android.
+- Bot de Telegram que se recupera solo: vuelve a arrancar el hilo que recibe o el que ejecuta los pedidos si se traba o termina (y el bot entero si no alcanza), sin perder la cola; salta updates que no puede leer, reintenta con espera creciente, avisa la cola detrás de una acción de IA o un webhook y registra en el log (`notia:telegram`) por qué no corre y cada caída y recuperación.
 - ColdPass para credenciales cifradas con la contraseña del Owner: lista con buscador y filtros por contraseñas débiles o antiguas, detalle con historial fechado y copiado que se borra del portapapeles a los 30 segundos.
 - Desbloqueo de ColdPass con huella en Android, opcional por dispositivo.
 - Formulario de credencial de ColdPass con medidor de fuerza de la contraseña, deshacer el cambio y generador integrado (largo, mayúsculas, números, símbolos y sin ambiguos); pantalla completa en el teléfono.

@@ -13616,3 +13616,55 @@ Pedido del usuario: aprovechar la conexión de Notia Fit con Health Connect (Gal
 - Adaptador (`cargo test -p notia-app`, 469 aprobadas y los 2 fallos previos de `meeting` y `telegram_service`): `health::tests::the_watch_pulse_and_the_training_days_round_trip` y la actualización de un entrenamiento en `gym::tests::routines_sessions_and_workouts_round_trip_per_user`.
 - Web: `HealthDashboardView.test.tsx` (pulso dormido, **Usar este nivel**, gasto medido); fixtures regeneradas con `dump_dashboard_fixtures`.
 - Pendiente: probar con un reloj real. Los tipos y las cantidades que llegan dependen de la versión de Samsung Health.
+
+## Telegram: el bot se recupera solo y dice por qué no corre (2026-11-17)
+
+Reporte: el bot de Telegram a veces deja de responder y vuelve recién al reiniciar Notia (servidor headless en Docker).
+
+### Qué se encontró
+
+No hay registros del caso real, así que no hay una causa probada. Se revisó `telegram_worker.rs` completo y estos son los caminos que dejan al bot callado sin una línea en el log:
+
+1. **El supervisor no vigilaba los hilos.** `reconcile` solo comparaba la clave (biblioteca + token): si era la misma, no hacía nada. Si el hilo que lee Telegram (poller) o el que ejecuta la cola (executor) terminaba o se trababa, el worker seguía "corriendo" para siempre. Los `spawn` fallidos se ignoraban (`let _ =`). En release, `panic = "abort"` hace que un panic tire todo el proceso, no solo el hilo; por eso, en el servidor, el riesgo real es un hilo trabado, no uno muerto.
+2. **El supervisor apaga el bot sin decirlo.** `desired_worker` devuelve "no correr" en cualquiera de estos casos, y nada lo registraba:
+   - otra computadora de la biblioteca con más procesamiento se sincroniza con el servidor (`device_role`): el servidor le cede los servicios. Si esa computadora no puede correr el bot (por ejemplo, porque su biblioteca está bloqueada), nadie lo atiende;
+   - la biblioteca está bloqueada (cierre de sesión del Owner, o una clave que no abre la configuración);
+   - Telegram está desactivado;
+   - **un error cualquiera al leer la configuración**: detenía el worker, pasaba la cola a interrumpidos y lo volvía a arrancar recién al vencer la decisión en caché (60 s).
+3. **Pedidos en cola sin aviso detrás de una acción de IA o un webhook.** Esas corridas no muestran progreso y no tienen límite de tiempo (por diseño). Un mensaje que llegaba mientras tanto quedaba en cola con `ahead = 0` (solo se contaba `active`, que esas corridas no usan), así que no se avisaba nada: parecía que el bot no respondía.
+4. **Un update ilegible dejaba al bot sordo.** `getUpdates` deserializaba la respuesta entera como `Vec<TelegramUpdate>`. Un solo update con una forma inesperada hacía fallar el lote, y como el offset no avanzaba, el mismo lote volvía en cada llamada. Además, los updates descartados por `filter_map` no confirmaban su offset.
+
+### Qué cambió
+
+- **Salud de los hilos** (`Health` en `telegram_worker.rs`):
+  - el poller declara para cuándo vuelve: 2 min para un `getUpdates` (que tarda 35 s como mucho), 3 min para atender un update y 30 min para transcribir una nota de voz;
+  - `ThreadEnd` marca un hilo como terminado cuando sale por cualquier camino;
+  - cada poller tiene una generación: uno reemplazado que vuelve se va sin tocar la cola. El drenaje de la cola a interrumpidos solo ocurre con `stop`;
+  - los locks envenenados del poller y de la cola ya no cortan el hilo (`PoisonError::into_inner`).
+- **`Worker::revive`**, en cada pasada del supervisor (5 s):
+  - si el poller terminó o no volvió a tiempo, arranca otro, y si el executor terminó, arranca otro. Es el mismo worker: la cola con sus textos, las preguntas pendientes y el historial de cada chat se conservan;
+  - si el poller hubo que reemplazarlo más de `MAX_POLLER_RESPAWNS` (2) veces sin que atendiera un update, el worker entero arranca de cero (`Revival::Restart`). El viejo queda `retired` y ya no escribe el archivo del nuevo;
+  - una corrida que ocupa la cola más de 15 min se registra una vez, con su tipo.
+- **Decisión con motivo** (`Off`): `OtherDevice`, `NoLibrary`, `Locked`, `Disabled` y `Unreadable`.
+  - `Unreadable` (error al leer la configuración que no sea "bloqueada") deja el bot como estaba y no se guarda en la caché: se vuelve a leer en la próxima pasada.
+  - Cada motivo se escribe una vez en el log, cuando cambia.
+- **Reintentos de `getUpdates`**: el intervalo crece 3, 6, 12, 24 y 30 s mientras Telegram falla, en lugar de 3 s fijos.
+  - Se registra el primer fallo, se repite cada 5 min mientras siga y se registra cuando Telegram vuelve a responder.
+  - El texto del error es el nuestro o la `description` de Telegram (por ejemplo, `Conflict: terminated by other getUpdates request`, que indica otra instancia leyendo el mismo bot); nunca incluye la URL ni el token.
+- **`get_updates` lee cada update por separado** (`read_updates`): uno que no se puede leer se salta. `UpdateBatch.next_offset` confirma todos los updates de la respuesta, también los salteados, una vez atendidos los demás.
+- **Aviso de cola**: `enqueue` cuenta también la corrida en curso que no sea autónoma (pedido, acción de IA o webhook). Un mensaje que espera detrás de una acción ahora recibe «Solicitud en cola. Hay 1 solicitud antes.».
+- **Log**: target `notia_telegram` en nivel Info (`src-tauri/src/main.rs`, escritorio y Android). Las líneas empiezan con `[notia:telegram]` y no incluyen tokens, ids de chat ni contenido.
+  - Para ver la historia del bot en el servidor: `docker logs <contenedor> 2>&1 | grep "notia:telegram"`.
+
+### Pruebas
+
+- `telegram_worker::tests`:
+  - `a_poller_that_does_not_come_back_is_replaced_and_then_the_worker_restarts`: un worker real con un token que Telegram nunca ve (falla antes de la red);
+  - `a_thread_that_ended_starts_again_and_the_queue_stays`;
+  - `only_the_poller_that_must_run_marks_itself_ended`;
+  - `a_long_run_is_reported_once`;
+  - `a_failing_telegram_is_asked_again_less_and_less_often`.
+- `telegram_service::tests::an_update_that_cannot_be_read_is_skipped_and_still_confirmed`.
+- Pendiente:
+  - probar con un bot real que el reemplazo del poller no duplique respuestas (la deduplicación por `processed` lo cubre en teoría);
+  - confirmar con los logs del servidor cuál de los caminos de arriba fue el del reporte.

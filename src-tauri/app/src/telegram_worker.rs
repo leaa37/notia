@@ -20,12 +20,19 @@
 //! the Owner's chat that Notia queues by itself: they only read, show no
 //! progress, are never stored, send their answer only when it is not
 //! silence, and give way as soon as the Owner writes.
+//!
+//! The supervisor also watches the worker's threads (`Health`): a thread
+//! that ended, or a poller that did not come back in time, is started
+//! again without touching the queue, and the whole worker starts over when
+//! that does not help. Why the bot does not run, when it stops or starts
+//! and when Telegram stops answering go to the log (target
+//! `notia_telegram`), without tokens, chats or contents.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -36,7 +43,7 @@ use crate::host::{AppHandle, Emitter, Manager};
 use crate::backend::agent_autonomy::{self as autonomy, AutonomousKind};
 use crate::backend::telegram_bot as bot;
 use crate::backend::{
-    AgentRequest, BackendActor, BackendChannel, BackendMessage, BackendRequest, BackendRequestContext,
+    AgentRequest, BackendActor, BackendChannel, BackendErrorCode, BackendMessage, BackendRequest, BackendRequestContext,
     BackendRequestEnvelope, BackendResponse, BackendScope, MessageRole, PersistencePolicy,
     ProtocolVersion, ResumeDecision, ResumeRequest,
 };
@@ -46,7 +53,28 @@ use crate::library_users::LibraryDatabaseContext;
 use crate::services::telegram_service::{self as telegram, IncomingTelegramUpdate, TelegramDocument, TelegramPhoto};
 
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
+/// First pause after a failed `getUpdates`; it doubles up to
+/// [`MAX_POLL_RETRY_DELAY`] while Telegram keeps failing.
 const POLL_RETRY_DELAY: Duration = Duration::from_secs(3);
+const MAX_POLL_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// A failing `getUpdates` streak is written to the log again this often.
+const POLL_FAILURE_REPORT: Duration = Duration::from_secs(5 * 60);
+/// The poller must come back from a `getUpdates` (35 s at most) within
+/// this; one that does not is replaced by a new one.
+const POLL_DUE: Duration = Duration::from_secs(2 * 60);
+/// Handling one update: a few messages sent, the database, a queue.
+const UPDATE_DUE: Duration = Duration::from_secs(3 * 60);
+/// Transcribing a voice note of up to 15 minutes on the computer.
+const TRANSCRIPTION_DUE: Duration = Duration::from_secs(30 * 60);
+/// Pollers replaced in a row without handling an update before the whole
+/// worker starts over.
+const MAX_POLLER_RESPAWNS: u32 = 2;
+/// A run that holds the queue this long is written to the log once: what
+/// arrives meanwhile waits behind it.
+const LONG_RUN: Duration = Duration::from_secs(15 * 60);
+/// Log target of the bot's life: why it does not run, its stops, starts and
+/// recoveries, and Telegram failures. Never tokens, chats nor contents.
+const LOG_TARGET: &str = "notia_telegram";
 const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(120);
 const CLARIFICATION_TIMEOUT: Duration = Duration::from_secs(600);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
@@ -72,6 +100,9 @@ pub(crate) const LIBRARY_CHANGED_EVENT: &str = "notia://telegram-library-changed
 #[derive(Default)]
 pub(crate) struct TelegramWorkerState {
     running: Mutex<Option<RunningWorker>>,
+    /// What the log last said about a bot that does not run here, so each
+    /// reason is written once.
+    reported: Mutex<Option<&'static str>>,
 }
 
 struct RunningWorker {
@@ -150,23 +181,56 @@ pub(crate) fn init() -> crate::host::plugin::TauriPlugin<crate::host::Wry> {
         .build()
 }
 
+/// Why the bot does not run on this device now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Off {
+    /// Another computer of the library runs its services (`device_role`),
+    /// or this device never does (Android).
+    OtherDevice,
+    /// No library is selected, or it is not available on this device.
+    NoLibrary,
+    /// The configuration is encrypted and the Owner has not signed in.
+    Locked,
+    /// Telegram is off or has no bot token.
+    Disabled,
+    /// The configuration could not be read now: the bot stays as it was.
+    Unreadable,
+}
+
+impl Off {
+    /// The log line that says why.
+    fn report(self) -> &'static str {
+        match self {
+            Off::OtherDevice => "el bot no corre en este equipo: los servicios de la biblioteca los atiende otra computadora (la de más procesamiento)",
+            Off::NoLibrary => "el bot no corre: no hay una biblioteca seleccionada disponible en este equipo",
+            Off::Locked => "el bot no corre: la biblioteca está bloqueada hasta que el Owner inicie sesión",
+            Off::Disabled => "el bot no corre: Telegram está desactivado o no tiene token en la configuración",
+            Off::Unreadable => "no se pudo leer la configuración de la biblioteca; el bot sigue como estaba",
+        }
+    }
+}
+
+type Desired = Result<(WorkerKey, CatalogLibrary), Off>;
+
 /// What the supervisor decided last, and from what. Reading the
 /// configuration means opening and decrypting a file, through the slow
 /// storage of Android; the decision is taken again when Notia writes a
 /// configuration, a library is locked or unlocked, the selected library
-/// changes, or after [`DECISION_TTL`] (a change made outside Notia).
+/// changes, or after [`DECISION_TTL`] (a change made outside Notia). A
+/// configuration that could not be read is not kept: it is read again on
+/// the next pass.
 struct Decision {
     generation: u64,
     library: Option<String>,
     client: bool,
     at: std::time::Instant,
-    worker: Option<(WorkerKey, CatalogLibrary)>,
+    worker: Desired,
 }
 
 const DECISION_TTL: Duration = Duration::from_secs(60);
 static DECISION: Mutex<Option<Decision>> = Mutex::new(None);
 
-fn desired_worker(app: &AppHandle) -> Option<(WorkerKey, CatalogLibrary)> {
+fn desired_worker(app: &AppHandle) -> Desired {
     let generation = crate::library_config::config_generation();
     let library = crate::library_catalog::selected_library_id(app);
     let client = !crate::device_role::runs_services(app);
@@ -178,46 +242,95 @@ fn desired_worker(app: &AppHandle) -> Option<(WorkerKey, CatalogLibrary)> {
         }
     }
     let worker = read_desired_worker(app, client);
-    if let Ok(mut last) = DECISION.lock() {
-        *last = Some(Decision { generation, library, client, at: std::time::Instant::now(), worker: worker.clone() });
+    if !matches!(worker, Err(Off::Unreadable)) {
+        if let Ok(mut last) = DECISION.lock() {
+            *last = Some(Decision { generation, library, client, at: std::time::Instant::now(), worker: worker.clone() });
+        }
     }
     worker
 }
 
-fn read_desired_worker(app: &AppHandle, client: bool) -> Option<(WorkerKey, CatalogLibrary)> {
+fn read_desired_worker(app: &AppHandle, client: bool) -> Desired {
     // Only the computer that runs the library's services answers Telegram.
     if client {
-        return None;
+        return Err(Off::OtherDevice);
     }
-    let library = crate::library_catalog::selected_library(app)?;
-    app.state::<crate::library_registry::LibraryBindingRegistry>().lookup(&library.id).ok()?;
-    let config = crate::library_config::read_library_config(app, &library.id).ok()??;
-    let section = config.get("telegram")?;
+    let library = crate::library_catalog::selected_library(app).ok_or(Off::NoLibrary)?;
+    app.state::<crate::library_registry::LibraryBindingRegistry>().lookup(&library.id).map_err(|_| Off::NoLibrary)?;
+    let config = match crate::library_config::read_library_config(app, &library.id) {
+        Ok(Some(config)) => config,
+        Ok(None) => return Err(Off::Disabled),
+        Err(error) if error.code == BackendErrorCode::Unauthorized => return Err(Off::Locked),
+        Err(_) => return Err(Off::Unreadable),
+    };
+    let section = config.get("telegram").ok_or(Off::Disabled)?;
     let token = section.get("botToken").and_then(Value::as_str).unwrap_or_default().trim().to_string();
     if section.get("enabled").and_then(Value::as_bool) != Some(true) || token.is_empty() {
-        return None;
+        return Err(Off::Disabled);
     }
-    Some((WorkerKey { library_id: library.id.clone(), token }, library))
+    Ok((WorkerKey { library_id: library.id.clone(), token }, library))
+}
+
+/// Writes `reason` to the log when it is not what the log said last;
+/// `None` once the bot runs, so the next reason is written again.
+fn report(state: &TelegramWorkerState, reason: Option<&'static str>) {
+    let Ok(mut reported) = state.reported.lock() else {
+        return;
+    };
+    if *reported == reason {
+        return;
+    }
+    *reported = reason;
+    if let Some(reason) = reason {
+        log::info!(target: LOG_TARGET, "[notia:telegram] {reason}");
+    }
 }
 
 fn reconcile(app: &AppHandle) {
     let desired = desired_worker(app);
     let state = app.state::<TelegramWorkerState>();
+    if let Err(off) = &desired {
+        report(&state, Some(off.report()));
+    }
+    // A configuration that could not be read now leaves the bot as it is.
+    if matches!(desired, Err(Off::Unreadable)) {
+        return;
+    }
     let Ok(mut running) = state.running.lock() else {
         return;
     };
-    if running.as_ref().map(|running| &running.key) == desired.as_ref().map(|(key, _)| key) {
-        return;
+    if let (Ok((key, library)), Some(current)) = (&desired, running.as_ref()) {
+        if current.key == *key {
+            report(&state, None);
+            if let Revival::Restart(cause) = current.worker.revive() {
+                log::error!(target: LOG_TARGET, "[notia:telegram] {cause}; reinicio el bot entero");
+                current.worker.retire();
+                current.stop.store(true, Ordering::SeqCst);
+                *running = start_worker(app, key.clone(), library.clone());
+            }
+            return;
+        }
     }
     if let Some(previous) = running.take() {
         previous.stop.store(true, Ordering::SeqCst);
-    }
-    if let Some((key, library)) = desired {
-        let stop = Arc::new(AtomicBool::new(false));
-        if let Some(worker) = Worker::start(app.clone(), library, key.token.clone(), Arc::clone(&stop)) {
-            *running = Some(RunningWorker { key, stop, worker });
+        if desired.is_ok() {
+            log::info!(target: LOG_TARGET, "[notia:telegram] cambió la biblioteca o el token: reinicio el bot");
         }
     }
+    if let Ok((key, library)) = desired {
+        *running = start_worker(app, key, library);
+    }
+}
+
+fn start_worker(app: &AppHandle, key: WorkerKey, library: CatalogLibrary) -> Option<RunningWorker> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let Some(worker) = Worker::start(app.clone(), library, key.token.clone(), Arc::clone(&stop)) else {
+        report(&app.state::<TelegramWorkerState>(), Some("no se pudo iniciar el bot: falta la carpeta de datos o no se pudieron crear sus hilos"));
+        return None;
+    };
+    report(&app.state::<TelegramWorkerState>(), None);
+    log::info!(target: LOG_TARGET, "[notia:telegram] bot iniciado en este equipo");
+    Some(RunningWorker { key, stop, worker })
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +472,19 @@ impl Job {
     fn is_persisted(&self) -> bool {
         self.autonomous.is_none() && self.action.is_none() && self.webhook.is_none()
     }
+
+    /// What kind of run it is, as the log names it.
+    fn kind(&self) -> &'static str {
+        if self.action.is_some() {
+            "una acción de IA"
+        } else if self.webhook.is_some() {
+            "un webhook"
+        } else if self.autonomous.is_some() {
+            "una corrida autónoma"
+        } else {
+            "un pedido"
+        }
+    }
 }
 
 /// The run of an AI action (see `ai_actions`): a turn of the Owner's chat
@@ -493,6 +619,165 @@ struct Worker {
     links: Mutex<HashMap<i64, LinkFlow>>,
     albums: Mutex<HashMap<(i64, String), PendingAlbum>>,
     batches: Mutex<HashMap<i64, PendingBatch>>,
+    health: Health,
+    /// Replaced by a new worker after a failure: it no longer writes the
+    /// file the new one owns.
+    retired: AtomicBool,
+}
+
+/// Liveness of a worker's threads, checked by the supervisor on each pass
+/// (`Worker::revive`).
+struct Health {
+    born: Instant,
+    /// The poller that must run; an older one that comes back leaves
+    /// without touching the queue.
+    poller: AtomicU64,
+    /// Milliseconds after `born` by which the poller must come back.
+    poller_due: AtomicU64,
+    poller_ended: AtomicBool,
+    executor_ended: AtomicBool,
+    /// Pollers replaced since one last handled an update.
+    respawns: AtomicU32,
+    /// When the executor took its current run, and what kind of run it is.
+    run: Mutex<Option<(Instant, &'static str)>>,
+    run_reported: AtomicBool,
+}
+
+impl Health {
+    fn new() -> Self {
+        let health = Health {
+            born: Instant::now(),
+            poller: AtomicU64::new(0),
+            poller_due: AtomicU64::new(0),
+            poller_ended: AtomicBool::new(false),
+            executor_ended: AtomicBool::new(false),
+            respawns: AtomicU32::new(0),
+            run: Mutex::new(None),
+            run_reported: AtomicBool::new(false),
+        };
+        health.expect_poller(POLL_DUE);
+        health
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The poller will come back within `within`.
+    fn expect_poller(&self, within: Duration) {
+        let within = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
+        self.poller_due.store(self.now().saturating_add(within), Ordering::SeqCst);
+    }
+
+    /// What poller `generation` says about its return; one already
+    /// replaced changes nothing.
+    fn poller_back_within(&self, generation: u64, within: Duration) {
+        if self.is_poller(generation) {
+            self.expect_poller(within);
+        }
+    }
+
+    fn poller_overdue(&self) -> bool {
+        self.now() > self.poller_due.load(Ordering::SeqCst)
+    }
+
+    fn is_poller(&self, generation: u64) -> bool {
+        self.poller.load(Ordering::SeqCst) == generation
+    }
+
+    fn begin_run(&self, kind: &'static str) {
+        if let Ok(mut run) = self.run.lock() {
+            *run = Some((Instant::now(), kind));
+        }
+        self.run_reported.store(false, Ordering::SeqCst);
+    }
+
+    fn end_run(&self) {
+        if let Ok(mut run) = self.run.lock() {
+            *run = None;
+        }
+    }
+
+    /// The run that holds the queue for longer than [`LONG_RUN`], once per
+    /// run: its kind and minutes.
+    fn long_run(&self) -> Option<(&'static str, u64)> {
+        let (started, kind) = (*self.run.lock().ok()?)?;
+        if started.elapsed() < LONG_RUN || self.run_reported.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some((kind, started.elapsed().as_secs() / 60))
+    }
+}
+
+/// Marks a thread of the worker as ended when it leaves, whatever the way
+/// (a return or, in development builds, a panic). A poller marks it only
+/// while it is still the one that must run.
+struct ThreadEnd<'a> {
+    health: &'a Health,
+    poller: Option<u64>,
+}
+
+impl Drop for ThreadEnd<'_> {
+    fn drop(&mut self) {
+        match self.poller {
+            Some(generation) if self.health.is_poller(generation) => self.health.poller_ended.store(true, Ordering::SeqCst),
+            Some(_) => {}
+            None => self.health.executor_ended.store(true, Ordering::SeqCst),
+        }
+    }
+}
+
+/// What the supervisor does with a worker after checking its threads.
+enum Revival {
+    Healthy,
+    /// Starting its threads again did not help: the worker starts over.
+    Restart(&'static str),
+}
+
+/// A run of failed `getUpdates` calls: how long to wait before the next
+/// one, and the log lines (the first failure, again every
+/// [`POLL_FAILURE_REPORT`], and when Telegram answers again).
+#[derive(Default)]
+struct PollFailures {
+    count: u32,
+    since: Option<Instant>,
+    reported: Option<Instant>,
+}
+
+impl PollFailures {
+    fn failed(&mut self, error: &str) -> Duration {
+        self.count = self.count.saturating_add(1);
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if self.reported.is_none_or(|at| at.elapsed() >= POLL_FAILURE_REPORT) {
+            self.reported = Some(Instant::now());
+            log::warn!(
+                target: LOG_TARGET,
+                "[notia:telegram] Telegram no responde ({} intento(s) fallido(s) en {} s): {error}",
+                self.count,
+                since.elapsed().as_secs()
+            );
+        }
+        poll_retry_delay(self.count)
+    }
+
+    fn answered(&mut self) {
+        if let Some(since) = self.since {
+            log::info!(
+                target: LOG_TARGET,
+                "[notia:telegram] Telegram volvió a responder después de {} intento(s) fallido(s) en {} s",
+                self.count,
+                since.elapsed().as_secs()
+            );
+        }
+        *self = PollFailures::default();
+    }
+}
+
+/// The pause after the `failures`-th failed `getUpdates` in a row: it
+/// doubles from [`POLL_RETRY_DELAY`] up to [`MAX_POLL_RETRY_DELAY`].
+fn poll_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(4);
+    POLL_RETRY_DELAY.saturating_mul(1 << doublings).min(MAX_POLL_RETRY_DELAY)
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -531,13 +816,15 @@ impl Worker {
             links: Mutex::new(HashMap::new()),
             albums: Mutex::new(HashMap::new()),
             batches: Mutex::new(HashMap::new()),
+            health: Health::new(),
+            retired: AtomicBool::new(false),
         });
         worker.persist();
         worker.notify_interrupted();
-        let executor = Arc::clone(&worker);
-        let _ = std::thread::Builder::new().name("notia-telegram-executor".into()).spawn(move || executor.run_queue());
-        let poller = Arc::clone(&worker);
-        let _ = std::thread::Builder::new().name("notia-telegram-poller".into()).spawn(move || poller.poll());
+        if !worker.spawn_executor() || !worker.spawn_poller() {
+            worker.stop.store(true, Ordering::SeqCst);
+            return None;
+        }
         Some(worker)
     }
 
@@ -545,7 +832,81 @@ impl Worker {
         self.stop.load(Ordering::SeqCst)
     }
 
+    /// Starts the thread that runs the queue; whether it started.
+    fn spawn_executor(self: &Arc<Self>) -> bool {
+        self.health.executor_ended.store(false, Ordering::SeqCst);
+        let executor = Arc::clone(self);
+        let spawned = std::thread::Builder::new().name("notia-telegram-executor".into()).spawn(move || executor.run_queue()).is_ok();
+        if !spawned {
+            self.health.executor_ended.store(true, Ordering::SeqCst);
+        }
+        spawned
+    }
+
+    /// Starts a new poller, which replaces the one that ran (if it ever
+    /// comes back, it leaves); whether it started.
+    fn spawn_poller(self: &Arc<Self>) -> bool {
+        let generation = self.health.poller.fetch_add(1, Ordering::SeqCst) + 1;
+        self.health.poller_ended.store(false, Ordering::SeqCst);
+        self.health.expect_poller(POLL_DUE);
+        let poller = Arc::clone(self);
+        let spawned = std::thread::Builder::new().name("notia-telegram-poller".into()).spawn(move || poller.poll(generation)).is_ok();
+        if !spawned {
+            self.health.poller_ended.store(true, Ordering::SeqCst);
+        }
+        spawned
+    }
+
+    /// Checks the worker's threads and starts again the one that ended or,
+    /// for the poller, did not come back in time. The queue, the questions
+    /// waiting for an answer and each chat's history stay: only the thread
+    /// is new. A poller replaced [`MAX_POLLER_RESPAWNS`] times without
+    /// handling an update asks for the whole worker to start over.
+    fn revive(self: &Arc<Self>) -> Revival {
+        if self.stopped() {
+            return Revival::Healthy;
+        }
+        if let Some((kind, minutes)) = self.health.long_run() {
+            log::warn!(
+                target: LOG_TARGET,
+                "[notia:telegram] el bot lleva {minutes} min con {kind}; lo que llegue mientras tanto espera en la cola (escribí «cancelá» para cortarlo)"
+            );
+        }
+        let poller = if self.health.poller_ended.load(Ordering::SeqCst) {
+            Some("terminó el hilo que recibe los mensajes de Telegram")
+        } else if self.health.poller_overdue() {
+            Some("el hilo que recibe los mensajes de Telegram dejó de responder")
+        } else {
+            None
+        };
+        if let Some(cause) = poller {
+            let respawns = self.health.respawns.fetch_add(1, Ordering::SeqCst) + 1;
+            if respawns > MAX_POLLER_RESPAWNS {
+                return Revival::Restart(cause);
+            }
+            log::warn!(target: LOG_TARGET, "[notia:telegram] {cause}: arranco otro ({respawns}/{MAX_POLLER_RESPAWNS})");
+            if !self.spawn_poller() {
+                return Revival::Restart("no se pudo arrancar otro hilo para recibir los mensajes");
+            }
+        }
+        if self.health.executor_ended.load(Ordering::SeqCst) {
+            log::warn!(target: LOG_TARGET, "[notia:telegram] terminó el hilo que ejecuta los pedidos: arranco otro");
+            if !self.spawn_executor() {
+                return Revival::Restart("no se pudo arrancar otro hilo para ejecutar los pedidos");
+            }
+        }
+        Revival::Healthy
+    }
+
+    /// Leaves the file to the worker that replaces this one.
+    fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+    }
+
     fn persist(&self) {
+        if self.retired.load(Ordering::SeqCst) {
+            return;
+        }
         let Ok(mut persisted) = self.persisted.lock() else {
             return;
         };
@@ -720,24 +1081,36 @@ impl Worker {
     // Polling
     // -----------------------------------------------------------------------
 
-    fn poll(self: Arc<Self>) {
-        while !self.stopped() {
-            let offset = self.persisted.lock().map(|file| file.offset).unwrap_or_default();
-            let updates = match block_on(telegram::get_updates(&self.token, offset)) {
-                Ok(updates) => updates,
-                Err(_) => {
-                    std::thread::sleep(POLL_RETRY_DELAY);
+    /// Reads Telegram while this poller is the one that must run
+    /// (`generation`). Each pass says when it will be back (`Health`), so a
+    /// poller stuck anywhere is replaced.
+    fn poll(self: Arc<Self>, generation: u64) {
+        let _ended = ThreadEnd { health: &self.health, poller: Some(generation) };
+        let mut failures = PollFailures::default();
+        let current = |worker: &Worker| !worker.stopped() && worker.health.is_poller(generation);
+        while current(&self) {
+            self.health.poller_back_within(generation, POLL_DUE);
+            let offset = self.persisted.lock().unwrap_or_else(PoisonError::into_inner).offset;
+            let batch = match block_on(telegram::get_updates(&self.token, offset)) {
+                Ok(batch) => {
+                    failures.answered();
+                    batch
+                }
+                Err(error) => {
+                    let delay = failures.failed(&error);
+                    self.health.poller_back_within(generation, delay + POLL_DUE);
+                    std::thread::sleep(delay);
                     continue;
                 }
             };
-            for update in updates {
-                if self.stopped() {
+            let mut read_all = true;
+            for update in batch.updates {
+                if !current(&self) {
+                    read_all = false;
                     break;
                 }
                 let seen = {
-                    let Ok(mut file) = self.persisted.lock() else {
-                        return;
-                    };
+                    let mut file = self.persisted.lock().unwrap_or_else(PoisonError::into_inner);
                     file.offset = file.offset.max(update.update_id + 1);
                     let seen = file.processed.contains(&update.update_id);
                     if !seen {
@@ -750,12 +1123,33 @@ impl Worker {
                 };
                 self.persist();
                 if !seen {
+                    // A voice note is transcribed on the computer first.
+                    let due = if update.audio.is_some() { TRANSCRIPTION_DUE } else { UPDATE_DUE };
+                    self.health.poller_back_within(generation, due);
                     self.handle_update(update);
+                    self.health.respawns.store(0, Ordering::SeqCst);
+                }
+            }
+            // Updates Telegram sent that carry nothing to answer, or could
+            // not be read, are confirmed too, or they would come back.
+            if let Some(next) = batch.next_offset.filter(|_| read_all && current(&self)) {
+                let advanced = {
+                    let mut file = self.persisted.lock().unwrap_or_else(PoisonError::into_inner);
+                    let advanced = next > file.offset;
+                    file.offset = file.offset.max(next);
+                    advanced
+                };
+                if advanced {
+                    self.persist();
                 }
             }
         }
-        // Stopping keeps the queue on disk: it becomes interrupted and is
-        // only resumed with the explicit recovery command.
+        // A poller replaced by a newer one just leaves. Stopping keeps the
+        // queue on disk: it becomes interrupted and is only resumed with the
+        // explicit recovery command.
+        if !self.stopped() {
+            return;
+        }
         if let Ok(mut queue) = self.queue.lock() {
             // Autonomous runs are dropped (the next review asks again), and
             // so are action runs (their runs end up interrupted).
@@ -1323,7 +1717,11 @@ impl Worker {
                 self.send(chat_id, "No puedo aceptar más de 10 solicitudes pendientes. Esperá a que termine alguna e intentá nuevamente.");
                 return;
             }
-            let ahead = pending + usize::from(self.active.lock().map(|active| active.is_some()).unwrap_or(false));
+            // What runs now counts too: a request, an AI action or a webhook
+            // (an autonomous run gives way to the person's message).
+            let running = self.active.lock().map(|active| active.is_some()).unwrap_or(false)
+                || self.current.lock().map(|current| current.as_ref().is_some_and(|run| !run.autonomous)).unwrap_or(false);
+            let ahead = pending + usize::from(running);
             queue.push_back(Job {
                 stored: StoredJob {
                     request_id: short_id(),
@@ -1489,64 +1887,65 @@ impl Worker {
     // -----------------------------------------------------------------------
 
     fn run_queue(self: Arc<Self>) {
+        let _ended = ThreadEnd { health: &self.health, poller: None };
         while !self.stopped() {
             let job = {
-                let Ok(queue) = self.queue.lock() else {
-                    return;
-                };
-                let Ok((mut queue, _)) = self.queue_ready.wait_timeout(queue, Duration::from_secs(1)) else {
-                    return;
-                };
+                let queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+                let (mut queue, _) = self.queue_ready.wait_timeout(queue, Duration::from_secs(1)).unwrap_or_else(PoisonError::into_inner);
                 queue.pop_front()
             };
             let Some(job) = job else {
                 continue;
             };
-            // Runs Notia started by itself are never stored nor resumed.
-            if let Some(action) = job.action.clone() {
-                self.run_action(&job, &action);
-                if let Ok(mut current) = self.current.lock() {
-                    *current = None;
-                }
-                continue;
+            self.health.begin_run(job.kind());
+            self.run_one(&job);
+            self.health.end_run();
+        }
+    }
+
+    fn run_one(&self, job: &Job) {
+        // Runs Notia started by itself are never stored nor resumed.
+        if let Some(action) = job.action.as_ref() {
+            self.run_action(job, action);
+            self.clear_current();
+            return;
+        }
+        if let Some(webhook) = job.webhook.as_ref() {
+            self.run_webhook(job, webhook);
+            self.clear_current();
+            return;
+        }
+        if let Some(kind) = job.autonomous {
+            self.run_autonomous(job, kind);
+            self.clear_current();
+            return;
+        }
+        if let Ok(mut active) = self.active.lock() {
+            *active = Some(job.stored.clone());
+        }
+        self.persist();
+        let chat_id = job.stored.chat_id;
+        let result = self.run_job(job);
+        self.clear_current();
+        match result {
+            // A cancel may carry the agent's findings, written in Markdown.
+            Err(message) if message.starts_with(bot::CANCELLED_MESSAGE) => {
+                self.send_markdown_checked(chat_id, &message);
             }
-            if let Some(webhook) = job.webhook.clone() {
-                self.run_webhook(&job, &webhook);
-                if let Ok(mut current) = self.current.lock() {
-                    *current = None;
-                }
-                continue;
+            Err(message) => {
+                self.send(chat_id, &message);
             }
-            if let Some(kind) = job.autonomous {
-                self.run_autonomous(&job, kind);
-                if let Ok(mut current) = self.current.lock() {
-                    *current = None;
-                }
-                continue;
-            }
-            if let Ok(mut active) = self.active.lock() {
-                *active = Some(job.stored.clone());
-            }
-            self.persist();
-            let chat_id = job.stored.chat_id;
-            let result = self.run_job(&job);
-            if let Ok(mut current) = self.current.lock() {
-                *current = None;
-            }
-            match result {
-                // A cancel may carry the agent's findings, written in Markdown.
-                Err(message) if message.starts_with(bot::CANCELLED_MESSAGE) => {
-                    self.send_markdown_checked(chat_id, &message);
-                }
-                Err(message) => {
-                    self.send(chat_id, &message);
-                }
-                Ok(()) => {}
-            }
-            if let Ok(mut active) = self.active.lock() {
-                *active = None;
-            }
-            self.persist();
+            Ok(()) => {}
+        }
+        if let Ok(mut active) = self.active.lock() {
+            *active = None;
+        }
+        self.persist();
+    }
+
+    fn clear_current(&self) {
+        if let Ok(mut current) = self.current.lock() {
+            *current = None;
         }
     }
 
@@ -2656,6 +3055,128 @@ fn transcribe(_app: &AppHandle, _token: &str, _audio: &telegram::TelegramAudio) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker of a token Telegram never sees: `getUpdates` fails before
+    /// reaching the network, so the poller only retries.
+    fn offline_worker() -> (Arc<Worker>, Arc<AtomicBool>, std::path::PathBuf) {
+        use crate::host::{AppContext, AppPaths, HostPorts};
+        let directory = std::env::temp_dir().join(format!("notia-telegram-{}", uuid::Uuid::new_v4()));
+        let app = AppContext::new(AppPaths::new(Some(directory.clone()), None), HostPorts::default());
+        let library = CatalogLibrary { id: "lib".into(), name: "Biblioteca".into(), path: directory.display().to_string(), android_tree_uri: None };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = Worker::start(app, library, "token inválido".into(), Arc::clone(&stop)).expect("worker");
+        (worker, stop, directory)
+    }
+
+    /// Waits until the running poller failed its first `getUpdates` and
+    /// sleeps before the next one, so it does not touch its time meanwhile.
+    fn wait_for_retry_pause(worker: &Worker) {
+        let resting = |worker: &Worker| {
+            let pause = u64::try_from((POLL_DUE + POLL_RETRY_DELAY / 2).as_millis()).expect("ms");
+            worker.health.poller_due.load(Ordering::SeqCst) > worker.health.now() + pause
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !resting(worker) {
+            assert!(Instant::now() < deadline, "the poller never paused after its failure");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_failing_telegram_is_asked_again_less_and_less_often() {
+        let delays = (1..=7).map(|failures| poll_retry_delay(failures).as_secs()).collect::<Vec<_>>();
+        assert_eq!(delays, vec![3, 6, 12, 24, 30, 30, 30]);
+    }
+
+    #[test]
+    fn a_poller_that_does_not_come_back_is_replaced_and_then_the_worker_restarts() {
+        let (worker, stop, directory) = offline_worker();
+        wait_for_retry_pause(&worker);
+        assert!(matches!(worker.revive(), Revival::Healthy));
+        assert_eq!(worker.health.poller.load(Ordering::SeqCst), 1, "a healthy poller stays");
+        for replaced in 1..=MAX_POLLER_RESPAWNS {
+            worker.health.expect_poller(Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(matches!(worker.revive(), Revival::Healthy));
+            assert_eq!(worker.health.poller.load(Ordering::SeqCst), u64::from(replaced) + 1, "a new poller runs");
+            assert!(!worker.health.poller_overdue(), "the new poller has its own time");
+            wait_for_retry_pause(&worker);
+        }
+        // The replaced pollers wake up later and leave without a word.
+        worker.health.poller_back_within(1, Duration::ZERO);
+        assert!(!worker.health.poller_overdue(), "a replaced poller does not touch the time of the new one");
+        worker.health.expect_poller(Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(matches!(worker.revive(), Revival::Restart(_)), "replacing it did not help");
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_thread_that_ended_starts_again_and_the_queue_stays() {
+        let (worker, stop, directory) = offline_worker();
+        worker.queue.lock().expect("queue").push_back(Job {
+            stored: StoredJob {
+                request_id: "r".into(),
+                chat_id: 1,
+                telegram_user_id: 2,
+                library_user_id: OWNER.into(),
+                attachments: Vec::new(),
+                attachment: None,
+            },
+            text: "pedido".into(),
+            autonomous: None,
+            action: None,
+            webhook: None,
+        });
+        worker.health.poller_ended.store(true, Ordering::SeqCst);
+        worker.health.executor_ended.store(true, Ordering::SeqCst);
+        // Held so the new executor cannot take the request meanwhile.
+        let queue = worker.queue.lock().expect("queue");
+        assert!(matches!(worker.revive(), Revival::Healthy));
+        assert!(!worker.health.poller_ended.load(Ordering::SeqCst), "a new poller runs");
+        assert!(!worker.health.executor_ended.load(Ordering::SeqCst), "a new executor runs");
+        assert_eq!(worker.health.poller.load(Ordering::SeqCst), 2);
+        assert_eq!(queue.len(), 1, "the request is still queued, with its text");
+        assert_eq!(queue[0].text, "pedido");
+        drop(queue);
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn only_the_poller_that_must_run_marks_itself_ended() {
+        let health = Health::new();
+        health.poller.store(2, Ordering::SeqCst);
+        drop(ThreadEnd { health: &health, poller: Some(1) });
+        assert!(!health.poller_ended.load(Ordering::SeqCst), "a replaced poller leaves quietly");
+        drop(ThreadEnd { health: &health, poller: Some(2) });
+        assert!(health.poller_ended.load(Ordering::SeqCst));
+        assert!(!health.executor_ended.load(Ordering::SeqCst));
+        drop(ThreadEnd { health: &health, poller: None });
+        assert!(health.executor_ended.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_long_run_is_reported_once() {
+        // A machine started minutes ago cannot place a run that far back.
+        let (Some(long_ago), Some(just_long)) =
+            (Instant::now().checked_sub(LONG_RUN + Duration::from_secs(60)), Instant::now().checked_sub(LONG_RUN))
+        else {
+            return;
+        };
+        let health = Health::new();
+        assert_eq!(health.long_run(), None, "nothing runs");
+        health.begin_run("una acción de IA");
+        assert_eq!(health.long_run(), None, "a run that just started");
+        *health.run.lock().expect("run") = Some((long_ago, "una acción de IA"));
+        assert_eq!(health.long_run(), Some(("una acción de IA", 16)));
+        assert_eq!(health.long_run(), None, "once per run");
+        health.end_run();
+        health.begin_run("un pedido");
+        *health.run.lock().expect("run") = Some((just_long, "un pedido"));
+        assert!(health.long_run().is_some(), "the next run is reported again");
+    }
 
     #[test]
     fn stored_jobs_never_keep_the_request_text() {
