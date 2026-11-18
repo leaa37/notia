@@ -198,6 +198,14 @@ fn route(command: &str) -> Option<Route> {
         "finance_products" => finance_products,
         "finance_salary_savings" => finance_salary_savings,
         "finance_dollar_quotes" => finance_dollar_quotes,
+        "finance_session" => finance_session,
+        "finance_entry_menu" => finance_entry_menu,
+        "finance_form" => finance_form,
+        "finance_apply" => finance_apply,
+        "finance_manage" => finance_manage,
+        "finance_resolve_review" => finance_resolve_review,
+        "finance_search" => finance_search,
+        "finance_export" => finance_export,
         "get_speech_capabilities" => get_speech_capabilities,
         "prepare_speech_model" => prepare_speech_model,
         "prepare_device_speech_model" => prepare_speech_model,
@@ -502,6 +510,14 @@ pub const COMMAND_NAMES: &[&str] = &[
     "finance_products",
     "finance_salary_savings",
     "finance_dollar_quotes",
+    "finance_session",
+    "finance_entry_menu",
+    "finance_form",
+    "finance_apply",
+    "finance_manage",
+    "finance_resolve_review",
+    "finance_search",
+    "finance_export",
     "get_speech_capabilities",
     "prepare_speech_model",
     "prepare_device_speech_model",
@@ -1460,6 +1476,38 @@ fn finance_salary_savings(app: &AppHandle, _window_label: &str, command: &str, a
     let arg0 = app.clone();
     let arg1 = arg(command, args, "payload")?;
     Ok(Dispatch::Pending(Box::pin(async move { reply_result(crate::finance_screen::finance_salary_savings(arg0, arg1).await) })))
+}
+
+fn finance_session(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_entry::finance_session(app.clone(), arg(command, args, "payload")?))))
+}
+
+fn finance_entry_menu(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_entry::finance_entry_menu(app.clone(), arg(command, args, "context")?))))
+}
+
+fn finance_form(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_entry::finance_form(app.clone(), arg(command, args, "payload")?))))
+}
+
+fn finance_apply(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_entry::finance_apply(app.clone(), arg(command, args, "payload")?))))
+}
+
+fn finance_manage(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_entry::finance_manage(app.clone(), arg(command, args, "context")?))))
+}
+
+fn finance_resolve_review(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_entry::finance_resolve_review(app.clone(), arg(command, args, "payload")?))))
+}
+
+fn finance_search(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_screen::finance_search(app.clone(), arg(command, args, "payload")?))))
+}
+
+fn finance_export(app: &AppHandle, _window_label: &str, command: &str, args: &Value) -> Result<Dispatch, Value> {
+    Ok(Dispatch::Ready(reply_result(crate::finance_export::finance_export(app.clone(), arg(command, args, "payload")?))))
 }
 
 fn finance_dollar_quotes(_app: &AppHandle, _window_label: &str, _command: &str, _args: &Value) -> Result<Dispatch, Value> {

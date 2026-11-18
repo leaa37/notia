@@ -44,6 +44,13 @@ impl From<String> for FinanceCommandError {
     }
 }
 
+impl FinanceCommandError {
+    /// Something the person can fix in what they loaded.
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self { code: "validation", message: message.into() }
+    }
+}
+
 impl From<&str> for FinanceCommandError {
     fn from(message: &str) -> Self {
         message.to_string().into()
@@ -456,6 +463,11 @@ const FINANCE_DEV_TABLES: &[&str] = &[
     "finance_product_aliases",
     "finance_review_items",
     "finance_link_log",
+    "finance_loans",
+    "finance_loan_installments",
+    "finance_budgets",
+    "finance_budget_alerts",
+    "finance_applied_requests",
 ];
 const FINANCE_DEV_PAGE_SIZE: u32 = 50;
 const FINANCE_DEV_MAX_PAGE_SIZE: u32 = 200;
@@ -744,7 +756,14 @@ pub(crate) fn seed_finance_demo_data(connection: &mut Connection) -> Result<(), 
              INSERT OR IGNORE INTO finance_review_items (id,kind,subject_key,status,question,options_json,subject_json,created_at) VALUES
                 ('dev-review-product','similar-product','dev-product-milk-short|dev-product-milk','pending','¿«LECHE ENT 1LT» es el mismo producto que «Leche entera 1 L»?','[{\"id\":\"merge\",\"label\":\"Sí, es «Leche entera 1 L»\"},{\"id\":\"keep\",\"label\":\"No, son distintos\"}]','{\"newId\":\"dev-product-milk-short\",\"existingId\":\"dev-product-milk\"}',CURRENT_TIMESTAMP);
              INSERT OR IGNORE INTO finance_link_log (id,kind,subject_id,target_id,summary,created_at) VALUES
-                ('dev-link-installment','installment-card-line','dev-installment-1','dev-statement-item-aug-installment','La línea «Cuota 1 compra demo» pagó la cuota 1/3.',CURRENT_TIMESTAMP);",
+                ('dev-link-installment','installment-card-line','dev-installment-1','dev-statement-item-aug-installment','La línea «Cuota 1 compra demo» pagó la cuota 1/3.',CURRENT_TIMESTAMP);
+             INSERT OR IGNORE INTO finance_loans (id,name,lender,currency,principal,installment_count,installment_amount,first_due_date,account_id,notes,active,created_at,updated_at) VALUES
+                ('dev-loan-car','Préstamo demo del auto','Banco Demo','ARS','100000.00',2,'55000.00','2026-10-10','dev-account-bank',NULL,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+             INSERT OR IGNORE INTO finance_loan_installments (id,loan_id,number,due_date,expected_amount,created_at,updated_at) VALUES
+                ('dev-loan-car:1','dev-loan-car',1,'2026-10-10','55000.00',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),
+                ('dev-loan-car:2','dev-loan-car',2,'2026-11-10','55000.00',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+             INSERT OR IGNORE INTO finance_budgets (id,category_id,currency,amount,active,created_at,updated_at) VALUES
+                ('dev-budget-food','dev-category-food','ARS','30000.00',1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);",
         )
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
@@ -792,7 +811,8 @@ pub(crate) fn validate_context(
 }
 
 fn validate_finance_actor(connection: &Connection, context: &FinanceContext) -> Result<(), String> {
-    if !matches!(context.source.as_str(), "app" | "public-url" | "telegram") {
+    // `manual`: a form of the Finanzas screen; `android`: the Notia Finanzas app.
+    if !matches!(context.source.as_str(), "app" | "public-url" | "telegram" | "manual" | "android") {
         return Err("El origen de la operación financiera no es válido.".to_string());
     }
     let actor_id = context.actor_library_user_id.trim();
@@ -851,6 +871,8 @@ pub(crate) fn sync_context(context: &FinanceContext, app: &crate::host::AppHandl
     if let Err(error) = app.emit(FINANCE_DATA_CHANGED_EVENT, ()) {
         log::warn!("[notia:finance] evento de cambio no emitido: {error}");
     }
+    // A change may take a category past its budget: the Owner hears it.
+    crate::finance_budgets::check_alerts_later(app, context);
     Ok(())
 }
 fn valid_amount(value: &str) -> bool {
@@ -1321,6 +1343,42 @@ pub fn finance_save_service_occurrence(
         transaction_query_occurrence(&connection, &occurrence.service_id, &occurrence.period)?;
     drop(connection);
     Ok(persisted)
+}
+
+/// Marks the month of `saved` as paid for `service`: the expense that
+/// paid it, with what was paid. The assistant and the forms both call it
+/// after saving the expense.
+pub(crate) fn record_service_payment(
+    app: crate::host::AppHandle,
+    context: FinanceContext,
+    saved: &FinanceTransaction,
+    service: &FinanceService,
+) -> FinanceCommandResult<FinanceServiceOccurrence> {
+    finance_save_service_occurrence(
+        app,
+        SaveFinanceServiceOccurrencePayload {
+            context,
+            occurrence: FinanceServiceOccurrence {
+                id: uuid::Uuid::new_v4().to_string(),
+                service_id: service.id.clone(),
+                period: saved.effective_date[..7].to_string(),
+                expected_amount: service.expected_amount.clone(),
+                paid_amount: Some(saved.amount.clone()),
+                effective_date: Some(saved.effective_date.clone()),
+                status: "current".to_string(),
+                transaction_id: Some(saved.id.clone()),
+                artifact_id: None,
+                source_reference: saved.source_reference.clone(),
+                raw_source: saved.raw_source.clone(),
+                actor_library_user_id: saved.actor_library_user_id.clone(),
+                source: saved.source.clone(),
+                created_at: None,
+                updated_at: None,
+                difference: None,
+            },
+            reason: None,
+        },
+    )
 }
 
 pub fn finance_list_all_service_occurrence_versions(
@@ -2263,6 +2321,11 @@ fn clear_finance_data(connection: &mut Connection) -> Result<(), String> {
         .execute_batch(
             "DELETE FROM finance_link_log;
              DELETE FROM finance_review_items;
+             DELETE FROM finance_applied_requests;
+             DELETE FROM finance_budget_alerts;
+             DELETE FROM finance_budgets;
+             DELETE FROM finance_loan_installments;
+             DELETE FROM finance_loans;
              DELETE FROM finance_merchant_aliases;
              DELETE FROM finance_product_aliases;
              DELETE FROM finance_service_occurrence_versions;
@@ -2313,7 +2376,7 @@ pub(crate) fn transaction_owner(
     connection: &Connection,
     transaction_id: &str,
 ) -> Result<Option<&'static str>, String> {
-    const OWNERS: [(&str, &str); 5] = [
+    const OWNERS: [(&str, &str); 6] = [
         (
             "SELECT EXISTS(SELECT 1 FROM finance_credit_card_statement_items WHERE transaction_id=?1)",
             "resumen de tarjeta",
@@ -2334,6 +2397,10 @@ pub(crate) fn transaction_owner(
         (
             "SELECT EXISTS(SELECT 1 FROM finance_installments WHERE transaction_id=?1)",
             "plan de cuotas",
+        ),
+        (
+            "SELECT EXISTS(SELECT 1 FROM finance_loan_installments WHERE transaction_id=?1)",
+            "préstamo",
         ),
     ];
     for (query, owner) in OWNERS {
@@ -2795,7 +2862,8 @@ mod tests {
         seed_finance_demo_data(&mut connection).expect("first demo seed");
         seed_finance_demo_data(&mut connection).expect("idempotent demo seed");
 
-        for table in FINANCE_DEV_TABLES {
+        // What was applied and the budget notices sent are bookkeeping, not data.
+        for table in FINANCE_DEV_TABLES.iter().filter(|table| !matches!(**table, "finance_applied_requests" | "finance_budget_alerts")) {
             let count: i64 = connection
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                     row.get(0)
@@ -2865,6 +2933,10 @@ mod tests {
             "finance_installment_plans",
             "finance_review_items",
             "finance_link_log",
+            "finance_loans",
+            "finance_loan_installments",
+            "finance_budgets",
+            "finance_applied_requests",
         ] {
             let count: i64 = connection
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {

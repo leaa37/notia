@@ -320,6 +320,9 @@ pub struct ReviewAction {
     /// person sends it and confirms what the assistant proposes.
     prompt: String,
     primary: bool,
+    /// The option `finance_resolve_review` applies at once, without the
+    /// chat; `None` when the doubt is only answered in the chat.
+    option_id: Option<String>,
 }
 
 /// A doubt the screen shows in «Para revisar»; it is answered in the chat.
@@ -382,6 +385,7 @@ fn review_card(item: &ReviewItem) -> ReviewCard {
             label: option.label.clone(),
             prompt: format!("Sobre la duda «{}» (caso {}): {}.", item.question, item.id, option.label),
             primary: index == 0,
+            option_id: Some(option.id.clone()),
         })
         .collect::<Vec<_>>();
     if actions.is_empty() {
@@ -389,6 +393,7 @@ fn review_card(item: &ReviewItem) -> ReviewCard {
             label: "Responder en el chat".into(),
             prompt: format!("Sobre la duda «{}» (caso {}): ", item.question, item.id),
             primary: true,
+            option_id: None,
         });
     }
     ReviewCard {
@@ -486,6 +491,7 @@ pub struct MovementRow {
 #[derive(Debug, Clone)]
 struct Entry {
     row: MovementRow,
+    destination: Option<String>,
     category_id: Option<String>,
     amount: i128,
     to_savings: bool,
@@ -509,6 +515,7 @@ fn origin_label(source: &str, artifact_type: Option<&str>) -> String {
         ("app", _) => "Chat de Notia",
         ("public-url", _) => "URL pública",
         ("manual", _) => "Carga manual",
+        ("android", _) => "App Notia Finanzas",
         _ => "Asistente",
     };
     if source == "telegram" && label != "Telegram" {
@@ -572,8 +579,14 @@ struct MonthLedger {
 }
 
 fn load_month(connection: &Connection, month: &str, reviews: &[ReviewItem]) -> Result<MonthLedger, String> {
-    let accounts = load_accounts(connection)?;
     let (from, to) = notia_backend_core::finance_insights::month_range(month).ok_or("El mes no es válido.")?;
+    load_range(connection, &from, &to, reviews)
+}
+
+/// The movements that count between two days (`YYYY-MM-DD`, both in), the
+/// most recent first.
+fn load_range(connection: &Connection, from: &str, to: &str, reviews: &[ReviewItem]) -> Result<MonthLedger, String> {
+    let accounts = load_accounts(connection)?;
     let categories = connection
         .prepare("SELECT id,name FROM finance_categories")
         .map_err(storage)?
@@ -652,6 +665,7 @@ fn load_month(connection: &Connection, month: &str, reviews: &[ReviewItem]) -> R
             let flag = flagged.get(&id).filter(|_| status != "discarded");
             Entry {
                 amount: cents(&amount),
+                destination: destination.clone(),
                 row: MovementRow {
                     uncategorized: kind == "expense" && category_id.is_none(),
                     counts_on_statement_due: statement_name.is_some() && purchase_date != effective,
@@ -965,6 +979,10 @@ pub struct FinanceOverview {
     month: String,
     review: Vec<ReviewCard>,
     salary: Option<SalaryUse>,
+    /// What came in, what went out and what was left, per currency.
+    balance: MonthBalance,
+    budgets: Vec<crate::finance_budgets::BudgetRow>,
+    loans: crate::finance_loans::LoansOfMonth,
     expenses: MonthExpenses,
     saved: SavedThisMonth,
     categories: CategoryBreakdown,
@@ -979,7 +997,8 @@ fn salary_use(connection: &Connection, month: &str) -> Result<Option<SalaryUse>,
     let Some(period) = previous_period(month) else { return Ok(None) };
     let Some(salary) = salary_of(connection, &period)? else { return Ok(None) };
     let flows = month_flows(connection, month, &salary.currency)?;
-    let recorded = flows.cards.0 + flows.savings.0 + flows.services_apart.0;
+    let loans = loans_paid_apart(connection, month, &salary.currency)?;
+    let recorded = flows.cards.0 + flows.savings.0 + flows.services_apart.0 + loans;
     let unregistered = (salary.net - recorded).max(0);
     let segment = |key, amount: i128| SalarySegment { key, amount: format_cents(amount), percent: percent(amount, salary.net) };
     let mut bought = Totals::new();
@@ -1003,6 +1022,7 @@ fn salary_use(connection: &Connection, month: &str) -> Result<Option<SalaryUse>,
             segment("cards", flows.cards.0),
             segment("savings", flows.savings.0),
             segment("services", flows.services_apart.0),
+            segment("loans", loans),
             segment("unregistered", unregistered),
         ],
         exceeded: recorded > salary.net,
@@ -1013,6 +1033,106 @@ fn salary_use(connection: &Connection, month: &str) -> Result<Option<SalaryUse>,
         employers: salary.employers,
         currency: salary.currency,
     }))
+}
+
+/// Loan installments paid in `month` from an account that is not a card:
+/// what a card paid is already inside its statement.
+fn loans_paid_apart(connection: &Connection, month: &str, currency: &str) -> Result<i128, String> {
+    let amounts = connection
+        .prepare(
+            "SELECT t.amount FROM finance_loan_installments i
+             JOIN finance_transactions t ON t.id=i.transaction_id AND t.deleted_at IS NULL AND t.status IN ('confirmed','corrected')
+             JOIN finance_accounts a ON a.id=t.account_id
+             WHERE a.account_type<>'credit_card' AND substr(t.effective_date,1,7)=?1 AND t.currency=?2",
+        )
+        .map_err(storage)?
+        .query_map(params![month, currency], |row| row.get::<_, String>(0))
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    Ok(amounts.iter().map(|amount| cents(amount)).sum())
+}
+
+/// One currency of the month's balance.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceRow {
+    currency: String,
+    /// Every income that counts: the salary and the rest.
+    income: String,
+    salary: String,
+    other_income: String,
+    expenses: String,
+    /// Net that went to savings: bought or moved in, minus sold or taken out.
+    savings: String,
+    /// Income minus expenses minus savings.
+    left: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonthBalance {
+    rows: Vec<BalanceRow>,
+    /// The incomes that are not the salary, the largest first.
+    other_incomes: Vec<MovementRow>,
+}
+
+const OTHER_INCOMES: usize = 5;
+
+fn month_balance(connection: &Connection, entries: &[Entry]) -> Result<MonthBalance, String> {
+    let salaries = connection
+        .prepare("SELECT transaction_id FROM finance_salary_receipts WHERE transaction_id IS NOT NULL")
+        .map_err(storage)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?
+        .collect::<Result<std::collections::HashSet<_>, _>>()
+        .map_err(storage)?;
+    let accounts = load_accounts(connection)?;
+    let is_savings = |id: Option<&str>| id.and_then(|id| accounts.get(id)).is_some_and(|account| account.account_type == "savings_reserve");
+    let mut figures = BTreeMap::<String, [i128; 4]>::new();
+    let mut others = Vec::new();
+    for entry in entries.iter().filter(|entry| counted(&entry.row.status)) {
+        let row = &entry.row;
+        let figure = figures.entry(row.currency.clone()).or_default();
+        match row.kind.as_str() {
+            "income" if salaries.contains(&row.id) => figure[0] += entry.amount,
+            "income" => {
+                figure[1] += entry.amount;
+                others.push(entry);
+            }
+            "expense" => figure[2] += entry.amount,
+            // A purchase of savings takes the money of its account; a sale
+            // brings it back.
+            "exchange" => match &row.exchange {
+                Some(exchange) if !exchange.into_savings => figure[3] -= entry.amount,
+                _ => figure[3] += entry.amount,
+            },
+            "transfer" => {
+                let destination = entry.destination.as_deref();
+                match (is_savings(Some(&row.account_id)), is_savings(destination)) {
+                    (false, true) => figure[3] += entry.amount,
+                    (true, false) => figure[3] -= entry.amount,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let rows = figures
+        .into_iter()
+        .filter(|(_, figure)| figure.iter().any(|value| *value != 0))
+        .map(|(currency, [salary, other, expenses, savings])| BalanceRow {
+            currency,
+            income: format_cents(salary + other),
+            salary: format_cents(salary),
+            other_income: format_cents(other),
+            expenses: format_cents(expenses),
+            savings: format_cents(savings),
+            left: format_cents(salary + other - expenses - savings),
+        })
+        .collect();
+    others.sort_by_key(|entry| std::cmp::Reverse(entry.amount));
+    Ok(MonthBalance { rows, other_incomes: others.into_iter().take(OTHER_INCOMES).map(|entry| entry.row.clone()).collect() })
 }
 
 fn month_expenses(connection: &Connection, entries: &[Entry]) -> Result<MonthExpenses, String> {
@@ -1203,7 +1323,7 @@ fn statement_reviews(rows: &[StatementRow], statements: &[Statement]) -> Vec<Rev
                     strong(&row.name),
                     text(format!(" es de {total}, pero sus líneas cargadas suman {lines}.")),
                 ],
-                actions: vec![ReviewAction { label: "Revisar en el chat".into(), prompt: prompt.clone(), primary: true }],
+                actions: vec![ReviewAction { label: "Revisar en el chat".into(), prompt: prompt.clone(), primary: true, option_id: None }],
                 ask: prompt,
             }
         })
@@ -1328,7 +1448,7 @@ fn category_review(breakdown: &CategoryBreakdown, month: &str) -> Option<ReviewC
             strong(format!("{} {} sin categoría", breakdown.uncategorized_count, if breakdown.uncategorized_count == 1 { "gasto" } else { "gastos" })),
             text(format!(" {} {}{share}. Sin eso, el desglose no dice mucho.", if row.count == 1 { "suma" } else { "suman" }, spoken_money(cents(&row.amount), &row.currency))),
         ],
-        actions: vec![ReviewAction { label: "Categorizar en el chat".into(), prompt: breakdown.categorize_prompt.clone().unwrap_or_default(), primary: true }],
+        actions: vec![ReviewAction { label: "Categorizar en el chat".into(), prompt: breakdown.categorize_prompt.clone().unwrap_or_default(), primary: true, option_id: None }],
         ask: breakdown.categorize_prompt.clone().unwrap_or_default(),
     })
 }
@@ -1355,6 +1475,9 @@ fn overview(connection: &Connection, month: String) -> Result<FinanceOverview, S
     let mut largest = ledger.entries.iter().filter(|entry| entry.counted_expense()).collect::<Vec<_>>();
     largest.sort_by(|left, right| left.row.currency.cmp(&right.row.currency).then(right.amount.cmp(&left.amount)));
     Ok(FinanceOverview {
+        balance: month_balance(connection, &ledger.entries)?,
+        budgets: crate::finance_budgets::budgets_of_month(connection, &month)?,
+        loans: crate::finance_loans::loans_of_month(connection, &month)?,
         salary: salary_use(connection, &month)?,
         expenses: month_expenses(connection, &ledger.entries)?,
         saved: saved_this_month(connection, &month)?,
@@ -1501,6 +1624,159 @@ fn change_prompt(row: &MovementRow) -> String {
         "Quiero cambiar este movimiento (id {}): «{}» del {} por {} {} en {}. ",
         row.id, row.description, row.purchase_date, row.currency, row.amount, row.account_name
     )
+}
+
+// ---------------------------------------------------------------------------
+// The whole history: search and export
+// ---------------------------------------------------------------------------
+
+const SEARCH_PAGE: usize = 200;
+const EVER_FROM: &str = "0000-01-01";
+const EVER_TO: &str = "9999-12-31";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPayload {
+    context: FinanceContext,
+    #[serde(default)]
+    search: String,
+    #[serde(default)]
+    filter: String,
+    #[serde(default)]
+    page: usize,
+}
+
+/// The movements found in one month.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchMonth {
+    month: String,
+    rows: Vec<MovementRow>,
+    /// The expenses found that count, per currency.
+    expense_totals: Vec<Money>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinanceSearch {
+    search: String,
+    filter: String,
+    count: usize,
+    page: usize,
+    has_more: bool,
+    months: Vec<SearchMonth>,
+    expense_totals: Vec<Money>,
+}
+
+/// Movements of every month that match `search` and `filter` (the filters
+/// of «Movimientos»), the most recent month first, by pages.
+pub fn finance_search(app: crate::host::AppHandle, payload: SearchPayload) -> FinanceCommandResult<FinanceSearch> {
+    let connection = validate_context(&payload.context, &app)?;
+    Ok(search_history(&connection, &payload.search, &payload.filter, payload.page)?)
+}
+
+fn search_history(connection: &Connection, search: &str, filter: &str, page: usize) -> Result<FinanceSearch, String> {
+    let reviews = pending_reviews(connection)?;
+    let ledger = load_range(connection, EVER_FROM, EVER_TO, &reviews)?;
+    let mut found = ledger.entries.iter().filter(|entry| matches_filter(entry, filter) && matches_search(entry, search)).collect::<Vec<_>>();
+    found.sort_by(|left, right| right.row.effective_date.cmp(&left.row.effective_date).then(right.row.purchase_date.cmp(&left.row.purchase_date)));
+    let mut totals = Totals::new();
+    for entry in found.iter().filter(|entry| entry.counted_expense()) {
+        add(&mut totals, &entry.row.currency, entry.amount);
+    }
+    let count = found.len();
+    let start = page.saturating_mul(SEARCH_PAGE).min(count);
+    let end = (start + SEARCH_PAGE).min(count);
+    let mut months = Vec::<SearchMonth>::new();
+    let mut month_totals = Vec::<Totals>::new();
+    for entry in &found[start..end] {
+        let month = entry.row.effective_date.get(..7).unwrap_or_default().to_string();
+        if months.last().is_none_or(|last| last.month != month) {
+            months.push(SearchMonth { month, rows: Vec::new(), expense_totals: Vec::new() });
+            month_totals.push(Totals::new());
+        }
+        if entry.counted_expense() {
+            if let Some(month_total) = month_totals.last_mut() {
+                add(month_total, &entry.row.currency, entry.amount);
+            }
+        }
+        if let Some(last) = months.last_mut() {
+            last.rows.push(entry.row.clone());
+        }
+    }
+    for (month, month_total) in months.iter_mut().zip(&month_totals) {
+        month.expense_totals = money_list(month_total);
+    }
+    Ok(FinanceSearch {
+        search: search.to_string(),
+        filter: filter.to_string(),
+        count,
+        page,
+        has_more: end < count,
+        months,
+        expense_totals: money_list(&totals),
+    })
+}
+
+/// One movement as an exported row.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExportRow {
+    pub effective_date: String,
+    pub purchase_date: String,
+    pub kind: &'static str,
+    pub description: String,
+    pub category: String,
+    pub account: String,
+    pub service: String,
+    pub amount: String,
+    pub currency: String,
+    pub status: &'static str,
+    pub origin: String,
+}
+
+fn kind_text(kind: &str) -> &'static str {
+    match kind {
+        "expense" => "Gasto",
+        "income" => "Ingreso",
+        "transfer" => "Transferencia",
+        "exchange" => "Cambio de moneda",
+        _ => "Ajuste",
+    }
+}
+
+fn status_text(status: &str) -> &'static str {
+    match status {
+        "confirmed" | "corrected" => "Cuenta",
+        CARD_UNPAID => "En tarjeta, a pagar",
+        "pending" => "Pendiente",
+        "discarded" => "Descartado",
+        _ => "Otro",
+    }
+}
+
+/// The movements between two days (both in; empty for the whole history),
+/// oldest first, as they are exported.
+pub(crate) fn export_rows(connection: &Connection, from: Option<&str>, to: Option<&str>) -> Result<Vec<ExportRow>, String> {
+    let ledger = load_range(connection, from.unwrap_or(EVER_FROM), to.unwrap_or(EVER_TO), &[])?;
+    let mut rows = ledger
+        .entries
+        .iter()
+        .map(|entry| ExportRow {
+            effective_date: entry.row.effective_date.clone(),
+            purchase_date: entry.row.purchase_date.clone(),
+            kind: kind_text(&entry.row.kind),
+            description: entry.row.description.clone(),
+            category: entry.row.category_name.clone().unwrap_or_default(),
+            account: entry.row.account_name.clone(),
+            service: entry.row.service_name.clone().unwrap_or_default(),
+            amount: entry.row.amount.clone(),
+            currency: entry.row.currency.clone(),
+            status: status_text(&entry.row.status),
+            origin: entry.row.origin.clone(),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.effective_date.cmp(&right.effective_date).then(left.purchase_date.cmp(&right.purchase_date)));
+    Ok(rows)
 }
 
 pub fn finance_movements(app: crate::host::AppHandle, payload: MovementsPayload) -> FinanceCommandResult<FinanceMovements> {

@@ -12,7 +12,7 @@ use crate::host::{
 
 const NOTIA_DIRECTORY: &str = ".notia";
 const DATABASE_FILE_NAME: &str = "notia.db";
-pub const CURRENT_SCHEMA_VERSION: i64 = 34;
+pub const CURRENT_SCHEMA_VERSION: i64 = 35;
 /// A client's copy that never got its host's database.
 pub(crate) const COPY_WITHOUT_DATABASE: &str =
     "La copia de este equipo no tiene la base de datos de la biblioteca: conectate al host para completarla.";
@@ -1326,6 +1326,71 @@ fn migrate_to(connection: &Connection, target: i64) -> Result<i64, rusqlite::Err
                  PRIMARY KEY (owner_user_id, date)
              );
              INSERT INTO notia_schema_migrations (version) VALUES (34);",
+        )?;
+        transaction.commit()?;
+    }
+    if current_version < 35 && target >= 35 {
+        // Finanzas cargado a mano: lo que ya se aplicó de cada pedido (para
+        // que la cola de la app no duplique nada), los presupuestos por
+        // categoría con los avisos ya enviados, y los préstamos con sus
+        // cuotas. Una cuota pagada apunta al gasto que la pagó.
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS finance_applied_requests (
+                 request_id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 result_json TEXT NOT NULL,
+                 applied_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS finance_budgets (
+                 id TEXT PRIMARY KEY,
+                 category_id TEXT NOT NULL REFERENCES finance_categories(id),
+                 currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+                 amount TEXT NOT NULL,
+                 active INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 UNIQUE (category_id, currency)
+             );
+             CREATE TABLE IF NOT EXISTS finance_budget_alerts (
+                 id TEXT PRIMARY KEY,
+                 budget_id TEXT NOT NULL REFERENCES finance_budgets(id) ON DELETE CASCADE,
+                 month TEXT NOT NULL,
+                 level INTEGER NOT NULL,
+                 sent_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS finance_loans (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 lender TEXT,
+                 currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+                 principal TEXT,
+                 installment_count INTEGER NOT NULL CHECK (installment_count > 0 AND installment_count <= 600),
+                 installment_amount TEXT NOT NULL,
+                 first_due_date TEXT NOT NULL,
+                 account_id TEXT REFERENCES finance_accounts(id),
+                 notes TEXT,
+                 active INTEGER NOT NULL DEFAULT 1,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 deleted_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS finance_loan_installments (
+                 id TEXT PRIMARY KEY,
+                 loan_id TEXT NOT NULL REFERENCES finance_loans(id),
+                 number INTEGER NOT NULL,
+                 due_date TEXT NOT NULL,
+                 expected_amount TEXT NOT NULL,
+                 paid_amount TEXT,
+                 paid_date TEXT,
+                 transaction_id TEXT UNIQUE REFERENCES finance_transactions(id),
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 UNIQUE (loan_id, number)
+             );
+             CREATE INDEX IF NOT EXISTS idx_finance_loan_installments_due
+                 ON finance_loan_installments(due_date);
+             INSERT INTO notia_schema_migrations (version) VALUES (35);",
         )?;
         transaction.commit()?;
     }

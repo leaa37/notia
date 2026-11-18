@@ -2691,31 +2691,7 @@ impl TauriBackendToolExecutor {
         };
         // The payment marks the service's month as paid; a failure is
         // reported so the user can fix the occurrence, never hidden.
-        let occurrence = crate::finance::finance_save_service_occurrence(
-            self.app.clone(),
-            crate::finance::SaveFinanceServiceOccurrencePayload {
-                context: finance_context,
-                occurrence: crate::finance::FinanceServiceOccurrence {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    service_id: service.id.clone(),
-                    period: saved.effective_date[..7].to_string(),
-                    expected_amount: service.expected_amount.clone(),
-                    paid_amount: Some(saved.amount.clone()),
-                    effective_date: Some(saved.effective_date.clone()),
-                    status: "current".to_string(),
-                    transaction_id: Some(saved.id.clone()),
-                    artifact_id: None,
-                    source_reference: saved.source_reference.clone(),
-                    raw_source: saved.raw_source.clone(),
-                    actor_library_user_id: saved.actor_library_user_id.clone(),
-                    source: saved.source.clone(),
-                    created_at: None,
-                    updated_at: None,
-                    difference: None,
-                },
-                reason: None,
-            },
-        );
+        let occurrence = crate::finance::record_service_payment(self.app.clone(), finance_context, &saved, &service);
         Ok(match occurrence {
             Ok(occurrence) => json!({ "ok": true, "changed": true, "transaction": saved, "occurrence": occurrence, "links": links, "reviewItems": review_items }),
             Err(error) => json!({
