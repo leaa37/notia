@@ -13668,3 +13668,136 @@ No hay registros del caso real, así que no hay una causa probada. Se revisó `t
 - Pendiente:
   - probar con un bot real que el reemplazo del poller no duplique respuestas (la deduplicación por `processed` lo cubre en teoría);
   - confirmar con los logs del servidor cuál de los caminos de arriba fue el del reporte.
+
+## Finanzas: carga manual, préstamos, presupuestos, historial y app de Android (2026-11-19)
+
+Pedido del usuario: poder cargar todo Finanzas a mano en la página, una app de Android aparte con lo mismo (ver, cargar…), y mejoras al módulo. Eligió todo en una sola entrega, una app nativa con cola sin conexión y, como mejoras:
+- una sección de pago de préstamos al lado de la de tarjetas;
+- ingresos y saldo del mes;
+- presupuestos por categoría;
+- búsqueda en todo el historial y exportar.
+
+**Cambia la decisión de «Finanzas: seguimiento informal cargado por el asistente»**: la pantalla ya no es de solo lectura. El resto de esas decisiones sigue igual:
+- las cuentas no llevan saldo;
+- un gasto existe una sola vez;
+- cargar un resumen significa que ya se pagó;
+- un gasto con tarjeta queda en `card_unpaid` hasta que lo paga un resumen.
+
+### Contrato (Rust)
+
+- **Formularios armados por Rust** (`app/src/finance_forms.rs`):
+  - `EntryForm { kind, id, title, intro, submit, fields, delete, actions }`;
+  - cada `Field` es `{ key, label, type, value, required, help?, placeholder?, options?, suggestions?, columns?, addLabel?, readOnly? }`, y `type` es `text`, `multiline`, `money`, `integer`, `date`, `month`, `select`, `toggle` o `items` (filas con `columns`);
+  - las claves son las de los argumentos de las herramientas del asistente (`amount`, `accountId`, `effectiveDate`…), así los errores de los constructores nombran el campo;
+  - la web y la app dibujan cualquier formulario con un renderizador genérico: un campo nuevo no requiere cambios ahí.
+- **Comandos** (`app/src/finance_entry.rs`, registrados en `registry.rs`):
+  - `finance_entry_menu({context})`: los tipos de carga por grupo.
+  - `finance_form({payload: {context, kind, id?, prefill?}})`: el formulario nuevo, con lo que la pantalla preselecciona (`serviceId`, `loanId`, `reserveId`), o el registro guardado para editarlo.
+    - `kind: "movement"` abre el formulario según el tipo del movimiento, y un cambio de moneda abre su movimiento de ahorro.
+    - Un movimiento que pertenece a un documento (`transaction_owner`) trae importe, cuenta, moneda y fecha `readOnly`, con «Se corrige desde el …».
+  - `finance_apply({payload: {context, kind, id?, action?, values, requestId?}})`:
+    - `action` es `save`, `delete` o una acción del formulario (`unpay-last` de un préstamo);
+    - devuelve `ApplyResult { ok, message, errors, savedId, duplicate }`;
+    - los errores que la persona puede corregir vuelven como `ok: false` con `errors` por campo; solo los de almacenamiento o permisos son error del comando;
+    - lo que el pedido no manda toma el valor del formulario: el de por defecto o el guardado.
+  - `finance_manage({context})`: secciones (cuentas, categorías, servicios, reservas, préstamos, presupuestos, planes de cuotas, sueldos, resúmenes, comercios) con sus filas y el formulario que agrega.
+  - `finance_resolve_review({payload: {context, reviewItemId, optionId}})`: aplica una opción de «Para revisar» (`finance_edits::finance_resolve_review_item`). `ReviewAction` trae `optionId` cuando existe; la pantalla lo aplica al tocarlo y, si no hay, sigue yendo al chat.
+  - `finance_session({payload: {libraryId}})`: el `FinanceContext` del Owner para la app de Android, que no conoce la carpeta de la biblioteca en el servidor (`source: "android"`).
+  - `finance_search({payload: {context, search, filter, page}})`: todo el historial con los filtros de Movimientos, por mes, de a 200 movimientos (`load_range` es el mismo cargador del mes).
+  - `finance_export({payload: {context, from?, to?, format}})`:
+    - devuelve `{ fileName, mediaType, base64, rows }`;
+    - `xlsx` es un libro de una hoja armado con `zip` (`finance_export.rs`), con importes numéricos, encabezado fijo y autofiltro;
+    - `csv` va separado por `;`, con coma decimal y BOM.
+- **Los mismos constructores que el asistente.** `finance_apply` llama a `finance_agent_inputs::build_transaction`, `build_purchase`, `build_salary`, `build_credit_card_statement`, `build_category` y `build_service`, y a las mismas funciones de dominio (`finance_save_transaction_linked`, `finance_save_purchase`…).
+  - Los valores por defecto los completa Rust:
+    - un sueldo sin bruto usa el neto, y sin descuentos, bruto menos neto;
+    - una línea de ticket sin total es cantidad por precio, y el total del ticket es la suma menos los descuentos;
+    - un resumen suma sus consumos, cargos, intereses, impuestos y créditos desde sus líneas;
+    - un pago de servicio sin importe usa el esperado y la cuenta habitual.
+  - Una tarjeta acepta dólares: la moneda elegida se aplica después del constructor, que exige la de la cuenta.
+  - El paso que marca pagado el mes de un servicio quedó en `finance::record_service_payment`, que usan el asistente (`backend_runtime`) y la carga manual.
+- **Origen**: `FinanceContext.source` acepta `manual` (formularios de la pantalla; «Carga manual») y `android` («App Notia Finanzas»). `finance_apply` usa `manual` salvo que el pedido venga de la app.
+- **Idempotencia**: un `requestId` aplicado se guarda en `finance_applied_requests` con su resultado. El mismo id devuelve ese resultado con `duplicate: true` y no repite nada. Solo se guarda lo que salió bien: un pedido rechazado puede corregirse y reenviarse con el mismo id. La web genera un id por intento y lo renueva después de un rechazo.
+
+### Préstamos (`app/src/finance_loans.rs`)
+
+- `finance_loans` (nombre, prestador, moneda, lo recibido opcional, cuotas, importe de cada una, primer vencimiento, cuenta habitual, notas, activo) y `finance_loan_installments` (una fila por cuota, `UNIQUE(loan_id, number)`).
+- El calendario es mensual desde el primer vencimiento (`finance_matching::add_months`). Guardar el préstamo actualiza solo las cuotas sin pagar, borra las que sobran si no están pagadas y rechaza achicarlo por debajo de una cuota pagada.
+- **Pagar** crea un gasto confirmado de la categoría `category-loans` («Préstamos», que se crea la primera vez) con `source_reference = loan:{id}:{n}`, y lo une a la cuota (`transaction_id`, `paid_amount`, `paid_date`). El importe pagado puede diferir del esperado.
+  - La cuota entra en `transaction_owner` («préstamo»): desde Movimientos el gasto solo cambia categoría y descripción, y no se borra suelto.
+  - `unpay-last` lo borra y libera la cuota.
+  - Eliminar el préstamo borra sus gastos.
+- Se eligió un gasto y no una transferencia a una cuenta interna. Así la cuota aparece en Movimientos, en «En qué se gastó» y en los presupuestos, como un servicio, sin tocar los lugares que filtran `savings_reserve`.
+- En el Resumen:
+  - `loans_of_month` da el estado de cada préstamo activo en el mes (`paid`, `pending`, `overdue` si hay una anterior sin pagar, o `none`), lo que resta y lo pagado del mes;
+  - «¿A dónde fue el sueldo?» suma el segmento `loans`, con lo pagado fuera de una tarjeta (lo pagado con tarjeta ya está en su resumen).
+
+### Presupuestos (`app/src/finance_budgets.rs`)
+
+- `finance_budgets` (categoría de gastos, moneda, tope; `UNIQUE(category_id, currency)`) y `finance_budget_alerts` (presupuesto, mes y nivel avisado).
+- Lo gastado es lo mismo que cuenta «En qué se gastó»: gastos `confirmed`/`corrected` del mes por `effective_date`. Lo que está en tarjeta a pagar todavía no cuenta.
+- `status` es `ok`, `near` (80 % o más) u `over` (más que el tope).
+- **Aviso por Telegram**: `sync_context` (el final de toda escritura de Finanzas, también las del asistente) llama a `check_alerts_later`.
+  - En un hilo aparte revisa los presupuestos del mes actual y manda al Owner un mensaje por cada nivel nuevo alcanzado (80 y 100), con `telegram_worker::send_task_message`.
+  - El aviso queda registrado solo si llegó; sin bot en este equipo no se registra y se prueba en la próxima escritura.
+
+### Resumen: saldo del mes (`finance_screen.rs`)
+
+- `FinanceOverview.balance`, por moneda:
+  - `income` es `salary` (ingresos que pertenecen a un recibo de sueldo) más `otherIncome`;
+  - `expenses` son los gastos que cuentan;
+  - `savings` es lo neto que fue al ahorro: compras de moneda y transferencias a una reserva, menos ventas y retiros;
+  - `left` es `income - expenses - savings`.
+- `otherIncomes` lista hasta 5 ingresos que no son sueldo.
+- `FinanceOverview.budgets` y `FinanceOverview.loans` traen esas secciones.
+
+### Esquema 35 (`database.rs`)
+
+Tablas nuevas: `finance_applied_requests`, `finance_budgets`, `finance_budget_alerts`, `finance_loans` y `finance_loan_installments`. Todas tienen clave primaria, así que viajan con `row_sync`. Entran en la pestaña Dev y en «Vaciar Finanzas». La semilla de demo suma un préstamo y un presupuesto.
+
+### Web (`src/modules/finance`)
+
+- `FinanceEntryProvider` (`components/entry/`) abre el menú «Cargar», el diálogo de cada formulario, la exportación y los avisos.
+  - Viven en `.finance-layer`, hermano de la vista: `.finance-screen` es un contenedor de tamaño (`container-type`), que retendría una capa fija dentro de su scroll. Los tokens `--fin-*` se definen también para `.finance-layer`.
+  - El contexto y `useFinanceEntry` están en `financeEntryContext.ts`; fuera del proveedor vale `null` y las pestañas siguen funcionando.
+- `FinanceFormFields` es el renderizador genérico. Pantallas nuevas:
+  - `FinanceManageTab` («Administrar»);
+  - `FinanceHistory` («Todo el historial» y `FinanceExportDialog`, que descarga con un enlace como el diagrama de Mermaid);
+  - `FinanceOverviewExtras` (saldo, presupuestos y préstamos, en escritorio y teléfono).
+- En el encabezado:
+  - **Cargar** es la acción principal y **Con el asistente** abre el chat;
+  - en el teléfono los botones de chat y «+» pasan a la fila de «Finanzas», así el mes entra entero.
+- En lo que ya existía:
+  - Movimientos tiene **Editar** en el detalle (escritorio y teléfono);
+  - Resumen tiene **Pagar** en servicios pendientes y préstamos, y un resumen abre su formulario;
+  - Productos permite editar un ticket y renombrar o unir un producto;
+  - Ahorro tiene «Nuevo movimiento» y «Editar reserva».
+
+### App de Android
+
+- Repo aparte, [`leaa37/notia-finance-android`](https://github.com/leaa37/notia-finance-android): Kotlin y Compose, con el mismo cliente, certificado fijado, credenciales y sesión que Notia Fit, más `finance_session`.
+- Lee los mismos comandos y dibuja los formularios con su propio renderizador genérico.
+- **Sin conexión**:
+  - guarda en archivos la última respuesta de cada vista y los formularios vacíos (los descarga una vez por apertura);
+  - una carga sin conexión queda en `OfflineQueue` con su `requestId` y la manda `QueueWorker` (WorkManager, con red, reintento exponencial);
+  - Notia la aplica una sola vez;
+  - una rechazada queda para corregir.
+- Diferencias impuestas por la plataforma:
+  - no tiene la pestaña Dev ni el chat del asistente;
+  - para editar algo guardado necesita conexión.
+
+### Validaciones
+
+- Rust:
+  - `cargo test -p notia-app --lib`: 498 aprobadas y 2 fallidas, las mismas de siempre (`meeting::…a_meeting_whose_session_is_gone_finishes_with_its_lines` y `telegram_service::…endpoint_accepts_standard_bot_token_shape`);
+  - las 95 de Finanzas pasan, incluida `finance_entry::tests::everything_the_assistant_loads_can_be_loaded_by_hand`, que en una biblioteca real carga, repite un `requestId`, edita, borra y prueba préstamo, presupuesto, ticket, sueldo, resumen, pago de servicio, búsqueda, exportación y administrar;
+  - hay pruebas de formularios (`finance_forms`), préstamos, presupuestos (niveles, montos y texto del aviso) y exportación (CSV y partes del XLSX);
+  - `cargo clippy` sin avisos en los módulos nuevos.
+- Web:
+  - `vitest run`: 152 archivos, 766 pruebas. Nuevas: `FinanceEntry.test.tsx` (cargar con un error por campo, pagar servicio y préstamo, resolver una duda, editar, administrar) y `FinanceFormFields.test.tsx`;
+  - `tsc` y `eslint` limpios.
+- En el navegador (servidor headless con una biblioteca nueva, Chromium):
+  - en escritorio: cuentas, un gasto con su error de campo, un gasto en dólares con tarjeta, un ingreso, préstamo, presupuesto, servicio, pagar la cuota y el servicio desde el Resumen, editar un movimiento, buscar en el historial y exportar el `.xlsx`;
+  - en 390 px: un gasto y un ticket con productos. Un ticket repetido se rechaza («El ticket ya fue registrado anteriormente»).
+- App: compila y firma en GitHub Actions (ver su README).
+- Pendiente: probar la app en un teléfono real, sobre todo la cola sin conexión fuera de casa, y un aviso de presupuesto con el bot de Telegram real.

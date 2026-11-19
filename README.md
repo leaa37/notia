@@ -70,18 +70,50 @@ Las respuestas en vivo, Notas IA, **Pasar por IA** y las preguntas envían la tr
 - **Resultado**: mientras grabás, cada frase de la transcripción en vivo muestra el nombre de quien hablaba. Al terminar, si la separación de hablantes encontró voces, cada «Hablante N» toma el nombre de la persona de Teams que habló durante la mayor parte de su tiempo, si cubre al menos el 40 %. Si no separó voces, la transcripción se arma por los turnos de Teams. Los nombres quedan en la nota guardada y podés cambiarlos como siempre.
 - Solo se marca mientras Meeting graba. Lo que se habló antes de empezar la grabación no se tiene en cuenta.
 
-El acceso **Finanzas**, ubicado debajo de **Transcribir meeting** en el panel izquierdo, abre el módulo local de finanzas personales: un seguimiento informal de los gastos del mes, lo pagado de tarjetas, lo que está en tarjeta a pagar, lo ahorrado, los servicios y los productos con su precio y comercio. La pantalla solo muestra; para cargar o corregir algo, tocá **Cargar con el asistente** o escribile en el chat o por Telegram. Las cuentas solo identifican de dónde salió el dinero y no llevan saldo; las reservas de ahorro sí conservan un saldo a partir de su importe inicial y sus movimientos. Comprar o vender dólares del ahorro es un cambio de moneda: no suma a los gastos ni a los ingresos del mes. Cada biblioteca comienza con diez categorías de gasto y los cargos, intereses e impuestos de las tarjetas van a «Cargos de tarjeta». Los importes usan centavos exactos y ARS/USD se muestran siempre por separado.
+El acceso **Finanzas**, ubicado debajo de **Transcribir meeting** en el panel izquierdo, abre el módulo local de finanzas personales: un seguimiento informal de los gastos del mes, lo pagado de tarjetas, lo que está en tarjeta a pagar, lo ahorrado, los servicios y los productos con su precio y comercio. Todo se puede cargar a mano o pedírselo al asistente en el chat o por Telegram: **Cargar** abre la lista de cargas y **Con el asistente** abre el chat. Las cuentas solo identifican de dónde salió el dinero y no llevan saldo; las reservas de ahorro sí conservan un saldo a partir de su importe inicial y sus movimientos. Comprar o vender dólares del ahorro es un cambio de moneda: no suma a los gastos ni a los ingresos del mes. Cada biblioteca comienza con diez categorías de gasto y los cargos, intereses e impuestos de las tarjetas van a «Cargos de tarjeta». Los importes usan centavos exactos y ARS/USD se muestran siempre por separado.
 
-La pantalla tiene cuatro pestañas y las flechas junto al título cambian el mes:
+**Cargar a mano.** **Cargar** ofrece todo lo que carga el asistente:
+- del día a día: gasto, ingreso, transferencia, pago de servicio y pago de préstamo;
+- ahorro: movimiento de una reserva y compra o venta de dólares;
+- documentos: ticket con sus productos, resumen de tarjeta con sus líneas, sueldo con o sin sus conceptos, plan de cuotas y factura de servicio;
+- y lo que se configura: cuentas, categorías, servicios, reservas, préstamos y presupuestos.
 
-- **Resumen**: **Para revisar** (las dudas del asistente; cada botón pone tu respuesta en el chat y nada cambia hasta que la envíes y confirmes), **¿A dónde fue el sueldo?** (el sueldo del mes anterior repartido en tarjetas pagadas, ahorro, servicios pagados fuera de la tarjeta y lo sin registrar), gastos del mes, ahorrado este mes, **En qué se gastó** por categoría con los gastos más grandes, **Tarjetas pagadas** (avisa si las líneas cargadas de un resumen no suman su total), los servicios del mes con su historial y los últimos movimientos. Arriba a la derecha se ven las cotizaciones del dólar.
-- **Movimientos**: los movimientos del mes agrupados por tarjeta o cuenta, con búsqueda y filtros (sin categoría, cada categoría, en tarjeta a pagar, ahorro, descartados). Al tocar uno se ve su detalle —fecha de compra, mes en que cuenta, categoría, servicio, de dónde se cargó y estado— y **Pedir un cambio en el chat** lo cita en el chat.
+Cada formulario muestra tus cuentas, categorías y servicios para elegir y trae la fecha de hoy. Los importes se escriben como siempre (`15.000,50`). Lo que falta o está mal aparece debajo de su campo y nada se guarda hasta corregirlo.
+
+Una carga a mano pasa por las mismas reglas que una del asistente:
+- un gasto con tarjeta queda «En tarjeta, a pagar» hasta que llega su resumen, y se une solo a su línea;
+- un pago de servicio marca el mes como pagado;
+- un ticket repetido se rechaza;
+- lo dudoso va a **Para revisar**.
+
+Para corregir algo, tocá **Editar** en el detalle de un movimiento o tocá el registro en **Administrar**: el mismo formulario vuelve con lo guardado y permite eliminarlo. Un movimiento que pertenece a un documento (un ticket, un resumen, un sueldo o la cuota de un préstamo) solo cambia su categoría y su descripción; el importe, la fecha y la cuenta se corrigen desde ese documento.
+
+La pantalla tiene cinco pestañas y las flechas junto al título cambian el mes:
+
+- **Resumen**:
+  - **Para revisar**: las dudas del asistente. Una respuesta fija (por ejemplo «Sí, es el mismo producto») se aplica al tocarla; las demás van al chat y nada cambia hasta que la envíes y confirmes.
+  - **¿A dónde fue el sueldo?**: el sueldo del mes anterior repartido en tarjetas pagadas, ahorro, servicios y préstamos pagados fuera de la tarjeta, y lo sin registrar.
+  - **Saldo del mes**, por moneda: lo que entró (el sueldo y los otros ingresos, con la lista de esos otros), lo que salió en gastos, lo que fue al ahorro y lo que quedó.
+  - **Presupuestos**: un tope mensual por categoría con su barra. Se pone ámbar desde el 80 % y rojo al pasarte. Notia te avisa por Telegram una vez al llegar al 80 % y otra al pasarte.
+  - Gastos del mes, ahorrado este mes y **En qué se gastó** por categoría, con los gastos más grandes.
+  - **Tarjetas pagadas**: avisa si las líneas cargadas de un resumen no suman su total; tocá un resumen para editarlo.
+  - **Préstamos pagados**: cada préstamo con la cuota del mes (pagada, por pagar o atrasada), cuánto resta y **Pagar**.
+  - Los servicios del mes con su historial y **Pagar** en los pendientes, y los últimos movimientos.
+  - Arriba a la derecha se ven las cotizaciones del dólar.
+- **Movimientos**: los movimientos del mes agrupados por tarjeta o cuenta, con búsqueda y filtros (sin categoría, cada categoría, en tarjeta a pagar, ahorro, descartados). Al tocar uno se ve su detalle —fecha de compra, mes en que cuenta, categoría, servicio, de dónde se cargó y estado— con **Editar**, y **Pedir un cambio en el chat** lo cita en el chat.
+  - **Todo el historial** busca en todos los meses a la vez, agrupado por mes y con el total de gastos encontrados.
+  - **Exportar** baja los movimientos del mes, del año o de todo el historial a Excel (`.xlsx`, con los importes como números) o a CSV (separado por `;` y con coma decimal, como lo abre Excel en Argentina).
 - **Sueldo y ahorro**: el sueldo neto de los últimos meses en pesos o dólares, su promedio, la comparación con la inflación, qué parte del sueldo se va en tarjetas, servicios y ahorro mes a mes, las cotizaciones oficial, blue y tarjeta con tu última compra de dólares, y cada reserva de ahorro con sus movimientos del mes.
-- **Productos y tickets**: los productos con el precio más barato y el historial por comercio, y los tickets con su forma de pago y si ya se pagaron en un resumen. Sin productos, explica cómo mandar el primer ticket.
+- **Productos y tickets**: los productos con el precio más barato y el historial por comercio, y los tickets con su forma de pago y si ya se pagaron en un resumen. **Editar** abre un ticket y **Renombrar o unir** corrige un producto. Sin productos, explica cómo cargar el primer ticket.
+- **Administrar**: cuentas, categorías, servicios, reservas de ahorro, préstamos, presupuestos, planes de cuotas, sueldos, resúmenes de tarjeta y comercios. Tocá uno para editarlo o eliminarlo, o usá el botón de cada sección para agregar.
 
 En el teléfono (cuando Finanzas mide menos de 641 px de ancho, también en una tableta angosta o con el Explorador abierto) la pantalla cambia a su versión celular: el botón de chat queda arriba a la derecha y las pestañas se desplazan de costado. **Para revisar** muestra una duda a la vez con flechas, el resumen suma los servicios y los últimos movimientos, y las cotizaciones quedan al pie. En **Movimientos** tocar un movimiento abre su detalle ahí mismo, debajo de la fila. **Sueldo y ahorro** muestra los últimos seis sueldos y las cotizaciones de a dos. En **Productos**, tocar un producto abre su ficha en lugar de la lista y **Productos** vuelve. La pestaña **Dev** (en el teléfono, **Herramientas de desarrollo** al final) permite inspeccionar las tablas.
 
-Los servicios, sus pagos y sus facturas los carga el asistente; los servicios no generan obligaciones futuras automáticamente. En **Resumen**, **Servicios del mes** muestra cada servicio activo como pagado, pendiente o que no corresponde, y **Ver historial de servicios** muestra su estado en los últimos seis meses.
+Los servicios, sus pagos y sus facturas se cargan a mano o con el asistente; los servicios no generan obligaciones futuras automáticamente.
+
+**Préstamos.** Un préstamo tiene nombre, quién lo dio, moneda, lo que recibiste (opcional), la cantidad de cuotas, el importe de cada una, el primer vencimiento y la cuenta con la que lo pagás. Las cuotas vencen una por mes desde el primer vencimiento. **Pagar** registra la próxima cuota sin pagar como un gasto de la categoría «Préstamos», con el importe que escribas: si cambió, como en un préstamo UVA, ponés lo que pagaste. Cambiar el importe o la cantidad cambia solo las cuotas sin pagar. **Desmarcar la cuota** (en el préstamo) borra el pago de la última, y eliminar el préstamo borra también sus pagos.
+
+**App de Android.** [Notia Finanzas](https://github.com/leaa37/notia-finance-android) tiene lo mismo en el teléfono: ver, cargar, editar, buscar y exportar, y además carga sin conexión. Lo que cargás sin conexión espera en el teléfono y se manda solo; Notia lo aplica una sola vez aunque se reintente. En **Resumen**, **Servicios del mes** muestra cada servicio activo como pagado, pendiente o que no corresponde, y **Ver historial de servicios** muestra su estado en los últimos seis meses.
 
 Finanzas se actualiza sola cuando el asistente guarda un cambio, desde el chat de la aplicación o desde Telegram, sin requerir que cierres y vuelvas a abrir la vista. Si falla una consulta, se muestra un error para reintentar.
 
