@@ -670,7 +670,11 @@ fn save_service_payment(
     args.entry("description").or_insert_with(|| json!(format!("Pago de {}", service.name)));
     args.insert("categoryId".into(), json!(service.category_id));
     let expense_form = EntryForm { kind: "expense".into(), ..form.clone() };
-    save_movement(app, context, catalog, &expense_form, None, &args, request_id)
+    let mut result = save_movement(app, context, catalog, &expense_form, None, &args, request_id)?;
+    if result.ok {
+        result.message = result.message.replacen("Gasto guardado", &format!("Pago de {} guardado", service.name), 1);
+    }
+    Ok(result)
 }
 
 fn save_loan_payment(app: &AppHandle, context: &FinanceContext, values: &Values) -> FinanceCommandResult<ApplyResult> {

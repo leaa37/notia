@@ -22,6 +22,7 @@ import {
   reserveMovementAdds,
 } from '../../engines/financeSalaryText'
 import type { FinanceSalarySavings, QuoteCard, ReserveView, SalaryShare, SalaryShareKey } from '../../types/financeScreen'
+import { useFinanceEntry } from '../entry/financeEntryContext'
 
 /*
  * Sueldo y ahorro in the space of a phone: the canvas board «Teléfono ·
@@ -44,7 +45,7 @@ export function PhoneSalary({ data }: { data: FinanceSalarySavings }) {
     <PhoneShares shares={data.shares} />
     <PhoneQuotes data={data} />
     {data.reserves.map((reserve) => <PhoneReserve key={reserve.id} reserve={reserve} />)}
-    {data.reserves.length === 0 && <section className="finance-phone-card"><h2>Ahorro</h2><p className="finance-phone-sub">Todavía no hay reservas de ahorro. Pedile al asistente que cree una.</p></section>}
+    {data.reserves.length === 0 && <section className="finance-phone-card"><h2>Ahorro</h2><p className="finance-phone-sub">Todavía no hay reservas de ahorro. Creá una en «Administrar» o pedíselo al asistente.</p></section>}
   </div>
 }
 
@@ -190,6 +191,7 @@ function PhoneQuote({ quote }: { quote: QuoteCard }) {
 }
 
 function PhoneReserve({ reserve }: { reserve: ReserveView }) {
+  const entry = useFinanceEntry()
   const change = Number(reserve.monthChange)
   const missing = missingReserveMovements(reserve.totals)
   return <section className="finance-phone-card" aria-labelledby={`finance-phone-reserve-${reserve.id}`}>
@@ -197,6 +199,10 @@ function PhoneReserve({ reserve }: { reserve: ReserveView }) {
       <h2 id={`finance-phone-reserve-${reserve.id}`}>{reserve.name}</h2>
       <span className="finance-phone-sub">Lo registrado, no el saldo de una cuenta</span>
     </div>
+    {entry && <div className="finance-phone-actions">
+      <button type="button" className="finance-phone-button finance-phone-button--accent" onClick={() => entry.openEntry({ kind: 'savings-movement', prefill: { reserveId: reserve.id } })}>Nuevo movimiento</button>
+      <button type="button" className="finance-phone-button" onClick={() => entry.openEntry({ kind: 'reserve', id: reserve.id })}>Editar</button>
+    </div>}
     <div className="finance-phone-stack">
       <span className="finance-phone-figure finance-phone-figure--xl">{formatAmount(reserve.balance, reserve.currency)}</span>
       {change !== 0 && <span className={change > 0 ? 'finance-teal finance-phone-small' : 'finance-warn-text finance-phone-small'}>{change > 0 ? '+' : '−'} {formatAmount(Math.abs(change), reserve.currency, 0)} este mes</span>}

@@ -18,6 +18,8 @@ import { movementAmount, movementMeta, movementTone } from '../engines/financeMo
 import type { FinanceOverview, SalarySegmentKey, SalaryUse, ServiceStatus, StatementRow } from '../types/financeScreen'
 import { FinanceReviewSection } from './FinanceReviewSection'
 import { FinanceStatus } from './FinanceStatus'
+import { BalanceCard, BudgetsCard, LoansCard } from './FinanceOverviewExtras'
+import { useFinanceEntry } from './entry/financeEntryContext'
 import { PhoneOverview } from './phone/PhoneOverview'
 
 interface Props {
@@ -50,8 +52,11 @@ export function FinanceOverviewTab({ library, month, officialSell, onOpenChat, o
         <ExpensesCard data={data} />
         <SavedCard data={data} officialSell={officialSell} />
       </div>
+      <BalanceCard data={data} month={month} phone={false} />
+      <BudgetsCard data={data} phone={false} />
       <CategoriesCard data={data} month={month} />
       <CardsPaidCard data={data} month={month} />
+      <LoansCard data={data} month={month} phone={false} />
       <ServicesCard data={data} month={month} />
       <LatestCard data={data} month={month} onShowMovements={onShowMovements} />
     </div>
@@ -65,6 +70,7 @@ const SEGMENT_LABELS: Record<SalarySegmentKey, string> = {
   cards: 'Tarjetas pagadas',
   savings: 'Ahorro',
   services: 'Servicios aparte',
+  loans: 'Préstamos',
   unregistered: 'Sin registrar',
 }
 
@@ -79,7 +85,7 @@ function SalaryUseCard({ salary, month }: { salary: SalaryUse | null; month: str
   if (!salary) {
     return <section className="finance-card finance-salary-use" aria-labelledby="finance-salary-use-title">
       <h2 id="finance-salary-use-title">¿A dónde fue el sueldo de {previous}?</h2>
-      <p className="finance-empty">Todavía no hay un recibo de sueldo de {previous}. Mandáselo al asistente para ver a dónde fue.</p>
+      <p className="finance-empty">Todavía no hay un recibo de sueldo de {previous}. Cargalo con «Cargar» → «Sueldo» o mandáselo al asistente para ver a dónde fue.</p>
     </section>
   }
   const net = { amount: salary.net, currency: salary.currency }
@@ -214,6 +220,7 @@ function statementStatus(statement: StatementRow): { text: string; warn: boolean
 }
 
 function CardsPaidCard({ data, month }: { data: FinanceOverview; month: string }) {
+  const entry = useFinanceEntry()
   const { cards } = data
   const { installments } = cards
   return <section className="finance-card finance-cards-paid" aria-labelledby="finance-cards-title">
@@ -221,11 +228,11 @@ function CardsPaidCard({ data, month }: { data: FinanceOverview; month: string }
       <h2 id="finance-cards-title">Tarjetas pagadas</h2>
       <span className="finance-strong">{formatMoneyList(cards.totals)}<span className="finance-card__sub"> · {plural(cards.statements.length, 'resumen', 'resúmenes')}</span></span>
     </div>
-    {cards.statements.length === 0 && <p className="finance-empty">No vence ningún resumen de tarjeta en {formatMonthName(month)}.</p>}
+    {cards.statements.length === 0 && <p className="finance-empty">No vence ningún resumen de tarjeta en {formatMonthName(month)}.{entry && <> <button type="button" className="finance-link-button" onClick={() => entry.openEntry({ kind: 'card-statement' })}>Cargar un resumen</button></>}</p>}
     <div className="finance-list">
       {cards.statements.map((statement) => {
         const status = statementStatus(statement)
-        return <div key={statement.id} className="finance-statement">
+        return <button key={statement.id} type="button" className="finance-statement finance-statement--button" aria-label={`Editar el resumen ${statement.name}`} onClick={() => entry?.openEntry({ kind: 'card-statement', id: statement.id })}>
           <span className="finance-badge">{statement.badge}</span>
           <span className="finance-statement__main">
             <span className="finance-statement__name">{statement.name}</span>
@@ -235,7 +242,7 @@ function CardsPaidCard({ data, month }: { data: FinanceOverview; month: string }
             <strong>{formatAmount(statement.amount, statement.currency)}</strong>
             <span className="finance-card__sub">vence {formatShortDate(statement.dueDate)}</span>
           </span>
-        </div>
+        </button>
       })}
     </div>
     <p className="finance-card__sub">
@@ -253,6 +260,7 @@ const SERVICE_STATUS: Record<ServiceStatus, string> = { paid: 'Pagado', pending:
 const HISTORY_STATUS: Record<ServiceStatus | 'missing', string> = { ...SERVICE_STATUS, 'not-applicable': 'No corresponde', missing: 'Sin registro' }
 
 function ServicesCard({ data, month }: { data: FinanceOverview; month: string }) {
+  const entry = useFinanceEntry()
   const { services } = data
   const [showHistory, setShowHistory] = useState(false)
   return <section className="finance-card finance-services" aria-labelledby="finance-services-title">
@@ -260,14 +268,17 @@ function ServicesCard({ data, month }: { data: FinanceOverview; month: string })
       <h2 id="finance-services-title">Servicios de {formatMonthName(month)}</h2>
       {services.rows.length > 0 && <span className={services.pendingCount > 0 ? 'finance-warn-text finance-small' : 'finance-card__sub'}>{services.pendingCount > 0 ? `${services.pendingCount} sin pago` : 'Todos pagados'}</span>}
     </div>
-    {services.rows.length === 0 && <p className="finance-empty">No hay servicios activos. Pedile al asistente que agregue los que pagás cada mes.</p>}
+    {services.rows.length === 0 && <p className="finance-empty">No hay servicios activos.{entry && <> <button type="button" className="finance-link-button" onClick={() => entry.openEntry({ kind: 'service' })}>Agregar uno</button></>}</p>}
     {services.rows.map((row) => <div key={row.serviceId} className="finance-service">
       <div className="finance-service__row">
         <span className="finance-service__main">
           <span className="finance-service__name">{row.name}</span>
           <span className="finance-card__sub">{[row.provider, row.paid ? `pagado ${formatAmount(row.paid, row.currency, 0)}` : `esperado ${formatAmount(row.expected, row.currency, 0)}`].filter(Boolean).join(' · ')}</span>
         </span>
-        <span className={`finance-pill finance-pill--${row.status}`}>{SERVICE_STATUS[row.status]}</span>
+        <span className="finance-service__side">
+          <span className={`finance-pill finance-pill--${row.status}`}>{SERVICE_STATUS[row.status]}</span>
+          {entry && row.status === 'pending' && <button type="button" className="finance-button finance-button--outline finance-button--small" onClick={() => entry.openEntry({ kind: 'service-payment', prefill: { serviceId: row.serviceId } })}>Pagar</button>}
+        </span>
       </div>
       {row.note && <p className="finance-service__note">{row.note}</p>}
     </div>)}

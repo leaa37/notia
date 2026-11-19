@@ -4,6 +4,7 @@ import { formatAmount, formatMoney, formatShortDate, formatSignedPercent, plural
 import { PRODUCT_SORTS, seriesIndex, TICKET_STATUS } from '../../engines/financeProductText'
 import type { FinanceProducts, ProductDetail, ProductSort, TicketRow } from '../../types/financeScreen'
 import { FinancePriceChart } from '../FinancePriceChart'
+import { useFinanceEntry } from '../entry/financeEntryContext'
 
 /*
  * Productos y tickets in the space of a phone: the canvas boards «Teléfono ·
@@ -121,17 +122,25 @@ function PhoneProductDetail({ detail, onOpenChat }: { detail: ProductDetail; onO
         {detail.similar.actions.map((action) => <button key={action.label} type="button" className={`finance-phone-button${action.primary ? ' finance-phone-button--warn' : ''}`} onClick={() => onOpenChat(action.prompt)}>{action.label}</button>)}
       </div>
     </div>}
+    <PhoneProductEdit productId={detail.id} />
     <button type="button" className="finance-phone-button" onClick={() => onOpenChat(detail.correctPrompt)}>Corregir en el chat</button>
   </>
 }
 
+function PhoneProductEdit({ productId }: { productId: string }) {
+  const entry = useFinanceEntry()
+  if (!entry) return null
+  return <button type="button" className="finance-phone-button finance-phone-button--accent" onClick={() => entry.openEntry({ kind: 'product', id: productId })}>Renombrar o unir</button>
+}
+
 function PhoneTickets({ tickets }: { tickets: TicketRow[] }) {
+  const entry = useFinanceEntry()
   return <section className="finance-phone-card finance-phone-card--list" aria-labelledby="finance-phone-tickets-title">
     <div className="finance-phone-stack">
       <h2 id="finance-phone-tickets-title">Tickets</h2>
       <span className="finance-phone-sub">{tickets.length === 0 ? 'Sin tickets registrados.' : 'Con tarjeta cuentan cuando llega el resumen'}</span>
     </div>
-    {tickets.map((ticket) => <div key={ticket.id} className="finance-phone-line">
+    {tickets.map((ticket) => <button key={ticket.id} type="button" className="finance-phone-line finance-phone-line--button" aria-label={`Editar el ticket de ${ticket.merchant}`} onClick={() => entry?.openEntry({ kind: 'purchase', id: ticket.id })}>
       <span className="finance-phone-line__main">
         <span className="finance-phone-medium">{ticket.merchant} <span className="finance-muted finance-phone-normal">· {plural(ticket.itemCount, 'producto')}</span></span>
         <span className="finance-phone-sub">{formatShortDate(ticket.date)} · {ticket.payment}</span>
@@ -140,13 +149,13 @@ function PhoneTickets({ tickets }: { tickets: TicketRow[] }) {
         <strong className="finance-phone-nowrap">{formatMoney(ticket.total, 0)}</strong>
         <span className={`finance-pill finance-pill--${ticket.status} finance-phone-pill`}>{TICKET_STATUS[ticket.status]}</span>
       </span>
-    </div>)}
+    </button>)}
   </section>
 }
 
 function PhoneProductsEmpty({ tickets, onSendTicket }: { tickets: TicketRow[]; onSendTicket: () => void }) {
   const steps = [
-    { title: 'Mandás el ticket', text: 'por el chat de Notia o por Telegram.' },
+    { title: 'Cargás el ticket', text: 'a mano con «+», o por el chat o Telegram.' },
     { title: 'Lo confirmás', text: ': el asistente te muestra lo que leyó.' },
     { title: 'Ves los precios', text: 'y dónde conviene comprar.' },
   ]

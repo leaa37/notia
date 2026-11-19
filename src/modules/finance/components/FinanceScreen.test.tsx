@@ -35,6 +35,9 @@ const overview = {
   services: { rows: [], pendingCount: 0 },
   latest: [],
   movementCount: 0,
+  balance: { rows: [], otherIncomes: [] },
+  budgets: [],
+  loans: { rows: [], paid: [], pendingCount: 0 },
 } as unknown as FinanceOverview
 
 const movements = {

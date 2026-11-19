@@ -16,6 +16,8 @@ export interface ReviewAction {
   /** Message for the chat composer; nothing changes until it is sent and confirmed. */
   prompt: string
   primary: boolean
+  /** The option Rust applies at once; `null` when it is answered in the chat. */
+  optionId: string | null
 }
 
 export interface ReviewCard {
@@ -55,7 +57,7 @@ export interface MovementRow {
   note: string | null
 }
 
-export type SalarySegmentKey = 'cards' | 'savings' | 'services' | 'unregistered'
+export type SalarySegmentKey = 'cards' | 'savings' | 'services' | 'loans' | 'unregistered'
 
 export interface SalaryUse {
   period: string
@@ -109,10 +111,51 @@ export interface ServiceRow {
   history: Array<ServiceStatus | 'missing'>
 }
 
+export interface BalanceRow {
+  currency: string
+  income: string
+  salary: string
+  otherIncome: string
+  expenses: string
+  savings: string
+  left: string
+}
+
+export interface BudgetRow {
+  id: string
+  categoryId: string
+  categoryName: string
+  currency: string
+  budget: string
+  spent: string
+  remaining: string
+  percent: number
+  status: 'ok' | 'near' | 'over'
+}
+
+export interface LoanRow {
+  id: string
+  name: string
+  lender: string | null
+  currency: string
+  number: number | null
+  expected: string | null
+  paid: string | null
+  status: 'paid' | 'pending' | 'overdue' | 'none'
+  paidCount: number
+  installmentCount: number
+  remaining: string
+  nextDueDate: string | null
+}
+
 export interface FinanceOverview {
   month: string
   review: ReviewCard[]
   salary: SalaryUse | null
+  balance: { rows: BalanceRow[]; otherIncomes: MovementRow[] }
+  budgets: BudgetRow[]
+  /** `paid`: what was paid in the month, as `[currency, amount]`. */
+  loans: { rows: LoanRow[]; paid: Array<[string, string]>; pendingCount: number }
   expenses: { totals: Money[]; count: number; cardUnpaid: Money[]; cardUnpaidCount: number }
   saved: {
     contributions: Money[]

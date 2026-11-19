@@ -10,6 +10,7 @@ import { FinancePriceChart } from './FinancePriceChart'
 import { FinanceReviewCard } from './FinanceReviewSection'
 import { FinanceStatus } from './FinanceStatus'
 import { PhoneProducts } from './phone/PhoneProducts'
+import { useFinanceEntry } from './entry/financeEntryContext'
 
 const SEARCH_DELAY_MS = 250
 
@@ -84,6 +85,7 @@ export function FinanceProductsTab({ library, ticketPrompt, onOpenChat, phone }:
 }
 
 function ProductDetailCard({ detail, onOpenChat }: { detail: ProductDetail; onOpenChat: (prompt: string) => void }) {
+  const entry = useFinanceEntry()
   const { best, worst } = detail
   return <section className="finance-card finance-product-detail" aria-label="Detalle del producto">
     <div className="finance-card__head">
@@ -91,7 +93,10 @@ function ProductDetailCard({ detail, onOpenChat }: { detail: ProductDetail; onOp
         <h2 className="finance-product-detail__title">{detail.name}</h2>
         <span className="finance-card__sub">{detail.aliases.length > 0 ? `También figura como ${detail.aliases.join(' y ')}` : 'Sin otros nombres'}</span>
       </div>
-      <button type="button" className="finance-button finance-button--quiet-outline finance-button--small" onClick={() => onOpenChat(detail.correctPrompt)}>Corregir en el chat</button>
+      <div className="finance-card__actions">
+        {entry && <button type="button" className="finance-button finance-button--outline finance-button--small" onClick={() => entry.openEntry({ kind: 'product', id: detail.id })}>Renombrar o unir</button>}
+        <button type="button" className="finance-button finance-button--quiet-outline finance-button--small" onClick={() => onOpenChat(detail.correctPrompt)}>Corregir en el chat</button>
+      </div>
     </div>
     <div className="finance-product-detail__stats">
       <div className="finance-stat finance-stat--teal">
@@ -127,6 +132,7 @@ function ProductDetailCard({ detail, onOpenChat }: { detail: ProductDetail; onOp
 }
 
 function TicketsCard({ tickets }: { tickets: TicketRow[] }) {
+  const entry = useFinanceEntry()
   return <section className="finance-card finance-tickets" aria-labelledby="finance-tickets-title">
     <div className="finance-card__head finance-card__head--baseline">
       <h2 id="finance-tickets-title">Tickets</h2>
@@ -136,7 +142,7 @@ function TicketsCard({ tickets }: { tickets: TicketRow[] }) {
       ? <p className="finance-empty">Sin tickets registrados.</p>
       : <div className="finance-table-scroll">
         <table className="finance-table finance-tickets__table">
-          <thead><tr><th scope="col">Fecha</th><th scope="col">Comercio</th><th scope="col">Productos</th><th scope="col">Pago</th><th scope="col">Estado</th><th scope="col" className="is-number">Total</th></tr></thead>
+          <thead><tr><th scope="col">Fecha</th><th scope="col">Comercio</th><th scope="col">Productos</th><th scope="col">Pago</th><th scope="col">Estado</th><th scope="col" className="is-number">Total</th>{entry && <th scope="col"><span className="finance-visually-hidden">Editar</span></th>}</tr></thead>
           <tbody>{tickets.map((ticket) => <tr key={ticket.id}>
             <td className="finance-muted">{formatShortDate(ticket.date)}</td>
             <td>{ticket.merchant}</td>
@@ -144,6 +150,7 @@ function TicketsCard({ tickets }: { tickets: TicketRow[] }) {
             <td>{ticket.payment}</td>
             <td><span className={`finance-pill finance-pill--${ticket.status}`}>{TICKET_STATUS[ticket.status]}</span></td>
             <td className="is-number finance-strong">{formatMoney(ticket.total)}</td>
+            {entry && <td><button type="button" className="finance-link-button" aria-label={`Editar el ticket de ${ticket.merchant}`} onClick={() => entry.openEntry({ kind: 'purchase', id: ticket.id })}>Editar</button></td>}
           </tr>)}</tbody>
         </table>
       </div>}
@@ -152,7 +159,7 @@ function TicketsCard({ tickets }: { tickets: TicketRow[] }) {
 
 function ProductsEmpty({ data, onSendTicket }: { data: FinanceProducts; onSendTicket: () => void }) {
   const steps = [
-    { title: 'Mandás el ticket', text: 'Por el chat de Notia o por Telegram, en el momento de la compra.' },
+    { title: 'Cargás el ticket', text: 'A mano con «Cargar» → «Ticket», o mandándolo por el chat de Notia o por Telegram.' },
     { title: 'Lo confirmás', text: 'El asistente te muestra lo que leyó y te pregunta si un producto parecido es el mismo.' },
     { title: 'Ves los precios', text: 'Último precio por comercio e historial. Si pagaste con tarjeta, se une solo a la línea del resumen.' },
   ]

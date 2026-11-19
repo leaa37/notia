@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Search } from 'lucide-react'
+import { Download, Pencil, Search } from 'lucide-react'
 import type { NotiaLibrary } from '../../../types/notia'
 import { getFinanceMovements } from '../services/financeService'
 import { useFinanceResource } from '../hooks/useFinanceResource'
@@ -7,6 +7,8 @@ import { formatAmount, formatLongDate, formatMoney, formatMoneyList, formatShort
 import { movementAmount, movementKindLabel, movementMeta, movementStatusLabel, movementTone } from '../engines/financeMovementText'
 import type { FinanceMovements, MovementGroup, MovementRow } from '../types/financeScreen'
 import { FinanceStatus } from './FinanceStatus'
+import { FinanceHistory } from './FinanceHistory'
+import { useFinanceEntry } from './entry/financeEntryContext'
 import { PhoneMovements } from './phone/PhoneMovements'
 
 const SEARCH_DELAY_MS = 250
@@ -19,7 +21,26 @@ interface Props {
   phone: boolean
 }
 
-export function FinanceMovementsTab({ library, month, onOpenChat, phone }: Props) {
+type Scope = 'month' | 'history'
+
+export function FinanceMovementsTab(props: Props) {
+  const entry = useFinanceEntry()
+  const [scope, setScope] = useState<Scope>('month')
+  return <>
+    <div className={props.phone ? 'finance-scope finance-scope--phone' : 'finance-scope'}>
+      <div className="finance-segmented" role="group" aria-label="Qué movimientos">
+        <button type="button" aria-pressed={scope === 'month'} onClick={() => setScope('month')}>Este mes</button>
+        <button type="button" aria-pressed={scope === 'history'} onClick={() => setScope('history')}>Todo el historial</button>
+      </div>
+      <button type="button" className="finance-button finance-button--ghost finance-button--small" onClick={() => entry?.openExport(props.month)}>
+        <Download size={14} aria-hidden="true" />Exportar
+      </button>
+    </div>
+    {scope === 'history' ? <FinanceHistory library={props.library} phone={props.phone} /> : <MonthMovements {...props} />}
+  </>
+}
+
+function MonthMovements({ library, month, onOpenChat, phone }: Props) {
   const [filter, setFilter] = useState('all')
   const [search, setSearch] = useState('')
   const [appliedSearch, setAppliedSearch] = useState('')
@@ -111,6 +132,7 @@ function MovementGroupCard({ group, selectedId, onPick }: { group: MovementGroup
 }
 
 function MovementDetail({ row, prompt, onOpenChat }: { row: MovementRow; prompt: string | null; onOpenChat: (prompt: string) => void }) {
+  const entry = useFinanceEntry()
   const secondary = row.exchange
     ? `Pagaste ${formatAmount(row.amount, row.currency)}${row.exchange.rate ? ` · ${formatAmount(row.exchange.rate, row.currency, 0)} por ${row.exchange.currency === 'USD' ? 'dólar' : row.exchange.currency}` : ''}`
     : `${movementKindLabel(row.kind)} en ${row.currency === 'ARS' ? 'pesos' : 'dólares'}`
@@ -118,6 +140,9 @@ function MovementDetail({ row, prompt, onOpenChat }: { row: MovementRow; prompt:
   return <>
     <div className="finance-detail__top">
       <span className="finance-mono-label">Detalle</span>
+      {entry && <button type="button" className="finance-button finance-button--outline finance-button--small" onClick={() => entry.openEntry({ kind: 'movement', id: row.id })}>
+        <Pencil size={14} aria-hidden="true" />Editar
+      </button>}
     </div>
     <div className="finance-detail__head">
       <span className="finance-detail__desc">{row.description || movementKindLabel(row.kind)}</span>

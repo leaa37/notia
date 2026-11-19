@@ -11,6 +11,8 @@ import {
 } from '../../engines/financeFormat'
 import { movementAmount, movementTone } from '../../engines/financeMovementText'
 import type { FinanceOverview, ReviewCard, SalarySegmentKey, SalaryUse, ServiceStatus, StatementRow } from '../../types/financeScreen'
+import { BalanceCard, BudgetsCard, LoansCard } from '../FinanceOverviewExtras'
+import { useFinanceEntry } from '../entry/financeEntryContext'
 
 /*
  * Resumen in the space of a phone: the canvas board «Teléfono · Resumen».
@@ -29,8 +31,11 @@ export function PhoneOverview({ data, month, onOpenChat, onShowMovements }: Prop
     {data.review.length > 0 && <PhoneReview cards={data.review} onOpenChat={onOpenChat} />}
     <PhoneSalaryUse salary={data.salary} month={month} previousMonth={data.categories.previousMonth} />
     <PhoneTiles data={data} />
+    <BalanceCard data={data} month={month} phone />
+    <BudgetsCard data={data} phone />
     <PhoneCategories data={data} month={month} onOpenChat={onOpenChat} />
     <PhoneCardsPaid data={data} month={month} />
+    <LoansCard data={data} month={month} phone />
     <PhoneServices data={data} />
     <PhoneLatest data={data} month={month} onShowMovements={onShowMovements} />
   </div>
@@ -38,6 +43,7 @@ export function PhoneOverview({ data, month, onOpenChat, onShowMovements }: Prop
 
 /** «Para revisar»: one card at a time; each answer goes to the chat composer. */
 function PhoneReview({ cards, onOpenChat }: { cards: ReviewCard[]; onOpenChat: (prompt: string) => void }) {
+  const entry = useFinanceEntry()
   const [index, setIndex] = useState(0)
   const card = cards[Math.min(index, cards.length - 1)]
   const step = (offset: number) => setIndex((current) => (current + offset + cards.length) % cards.length)
@@ -56,9 +62,12 @@ function PhoneReview({ cards, onOpenChat }: { cards: ReviewCard[]; onOpenChat: (
     <span className="finance-phone-review__kind">{card.label}</span>
     <p className="finance-phone-review__text">{card.parts.map((part, partIndex) => part.strong ? <strong key={partIndex}>{part.text}</strong> : <span key={partIndex}>{part.text}</span>)}</p>
     <div className="finance-phone-actions">
-      {card.actions.map((action) => <button key={action.label} type="button" className={`finance-phone-button${action.primary ? ' finance-phone-button--accent' : ''}`} onClick={() => onOpenChat(action.prompt)}>{action.label}</button>)}
+      {card.actions.map((action) => <button key={action.label} type="button" className={`finance-phone-button${action.primary ? ' finance-phone-button--accent' : ''}`} onClick={() => {
+        if (entry && action.optionId) void entry.resolve(card.id, action.optionId)
+        else onOpenChat(action.prompt)
+      }}>{action.label}</button>)}
     </div>
-    <span className="finance-phone-sub">La respuesta va al chat; nada cambia hasta que la confirmes.</span>
+    <span className="finance-phone-sub">Tocá la respuesta y queda resuelto; lo que no tiene respuesta fija va al chat.</span>
   </section>
 }
 
@@ -66,6 +75,7 @@ const SEGMENT_LABELS: Record<SalarySegmentKey, string> = {
   cards: 'Tarjetas',
   savings: 'Ahorro',
   services: 'Servicios aparte',
+  loans: 'Préstamos',
   unregistered: 'Sin registrar',
 }
 
@@ -74,7 +84,7 @@ function PhoneSalaryUse({ salary, month, previousMonth }: { salary: SalaryUse | 
     const previous = formatMonthName(previousMonth)
     return <section className="finance-phone-card" aria-labelledby="finance-phone-salary-title">
       <h2 id="finance-phone-salary-title" className="finance-phone-h2--small">¿A dónde fue el sueldo de {previous}?</h2>
-      <p className="finance-phone-sub">Todavía no hay un recibo de sueldo de {previous}. Mandáselo al asistente para ver a dónde fue.</p>
+      <p className="finance-phone-sub">Todavía no hay un recibo de sueldo de {previous}. Cargalo con «+» → «Sueldo» o mandáselo al asistente.</p>
     </section>
   }
   const paid = salary.paymentDate ? `Neto cobrado el ${formatShortDate(salary.paymentDate)}` : `Neto de ${formatMonthName(salary.period)}`
@@ -151,6 +161,7 @@ function statementStatus(statement: StatementRow): { text: string; warn: boolean
 }
 
 function PhoneCardsPaid({ data, month }: { data: FinanceOverview; month: string }) {
+  const entry = useFinanceEntry()
   const { cards } = data
   return <section className="finance-phone-card finance-phone-card--list" aria-labelledby="finance-phone-cards-title">
     <div className="finance-phone-row finance-phone-row--baseline">
@@ -160,7 +171,7 @@ function PhoneCardsPaid({ data, month }: { data: FinanceOverview; month: string 
     {cards.statements.length === 0 && <p className="finance-phone-sub">No vence ningún resumen de tarjeta en {formatMonthName(month)}.</p>}
     {cards.statements.map((statement) => {
       const status = statementStatus(statement)
-      return <div key={statement.id} className="finance-phone-line">
+      return <button key={statement.id} type="button" className="finance-phone-line finance-phone-line--button" aria-label={`Editar el resumen ${statement.name}`} onClick={() => entry?.openEntry({ kind: 'card-statement', id: statement.id })}>
         <span className="finance-phone-line__main">
           <span>{statement.name}</span>
           <span className={`finance-phone-sub${status.warn ? ' finance-warn-text' : ''}`}>{status.check && <Check size={14} aria-hidden="true" className="finance-teal" />}{status.text}</span>
@@ -169,7 +180,7 @@ function PhoneCardsPaid({ data, month }: { data: FinanceOverview; month: string 
           <strong>{formatAmount(statement.amount, statement.currency, 0)}</strong>
           <span className="finance-phone-sub">vence {formatShortDate(statement.dueDate)}</span>
         </span>
-      </div>
+      </button>
     })}
   </section>
 }
@@ -177,19 +188,23 @@ function PhoneCardsPaid({ data, month }: { data: FinanceOverview; month: string 
 const SERVICE_STATUS: Record<ServiceStatus, string> = { paid: 'Pagado', pending: 'Pendiente', 'not-applicable': 'No corresponde' }
 
 function PhoneServices({ data }: { data: FinanceOverview }) {
+  const entry = useFinanceEntry()
   const { services } = data
   return <section className="finance-phone-card finance-phone-card--tight" aria-labelledby="finance-phone-services-title">
     <div className="finance-phone-row finance-phone-row--baseline">
       <h2 id="finance-phone-services-title">Servicios</h2>
       {services.rows.length > 0 && <span className={services.pendingCount > 0 ? 'finance-warn-text finance-phone-small' : 'finance-phone-sub'}>{services.pendingCount > 0 ? `${services.pendingCount} sin pago` : 'Todos pagados'}</span>}
     </div>
-    {services.rows.length === 0 && <p className="finance-phone-sub">No hay servicios activos. Pedile al asistente que agregue los que pagás cada mes.</p>}
+    {services.rows.length === 0 && <p className="finance-phone-sub">No hay servicios activos. Agregalos en «Administrar» o pedíselo al asistente.</p>}
     {services.rows.map((row) => <div key={row.serviceId} className="finance-phone-service">
       <span className="finance-phone-line__main">
         <span className="finance-phone-medium">{row.name}</span>
         <span className="finance-phone-sub">{row.paid ? `pagado ${formatAmount(row.paid, row.currency, 0)}` : `esperado ${formatAmount(row.expected, row.currency, 0)}`}</span>
       </span>
-      <span className={`finance-pill finance-pill--${row.status}`}>{SERVICE_STATUS[row.status]}</span>
+      <span className="finance-service__side">
+        <span className={`finance-pill finance-pill--${row.status}`}>{SERVICE_STATUS[row.status]}</span>
+        {entry && row.status === 'pending' && <button type="button" className="finance-phone-button finance-phone-button--accent" onClick={() => entry.openEntry({ kind: 'service-payment', prefill: { serviceId: row.serviceId } })}>Pagar</button>}
+      </span>
     </div>)}
   </section>
 }

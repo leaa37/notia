@@ -27,6 +27,7 @@ import {
 import type { FinanceSalarySavings, QuoteCard, ReserveView, SalaryShare, SalaryShareKey } from '../types/financeScreen'
 import { FinanceStatus } from './FinanceStatus'
 import { PhoneSalary } from './phone/PhoneSalary'
+import { useFinanceEntry } from './entry/financeEntryContext'
 
 const SHORT_RANGE = 6
 const BAR_MAX_HEIGHT = 200
@@ -57,7 +58,7 @@ export function FinanceSalaryTab({ library, month, phone }: { library: NotiaLibr
       {data.shares.map((share) => <ShareCard key={share.key} share={share} />)}
       <QuotesCard data={data} />
       {data.reserves.map((reserve) => <ReserveCard key={reserve.id} reserve={reserve} />)}
-      {data.reserves.length === 0 && <section className="finance-card finance-span-12"><h2>Ahorro</h2><p className="finance-empty">Todavía no hay reservas de ahorro. Pedile al asistente que cree una.</p></section>}
+      {data.reserves.length === 0 && <section className="finance-card finance-span-12"><h2>Ahorro</h2><p className="finance-empty">Todavía no hay reservas de ahorro. Creá una en «Administrar» o pedíselo al asistente.</p></section>}
     </div>
   </div>
 }
@@ -225,6 +226,7 @@ function QuoteTile({ quote }: { quote: QuoteCard }) {
 // Savings reserves
 
 function ReserveCard({ reserve }: { reserve: ReserveView }) {
+  const entry = useFinanceEntry()
   const change = Number(reserve.monthChange)
   const missing = missingReserveMovements(reserve.totals)
   return <section className="finance-card finance-span-12 finance-reserve" aria-labelledby={`finance-reserve-${reserve.id}`}>
@@ -232,6 +234,10 @@ function ReserveCard({ reserve }: { reserve: ReserveView }) {
       <div>
         <h2 id={`finance-reserve-${reserve.id}`}>{reserve.name}</h2>
         <span className="finance-card__sub">En {reserve.currency === 'USD' ? 'dólares' : 'pesos'} · es lo registrado, no el saldo de una cuenta</span>
+        {entry && <div className="finance-card__actions">
+          <button type="button" className="finance-button finance-button--outline finance-button--small" onClick={() => entry.openEntry({ kind: 'savings-movement', prefill: { reserveId: reserve.id } })}>Nuevo movimiento</button>
+          <button type="button" className="finance-button finance-button--quiet-outline finance-button--small" onClick={() => entry.openEntry({ kind: 'reserve', id: reserve.id })}>Editar reserva</button>
+        </div>}
       </div>
       <div className="finance-reserve__total">
         <div className="finance-figure finance-figure--xl">{formatAmount(reserve.balance, reserve.currency)}</div>

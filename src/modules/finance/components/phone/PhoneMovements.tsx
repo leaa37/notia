@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react'
 import { Search } from 'lucide-react'
 import { formatLongDate, formatMoney, formatMoneyList, formatShortDate } from '../../engines/financeFormat'
 import { movementAmount, movementKindLabel, movementMeta, movementStatusLabel, movementTone } from '../../engines/financeMovementText'
+import { useFinanceEntry } from '../entry/financeEntryContext'
 import type { FinanceMovements, MovementGroup, MovementRow } from '../../types/financeScreen'
 
 /*
@@ -78,6 +79,7 @@ interface RowProps {
 }
 
 function PhoneMovementRow({ row, open, prompt, onToggle, onOpenChat }: RowProps) {
+  const entry = useFinanceEntry()
   const tone = movementTone(row)
   const category = row.exchange ? 'Ahorro' : row.categoryName ?? (row.uncategorized ? 'Sin categoría' : '—')
   return <div className="finance-phone-movement" data-open={open || undefined}>
@@ -98,7 +100,8 @@ function PhoneMovementRow({ row, open, prompt, onToggle, onOpenChat }: RowProps)
         <dt>Cargado desde</dt><dd>{row.origin}</dd>
         <dt>Estado</dt><dd>{movementStatusLabel(row.status)}</dd>
       </dl>
-      {prompt && <button type="button" className="finance-phone-button finance-phone-button--accent" onClick={() => onOpenChat(prompt)}>Pedir un cambio en el chat</button>}
+      {entry && <button type="button" className="finance-phone-button finance-phone-button--accent" onClick={() => entry.openEntry({ kind: 'movement', id: row.id })}>Editar</button>}
+      {prompt && <button type="button" className="finance-phone-button" onClick={() => onOpenChat(prompt)}>Pedir un cambio en el chat</button>}
     </div>}
   </div>
 }
