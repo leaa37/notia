@@ -1,326 +1,277 @@
-import { useCallback, useState } from 'react'
-import { Check } from 'lucide-react'
+import { useCallback } from 'react'
+import { ArrowRight, TrendingDown, TrendingUp } from 'lucide-react'
 import type { NotiaLibrary } from '../../../types/notia'
 import { getFinanceOverview } from '../services/financeService'
 import { useFinanceResource } from '../hooks/useFinanceResource'
-import {
-  formatAmount,
-  formatMoney,
-  formatMoneyList,
-  formatMonthName,
-  formatPercent,
-  formatShortDate,
-  formatShortMonth,
-  formatSignedPercent,
-  plural,
-} from '../engines/financeFormat'
-import { movementAmount, movementMeta, movementTone } from '../engines/financeMovementText'
-import type { FinanceOverview, SalarySegmentKey, SalaryUse, ServiceStatus, StatementRow } from '../types/financeScreen'
-import { FinanceReviewSection } from './FinanceReviewSection'
-import { FinanceStatus } from './FinanceStatus'
-import { BalanceCard, BudgetsCard, LoansCard } from './FinanceOverviewExtras'
-import { useFinanceEntry } from './entry/financeEntryContext'
-import { PhoneOverview } from './phone/PhoneOverview'
+import { formatAmount, formatMoneyList, formatPercent, formatSignedPercent, plural } from '../engines/financeFormat'
+import type { Balance, CategoryRow, Commitment, FinanceOverview, HistoryPoint } from '../types/financeScreen'
+import { useFinanceEntry, type FinanceEntryApi } from './entry/financeEntryContext'
+import { FinanceBar, FinanceCard, FinancePill, FinanceStatus, MoneyText, MovementList } from './FinanceParts'
+import type { FinanceTab } from './FinanceScreen'
 
 interface Props {
   library: NotiaLibrary
   month: string
-  /** Today's official selling rate, shown beside what the dollars cost. */
-  officialSell: number | null
-  onOpenChat: (prompt: string | null) => void
-  onShowMovements: () => void
-  /** The phone board of the canvas. */
-  phone: boolean
+  onTab: (tab: FinanceTab) => void
 }
 
-export function FinanceOverviewTab({ library, month, officialSell, onOpenChat, onShowMovements, phone }: Props) {
+/** «Resumen»: how the month goes, from what Rust adds up. */
+export function FinanceOverviewTab({ library, month, onTab }: Props) {
   const load = useCallback(() => getFinanceOverview(library, month), [library, month])
-  const { data, error, isLoading, reload } = useFinanceResource(load, 'No se pudo cargar el resumen de Finanzas.')
+  const { data, error, isLoading, reload } = useFinanceResource(load, 'No se pudo leer el resumen.')
+  const entry = useFinanceEntry()
   if (!data) return <FinanceStatus isLoading={isLoading} error={error} onRetry={reload} />
-  if (phone) {
-    return <>
-      {error && <FinanceStatus isLoading={false} error={error} onRetry={reload} />}
-      <PhoneOverview data={data} month={month} onOpenChat={onOpenChat} onShowMovements={onShowMovements} />
-    </>
-  }
+  if (data.empty) return <Welcome entry={entry} />
+  const pesos = data.balance.find((balance) => balance.currency === 'ARS') ?? null
+  const others = data.balance.filter((balance) => balance.currency !== 'ARS')
   return <div className="finance-overview">
     {error && <FinanceStatus isLoading={false} error={error} onRetry={reload} />}
-    {data.review.length > 0 && <FinanceReviewSection cards={data.review} onOpenChat={onOpenChat} />}
-    <div className="finance-overview__grid">
-      <SalaryUseCard salary={data.salary} month={month} />
-      <div className="finance-overview__side">
-        <ExpensesCard data={data} />
-        <SavedCard data={data} officialSell={officialSell} />
-      </div>
-      <BalanceCard data={data} month={month} phone={false} />
-      <BudgetsCard data={data} phone={false} />
-      <CategoriesCard data={data} month={month} />
-      <CardsPaidCard data={data} month={month} />
-      <LoansCard data={data} month={month} phone={false} />
-      <ServicesCard data={data} month={month} />
-      <LatestCard data={data} month={month} onShowMovements={onShowMovements} />
+    <BalanceCard balance={pesos} others={others} />
+    <div className="finance-grid">
+      <CommitmentsCard view={data} entry={entry} onTab={onTab} />
+      <PaceCard view={data} />
+      <CategoriesCard rows={data.categories} />
+      <HistoryCard points={data.history} current={data.month} />
+      <DebtsCard view={data} onTab={onTab} />
+      <SavingsCard view={data} onTab={onTab} />
+      <FinanceCard title="Mayores gastos" className="finance-span-6">
+        <MovementList rows={data.topExpenses} empty="Sin gastos este mes." />
+      </FinanceCard>
+      <FinanceCard title="Últimos movimientos" className="finance-span-6" action={<button type="button" className="finance-link-button" onClick={() => onTab('movements')}>Ver todos</button>}>
+        <MovementList rows={data.recent} empty="Sin movimientos este mes." />
+      </FinanceCard>
     </div>
   </div>
 }
 
-// ---------------------------------------------------------------------------
-// Salary
-
-const SEGMENT_LABELS: Record<SalarySegmentKey, string> = {
-  cards: 'Tarjetas pagadas',
-  savings: 'Ahorro',
-  services: 'Servicios aparte',
-  loans: 'Préstamos',
-  unregistered: 'Sin registrar',
+function Welcome({ entry }: { entry: FinanceEntryApi | null }) {
+  const steps: Array<{ kind: string; title: string; text: string }> = [
+    { kind: 'salary', title: 'Tu sueldo', text: 'Lo que cobrás en mano.' },
+    { kind: 'expense', title: 'Un gasto', text: 'Nombre, importe y categoría.' },
+    { kind: 'card', title: 'Tus tarjetas', text: 'Después les cargás las compras en cuotas.' },
+    { kind: 'service', title: 'Tus servicios', text: 'Luz, internet, alquiler: los pagás cada mes.' },
+  ]
+  return <FinanceCard title="Empezá por acá" sub="Con esto, el Resumen te muestra cuánto te queda, qué falta pagar y en qué se va la plata.">
+    <div className="finance-welcome">
+      {steps.map((step) => <button key={step.kind} type="button" className="finance-welcome__step" onClick={() => entry?.openEntry({ kind: step.kind })}>
+        <strong>{step.title}</strong>
+        <span>{step.text}</span>
+        <ArrowRight size={16} aria-hidden="true" />
+      </button>)}
+    </div>
+  </FinanceCard>
 }
 
-function segmentCaption(key: SalarySegmentKey, amount: number, percent: number | null): string {
-  if (key === 'services' && amount === 0) return 'Sin pagos fuera de tarjeta'
-  if (key === 'unregistered') return `${formatPercent(percent)} · efectivo, transferencias o lo no cargado`
-  return `${formatPercent(percent)} del sueldo`
+function share(part: string, whole: string): number {
+  const total = Number(whole)
+  return total > 0 ? (Math.max(0, Number(part)) * 100) / total : 0
 }
 
-function SalaryUseCard({ salary, month }: { salary: SalaryUse | null; month: string }) {
-  const previous = formatMonthName(shiftPeriod(month, -1))
-  if (!salary) {
-    return <section className="finance-card finance-salary-use" aria-labelledby="finance-salary-use-title">
-      <h2 id="finance-salary-use-title">¿A dónde fue el sueldo de {previous}?</h2>
-      <p className="finance-empty">Todavía no hay un recibo de sueldo de {previous}. Cargalo con «Cargar» → «Sueldo» o mandáselo al asistente para ver a dónde fue.</p>
-    </section>
+/** What came in and where it went, in pesos; other currencies apart. */
+function BalanceCard({ balance, others }: { balance: Balance | null; others: Balance[] }) {
+  if (!balance) {
+    return <FinanceCard className="finance-balance"><p className="finance-empty">Sin movimientos en pesos este mes.</p>{others.map((other) => <OtherCurrency key={other.currency} balance={other} />)}</FinanceCard>
   }
-  const net = { amount: salary.net, currency: salary.currency }
-  const bought = formatMoneyList(salary.savingsBought, 0)
-  return <section className="finance-card finance-salary-use" aria-labelledby="finance-salary-use-title">
-    <div className="finance-card__head">
-      <div>
-        <h2 id="finance-salary-use-title">¿A dónde fue el sueldo de {formatMonthName(salary.period)}?</h2>
-        <p className="finance-card__sub">Con el sueldo cobrado {salary.paymentDate ? `el ${formatShortDate(salary.paymentDate)}` : `en ${formatMonthName(salary.period)}`} se paga lo que vence en {formatMonthName(month)}.</p>
+  const income = Number(balance.income)
+  const left = Number(balance.left)
+  const change = balance.expensesChange
+  return <section className="finance-card finance-balance" aria-label="Saldo del mes">
+    <div className="finance-balance__top">
+      <div className="finance-balance__main">
+        <span className="finance-mono-label">{income > 0 ? (left >= 0 ? 'Te queda' : 'Gastaste de más') : 'Gastaste'}</span>
+        <strong className={`finance-figure finance-figure--hero${left < 0 && income > 0 ? ' finance-figure--alert' : ''}`}>
+          {formatAmount(income > 0 ? balance.left : balance.expenses, 'ARS', 0)}
+        </strong>
+        {income > 0 && <span className="finance-card__sub">de {formatAmount(balance.income, 'ARS', 0)} que entraron</span>}
       </div>
-      <div className="finance-salary-use__total">
-        <div className="finance-figure finance-figure--xl">{formatMoney(net)}</div>
-        <div className="finance-card__sub">neto{salary.employers.length > 0 ? ` · ${salary.employers.join(' y ')}` : ''}</div>
+      <div className="finance-kpis">
+        <Kpi label="Ingresos" value={formatAmount(balance.income, 'ARS', 0)} note={Number(balance.salary) > 0 ? `Sueldo ${formatAmount(balance.salary, 'ARS', 0)}` : 'Sin sueldo cargado'} />
+        <Kpi
+          label="Gastos"
+          value={formatAmount(balance.expenses, 'ARS', 0)}
+          note={change === null ? (balance.spentPercent === null ? '' : `${formatPercent(balance.spentPercent, 0)} del ingreso`) : `${formatSignedPercent(change, 0)} que el mes pasado`}
+          tone={change === null ? undefined : change > 0 ? 'up' : 'down'}
+        />
+        <Kpi label="Ahorro" value={formatAmount(balance.saved, 'ARS', 0)} note={balance.savedPercent === null ? '' : `${formatPercent(balance.savedPercent, 0)} del ingreso`} />
       </div>
     </div>
-    <div className="finance-stack" role="img" aria-label={salary.segments.map((segment) => `${SEGMENT_LABELS[segment.key]} ${formatPercent(segment.percent)}`).join(', ')}>
-      {salary.segments.filter((segment) => Number(segment.amount) > 0).map((segment) => (
-        segment.key === 'unregistered'
-          ? <div key={segment.key} className="finance-stack__rest" />
-          : <div key={segment.key} className={`finance-stack__part finance-swatch--${segment.key}`} style={{ width: `${segment.percent ?? 0}%` }} />
-      ))}
-    </div>
-    {salary.exceeded && <p className="finance-warn-text">Lo registrado supera el sueldo de {formatMonthName(salary.period)}.</p>}
-    <div className="finance-salary-use__legend">
-      {salary.segments.map((segment) => {
-        const amount = Number(segment.amount)
-        const label = segment.key === 'savings' && bought !== '—' ? `Ahorro (${bought})` : SEGMENT_LABELS[segment.key]
-        return <div key={segment.key} className={`finance-legend-item${segment.key === 'services' && amount === 0 ? ' finance-legend-item--empty' : ''}`}>
-          <span className="finance-legend-item__label"><i className={`finance-swatch finance-swatch--${segment.key}`} aria-hidden="true" />{label}</span>
-          <strong className="finance-legend-item__amount">{segment.key === 'services' && amount === 0 ? '—' : formatAmount(segment.amount, salary.currency)}</strong>
-          <span className="finance-legend-item__caption">{segmentCaption(segment.key, amount, segment.percent)}</span>
-        </div>
+    {income > 0 && <>
+      <div className="finance-stack" role="img" aria-label={`Gastos ${formatPercent(share(balance.expenses, balance.income), 0)}, ahorro ${formatPercent(share(balance.saved, balance.income), 0)}`}>
+        <span className="finance-stack__part finance-stack__part--spent" style={{ width: `${Math.min(100, share(balance.expenses, balance.income))}%` }} />
+        <span className="finance-stack__part finance-stack__part--saved" style={{ width: `${Math.min(100, share(balance.saved, balance.income))}%` }} />
+      </div>
+      <div className="finance-legend">
+        <span><i className="finance-swatch finance-swatch--spent" />Gastos {formatPercent(share(balance.expenses, balance.income), 0)}</span>
+        <span><i className="finance-swatch finance-swatch--saved" />Ahorro {formatPercent(share(balance.saved, balance.income), 0)}</span>
+        <span><i className="finance-swatch finance-swatch--left" />Queda {formatPercent(Math.max(0, share(balance.left, balance.income)), 0)}</span>
+      </div>
+    </>}
+    {others.map((other) => <OtherCurrency key={other.currency} balance={other} />)}
+  </section>
+}
+
+function OtherCurrency({ balance }: { balance: Balance }) {
+  const money = (amount: string) => formatAmount(amount, balance.currency, 0)
+  return <p className="finance-balance__other">
+    <span className="finance-mono-label">En dólares</span>
+    Entraron {money(balance.income)} · gastaste {money(balance.expenses)} · ahorraste {money(balance.saved)} · queda {money(balance.left)}
+  </p>
+}
+
+function Kpi({ label, value, note, tone }: { label: string; value: string; note: string; tone?: 'up' | 'down' }) {
+  return <div className="finance-kpi">
+    <span className="finance-kpi__label">{label}</span>
+    <strong className="finance-kpi__value">{value}</strong>
+    {note && <span className={`finance-kpi__note${tone ? ` finance-kpi__note--${tone}` : ''}`}>
+      {tone === 'up' && <TrendingUp size={13} aria-hidden="true" />}
+      {tone === 'down' && <TrendingDown size={13} aria-hidden="true" />}
+      {note}
+    </span>}
+  </div>
+}
+
+const STATUS_TEXT: Record<Commitment['status'], string> = { paid: 'Pagado', pending: 'Pendiente', late: 'Atrasado' }
+
+function CommitmentsCard({ view, entry, onTab }: { view: FinanceOverview; entry: FinanceEntryApi | null; onTab: (tab: FinanceTab) => void }) {
+  const { commitments } = view
+  const total = commitments.paidCount + commitments.pendingCount
+  const pay = (item: Commitment) => {
+    if (item.kind === 'service') entry?.openEntry({ kind: 'service-payment', prefill: { serviceId: item.id, month: view.month } })
+    else if (item.kind === 'card') entry?.openEntry({ kind: 'card-payment', prefill: { cardId: item.id, month: view.month } })
+    else entry?.openEntry({ kind: 'loan-payment', prefill: { loanId: item.id } })
+  }
+  return <FinanceCard
+    className="finance-span-7"
+    title="Pagos del mes"
+    sub={total === 0 ? 'Sin servicios, tarjetas ni préstamos este mes.' : `Pagaste ${commitments.paidCount} de ${total}`}
+    action={<button type="button" className="finance-link-button" onClick={() => onTab('payments')}>Ir a Pagos</button>}
+  >
+    {total > 0 && <>
+      <FinanceBar percent={(commitments.paidCount * 100) / total} label={`Pagaste ${commitments.paidCount} de ${total}`} />
+      <div className="finance-split">
+        <div><span className="finance-mono-label">Pagado</span><strong><MoneyText list={commitments.paid} empty="$ 0" /></strong></div>
+        <div><span className="finance-mono-label">Falta pagar</span><strong className={commitments.pendingCount > 0 ? 'finance-warn-text' : ''}><MoneyText list={commitments.pending} empty="Nada" /></strong></div>
+      </div>
+      <ul className="finance-commitments" role="list">
+        {commitments.items.map((item) => <li key={`${item.kind}:${item.id}:${item.currency}`} className="finance-commitment">
+          <span className="finance-commitment__main">
+            <span className="finance-commitment__title">{item.title}</span>
+            <span className="finance-commitment__sub">{item.kind === 'service' ? 'Servicio' : item.kind === 'card' ? 'Tarjeta' : 'Préstamo'} · {item.subtitle}</span>
+          </span>
+          <span className="finance-commitment__amount">{item.amount ? formatAmount(item.amount, item.currency, 0) : '—'}</span>
+          {item.status === 'paid'
+            ? <FinancePill tone="paid">{STATUS_TEXT.paid}</FinancePill>
+            : <button type="button" className={`finance-button finance-button--small ${item.status === 'late' ? 'finance-button--warn' : 'finance-button--outline'}`} onClick={() => pay(item)}>
+              {item.status === 'late' ? 'Atrasado · Pagar' : 'Pagar'}
+            </button>}
+        </li>)}
+      </ul>
+    </>}
+  </FinanceCard>
+}
+
+function PaceCard({ view }: { view: FinanceOverview }) {
+  const pace = view.pace
+  return <FinanceCard className="finance-span-5" title="Ritmo del mes" sub={pace ? `Día ${pace.daysElapsed} de ${pace.daysInMonth}` : undefined}>
+    {!pace ? <p className="finance-empty">Sin gastos en pesos este mes.</p> : <>
+      <FinanceBar percent={(pace.daysElapsed * 100) / pace.daysInMonth} tone="muted" label={`Día ${pace.daysElapsed} de ${pace.daysInMonth}`} />
+      <dl className="finance-facts">
+        <div><dt>Gasto por día</dt><dd>{formatAmount(pace.dailyAverage, 'ARS', 0)}</dd></div>
+        {pace.projected && <div><dt>Si seguís así, el mes cierra en</dt><dd>{formatAmount(pace.projected, 'ARS', 0)}</dd></div>}
+        <div><dt>Gastos cargados</dt><dd>{pace.expenseCount}</dd></div>
+        {pace.biggest && <div><dt>El más grande</dt><dd>{pace.biggest.name} · {formatAmount(pace.biggest.amount, 'ARS', 0)}</dd></div>}
+      </dl>
+    </>}
+  </FinanceCard>
+}
+
+function budgetTone(row: CategoryRow): 'teal' | 'warn' | 'alert' {
+  if (!row.budget) return 'teal'
+  return row.budget.status === 'over' ? 'alert' : row.budget.status === 'near' ? 'warn' : 'teal'
+}
+
+function CategoriesCard({ rows }: { rows: CategoryRow[] }) {
+  const entry = useFinanceEntry()
+  return <FinanceCard
+    className="finance-span-7"
+    title="En qué se fue"
+    sub="Por categoría, con su presupuesto si tiene."
+    action={<button type="button" className="finance-link-button" onClick={() => entry?.openEntry({ kind: 'budget' })}>Nuevo presupuesto</button>}
+  >
+    {rows.length === 0 ? <p className="finance-empty">Sin gastos este mes.</p> : <ul className="finance-categories" role="list">
+      {rows.map((row) => {
+        const budget = row.budget
+        return <li key={`${row.currency}:${row.categoryId ?? 'none'}`} className="finance-category">
+          <div className="finance-category__head">
+            <span className="finance-category__name">{row.name}<span className="finance-muted"> · {plural(row.count, 'gasto')}</span></span>
+            <span className="finance-category__amount">{formatAmount(row.amount, row.currency, 0)}<span className="finance-muted"> {formatPercent(row.percent, 0)}</span></span>
+          </div>
+          <FinanceBar percent={budget ? budget.percent : row.percent} tone={budgetTone(row)} label={budget ? `${formatPercent(budget.percent, 0)} del presupuesto` : `${formatPercent(row.percent, 0)} de los gastos`} />
+          {budget && <span className={`finance-category__budget finance-category__budget--${budget.status}`}>
+            {budget.status === 'over'
+              ? `Te pasaste ${formatAmount(String(-Number(budget.remaining)), budget.currency, 0)} del presupuesto de ${formatAmount(budget.budget, budget.currency, 0)}`
+              : `Quedan ${formatAmount(budget.remaining, budget.currency, 0)} de ${formatAmount(budget.budget, budget.currency, 0)}`}
+          </span>}
+        </li>
       })}
+    </ul>}
+  </FinanceCard>
+}
+
+/** Six months of income and expenses, in pesos. */
+function HistoryCard({ points, current }: { points: HistoryPoint[]; current: string }) {
+  const max = Math.max(1, ...points.flatMap((point) => [Number(point.income), Number(point.expenses)]))
+  const average = points.filter((point) => Number(point.expenses) > 0)
+  const mean = average.length > 0 ? average.reduce((sum, point) => sum + Number(point.expenses), 0) / average.length : 0
+  return <FinanceCard className="finance-span-5" title="Últimos 6 meses" sub={mean > 0 ? `Gastás ${formatAmount(String(mean), 'ARS', 0)} por mes en promedio` : 'En pesos'}>
+    <div className="finance-chart" role="img" aria-label={points.map((point) => `${point.label}: entró ${formatAmount(point.income, 'ARS', 0)}, gastaste ${formatAmount(point.expenses, 'ARS', 0)}`).join('; ')}>
+      {points.map((point) => <div key={point.month} className={`finance-chart__month${point.month === current ? ' finance-chart__month--current' : ''}`}>
+        <div className="finance-chart__bars">
+          <span className="finance-chart__bar finance-chart__bar--income" style={{ height: `${(Number(point.income) * 100) / max}%` }} title={`Ingresos ${formatAmount(point.income, 'ARS', 0)}`} />
+          <span className="finance-chart__bar finance-chart__bar--expenses" style={{ height: `${(Number(point.expenses) * 100) / max}%` }} title={`Gastos ${formatAmount(point.expenses, 'ARS', 0)}`} />
+        </div>
+        <span className="finance-chart__label">{point.label}</span>
+      </div>)}
     </div>
-  </section>
-}
-
-function shiftPeriod(period: string, offset: number): string {
-  const [year, month] = period.split('-').map(Number)
-  const date = new Date(year, month - 1 + offset, 1)
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
-}
-
-// ---------------------------------------------------------------------------
-// Month figures
-
-function ExpensesCard({ data }: { data: FinanceOverview }) {
-  const { expenses } = data
-  return <section className="finance-card finance-card--compact" aria-label="Gastos del mes">
-    <span className="finance-card__sub">Gastos del mes</span>
-    <span className="finance-figure finance-figure--lg">{formatMoneyList(expenses.totals)}</span>
-    <span className="finance-card__sub">{plural(expenses.count, 'gasto')} · lo de tarjeta cuenta en el mes en que vence el resumen</span>
-    <div className="finance-card__foot">
-      {expenses.cardUnpaidCount === 0
-        ? <span className="finance-check"><Check size={16} aria-hidden="true" />Nada en tarjeta esperando resumen</span>
-        : <span className="finance-warn-text">{plural(expenses.cardUnpaidCount, 'gasto')} en tarjeta esperando su resumen · {formatMoneyList(expenses.cardUnpaid)}</span>}
+    <div className="finance-legend">
+      <span><i className="finance-swatch finance-swatch--income" />Ingresos</span>
+      <span><i className="finance-swatch finance-swatch--spent" />Gastos</span>
     </div>
-  </section>
+  </FinanceCard>
 }
 
-function SavedCard({ data, officialSell }: { data: FinanceOverview; officialSell: number | null }) {
-  const { saved } = data
-  const contributions = saved.contributions.map((money) => `+ ${formatMoney(money)}`).join(' · ')
-  const cost = formatMoneyList(saved.cost, 0)
-  const boughtCurrency = saved.bought[0]?.currency
-  return <section className="finance-card finance-card--compact" aria-label="Ahorrado este mes">
-    <span className="finance-card__sub">Ahorrado este mes</span>
-    <span className={`finance-figure finance-figure--lg${contributions ? ' finance-figure--teal' : ''}`}>{contributions || '—'}</span>
-    <span className="finance-card__sub">
-      {saved.cost.length > 0
-        ? <>Costó {cost}{saved.rate && ` · ${formatAmount(saved.rate, saved.cost[0].currency, 0)} por ${boughtCurrency === 'USD' ? 'dólar' : boughtCurrency}`}{saved.rate && officialSell !== null && boughtCurrency === 'USD' && ` (oficial ${formatAmount(officialSell, 'ARS', 0)})`}</>
-        : contributions ? 'Aportes a las reservas' : 'No hubo aportes este mes'}
-      {saved.withdrawals.length > 0 && ` · Retirado: ${formatMoneyList(saved.withdrawals, 0)}`}
-    </span>
-    {saved.reserves.length > 0 && <div className="finance-card__foot finance-card__foot--list">
-      {saved.reserves.map((reserve) => <div key={reserve.id} className="finance-split-row">
-        <span>{reserve.name}</span>
-        <strong>{formatAmount(reserve.balance, reserve.currency)}</strong>
+function DebtsCard({ view, onTab }: { view: FinanceOverview; onTab: (tab: FinanceTab) => void }) {
+  const { debts } = view
+  const nothing = debts.cards.length === 0 && debts.loans.length === 0
+  return <FinanceCard className="finance-span-6" title="Lo que debés" sub={nothing ? undefined : debts.cardTotal.length > 0 ? `En tarjetas: ${formatMoneyList(debts.cardTotal, 0)}` : undefined} action={<button type="button" className="finance-link-button" onClick={() => onTab('payments')}>Ver Pagos</button>}>
+    {nothing ? <p className="finance-empty">Sin cuotas pendientes.</p> : <>
+      {debts.cards.map((card) => <div key={card.id} className="finance-debt">
+        <span className="finance-debt__name">{card.name}</span>
+        <span className="finance-debt__detail">{plural(card.installmentsLeft, 'cuota')} · hasta {card.lastMonth}</span>
+        <strong><MoneyText list={card.remaining} /></strong>
+      </div>)}
+      {debts.upcoming.some((due) => due.amounts.length > 0) && <div className="finance-upcoming">
+        <span className="finance-mono-label">Cuotas de tarjeta que vienen</span>
+        {debts.upcoming.map((due) => <div key={due.month} className="finance-upcoming__row"><span>{due.label}</span><strong><MoneyText list={due.amounts} empty="—" /></strong></div>)}
+      </div>}
+      {debts.loans.map((loan) => <div key={loan.id} className="finance-loan">
+        <div className="finance-loan__head"><span>{loan.name}</span><span className="finance-muted">{loan.paidCount}/{loan.count} cuotas · pagaste {formatAmount(loan.totalPaid, loan.currency, 0)}</span></div>
+        <FinanceBar percent={loan.percent} label={`${loan.paidCount} de ${loan.count} cuotas`} />
+      </div>)}
+    </>}
+  </FinanceCard>
+}
+
+function SavingsCard({ view, onTab }: { view: FinanceOverview; onTab: (tab: FinanceTab) => void }) {
+  return <FinanceCard className="finance-span-6" title="Ahorro" action={<button type="button" className="finance-link-button" onClick={() => onTab('savings')}>Ver Ahorro</button>}>
+    {view.savings.length === 0 ? <p className="finance-empty">Sin reservas de ahorro.</p> : <div className="finance-split">
+      {view.savings.map((total) => <div key={total.currency}>
+        <span className="finance-mono-label">{total.currency === 'USD' ? 'En dólares' : 'En pesos'}</span>
+        <strong className="finance-figure">{formatAmount(total.balance, total.currency, 0)}</strong>
+        <span className={`finance-card__sub${Number(total.savedThisMonth) > 0 ? ' finance-teal' : ''}`}>
+          {Number(total.savedThisMonth) === 0 ? 'Nada en el mes' : `${Number(total.savedThisMonth) > 0 ? '+' : ''}${formatAmount(total.savedThisMonth, total.currency, 0)} en el mes`}
+        </span>
       </div>)}
     </div>}
-  </section>
-}
-
-// ---------------------------------------------------------------------------
-// Categories
-
-function CategoriesCard({ data, month }: { data: FinanceOverview; month: string }) {
-  const { categories, largest } = data
-  const previous = formatMonthName(categories.previousMonth)
-  return <section className="finance-card finance-categories" aria-labelledby="finance-categories-title">
-    <div className="finance-card__head finance-card__head--baseline">
-      <h2 id="finance-categories-title">En qué se gastó</h2>
-      {!categories.hasPrevious && categories.rows.length > 0 && <span className="finance-card__sub">{capitalize(previous)} sin datos para comparar</span>}
-    </div>
-    {categories.rows.length === 0 && <p className="finance-empty">No hay gastos en {formatMonthName(month)}.</p>}
-    {categories.rows.map((row) => <div key={`${row.filter}-${row.currency}`} className="finance-bar-row">
-      <div className="finance-bar-row__head">
-        <span>{row.name}<span className="finance-muted"> · {plural(row.count, 'gasto')}{categories.hasPrevious && row.variation !== null && ` · ${formatSignedPercent(row.variation)} contra ${previous}`}</span></span>
-        <span className="finance-bar-row__value">
-          {formatAmount(row.amount, row.currency)}
-          <span className="finance-muted"> {formatPercent(row.percent, 0)}</span>
-        </span>
-      </div>
-      <div className="finance-bar"><div className={`finance-bar__fill${row.uncategorized ? ' finance-bar__fill--hatch' : ''}`} style={{ width: `${row.percent ?? 0}%` }} /></div>
-      {row.description && <span className="finance-bar-row__note">{row.description}</span>}
-    </div>)}
-    {largest.length > 0 && <div className="finance-largest">
-      <span className="finance-mono-label">Los más grandes</span>
-      {largest.map((row) => <div key={row.id} className="finance-split-row finance-split-row--padded">
-        <span>{row.description}<span className="finance-muted"> · {row.accountName}</span></span>
-        <strong className="finance-medium">{formatAmount(row.amount, row.currency)}</strong>
-      </div>)}
-    </div>}
-  </section>
-}
-
-function capitalize(text: string): string {
-  return text.charAt(0).toUpperCase() + text.slice(1)
-}
-
-// ---------------------------------------------------------------------------
-// Cards paid
-
-function statementStatus(statement: StatementRow): { text: string; warn: boolean; check: boolean } {
-  const difference = formatAmount(statement.difference, statement.currency)
-  if (statement.check === 'missing') return { text: `Faltan ${difference} en líneas cargadas`, warn: true, check: false }
-  if (statement.check === 'extra') return { text: `Las líneas suman ${difference} más que el total`, warn: true, check: false }
-  if (statement.discarded.length > 0) {
-    return { text: `Incluye ${formatMoneyList(statement.discarded, 0)} descartado (${statement.discardedDescriptions.join(', ')})`, warn: false, check: false }
-  }
-  return { text: statement.lineCount === 1 ? 'Cuadra con su línea' : `Cuadra con sus ${statement.lineCount} líneas`, warn: false, check: true }
-}
-
-function CardsPaidCard({ data, month }: { data: FinanceOverview; month: string }) {
-  const entry = useFinanceEntry()
-  const { cards } = data
-  const { installments } = cards
-  return <section className="finance-card finance-cards-paid" aria-labelledby="finance-cards-title">
-    <div className="finance-card__head finance-card__head--baseline">
-      <h2 id="finance-cards-title">Tarjetas pagadas</h2>
-      <span className="finance-strong">{formatMoneyList(cards.totals)}<span className="finance-card__sub"> · {plural(cards.statements.length, 'resumen', 'resúmenes')}</span></span>
-    </div>
-    {cards.statements.length === 0 && <p className="finance-empty">No vence ningún resumen de tarjeta en {formatMonthName(month)}.{entry && <> <button type="button" className="finance-link-button" onClick={() => entry.openEntry({ kind: 'card-statement' })}>Cargar un resumen</button></>}</p>}
-    <div className="finance-list">
-      {cards.statements.map((statement) => {
-        const status = statementStatus(statement)
-        return <button key={statement.id} type="button" className="finance-statement finance-statement--button" aria-label={`Editar el resumen ${statement.name}`} onClick={() => entry?.openEntry({ kind: 'card-statement', id: statement.id })}>
-          <span className="finance-badge">{statement.badge}</span>
-          <span className="finance-statement__main">
-            <span className="finance-statement__name">{statement.name}</span>
-            <span className={`finance-statement__status${status.warn ? ' finance-warn-text' : ''}`}>{status.check && <Check size={14} aria-hidden="true" className="finance-teal" />}{status.text}</span>
-          </span>
-          <span className="finance-statement__amount">
-            <strong>{formatAmount(statement.amount, statement.currency)}</strong>
-            <span className="finance-card__sub">vence {formatShortDate(statement.dueDate)}</span>
-          </span>
-        </button>
-      })}
-    </div>
-    <p className="finance-card__sub">
-      {installments.pendingCount === 0
-        ? 'Cuotas: ninguna pendiente registrada.'
-        : `Cuotas: ${installments.pendingCount} ${installments.pendingCount === 1 ? 'pendiente' : 'pendientes'} por ${formatMoneyList(installments.remaining, 0)}${installments.nextDueDate ? ` · la próxima vence el ${formatShortDate(installments.nextDueDate)}` : ''}.`}
-    </p>
-  </section>
-}
-
-// ---------------------------------------------------------------------------
-// Services
-
-const SERVICE_STATUS: Record<ServiceStatus, string> = { paid: 'Pagado', pending: 'Pendiente', 'not-applicable': 'No corresponde este mes' }
-const HISTORY_STATUS: Record<ServiceStatus | 'missing', string> = { ...SERVICE_STATUS, 'not-applicable': 'No corresponde', missing: 'Sin registro' }
-
-function ServicesCard({ data, month }: { data: FinanceOverview; month: string }) {
-  const entry = useFinanceEntry()
-  const { services } = data
-  const [showHistory, setShowHistory] = useState(false)
-  return <section className="finance-card finance-services" aria-labelledby="finance-services-title">
-    <div className="finance-card__head finance-card__head--baseline">
-      <h2 id="finance-services-title">Servicios de {formatMonthName(month)}</h2>
-      {services.rows.length > 0 && <span className={services.pendingCount > 0 ? 'finance-warn-text finance-small' : 'finance-card__sub'}>{services.pendingCount > 0 ? `${services.pendingCount} sin pago` : 'Todos pagados'}</span>}
-    </div>
-    {services.rows.length === 0 && <p className="finance-empty">No hay servicios activos.{entry && <> <button type="button" className="finance-link-button" onClick={() => entry.openEntry({ kind: 'service' })}>Agregar uno</button></>}</p>}
-    {services.rows.map((row) => <div key={row.serviceId} className="finance-service">
-      <div className="finance-service__row">
-        <span className="finance-service__main">
-          <span className="finance-service__name">{row.name}</span>
-          <span className="finance-card__sub">{[row.provider, row.paid ? `pagado ${formatAmount(row.paid, row.currency, 0)}` : `esperado ${formatAmount(row.expected, row.currency, 0)}`].filter(Boolean).join(' · ')}</span>
-        </span>
-        <span className="finance-service__side">
-          <span className={`finance-pill finance-pill--${row.status}`}>{SERVICE_STATUS[row.status]}</span>
-          {entry && row.status === 'pending' && <button type="button" className="finance-button finance-button--outline finance-button--small" onClick={() => entry.openEntry({ kind: 'service-payment', prefill: { serviceId: row.serviceId } })}>Pagar</button>}
-        </span>
-      </div>
-      {row.note && <p className="finance-service__note">{row.note}</p>}
-    </div>)}
-    {services.rows.length > 0 && <button type="button" className="finance-link-button" aria-expanded={showHistory} onClick={() => setShowHistory((value) => !value)}>{showHistory ? 'Ocultar historial de servicios' : 'Ver historial de servicios'}</button>}
-    {showHistory && <div className="finance-table-scroll">
-      <table className="finance-history">
-        <caption className="finance-visually-hidden">Estado de cada servicio en los últimos meses</caption>
-        <thead><tr><th scope="col">Servicio</th>{services.historyPeriods.map((period) => <th key={period} scope="col">{formatShortMonth(period)}</th>)}</tr></thead>
-        <tbody>{services.rows.map((row) => <tr key={row.serviceId}>
-          <th scope="row">{row.name}</th>
-          {row.history.map((status, index) => <td key={services.historyPeriods[index]}><span className={`finance-history__dot finance-history__dot--${status}`} title={HISTORY_STATUS[status]} /><span className="finance-visually-hidden">{HISTORY_STATUS[status]}</span></td>)}
-        </tr>)}</tbody>
-      </table>
-    </div>}
-  </section>
-}
-
-// ---------------------------------------------------------------------------
-// Latest movements
-
-function LatestCard({ data, month, onShowMovements }: { data: FinanceOverview; month: string; onShowMovements: () => void }) {
-  return <section className="finance-card finance-latest" aria-labelledby="finance-latest-title">
-    <div className="finance-card__head finance-card__head--baseline">
-      <h2 id="finance-latest-title">Últimos movimientos</h2>
-      {data.movementCount > 0 && <button type="button" className="finance-link-button" onClick={onShowMovements}>Ver {data.movementCount === 1 ? 'el movimiento' : `los ${data.movementCount}`} →</button>}
-    </div>
-    {data.latest.length === 0 && <p className="finance-empty">No hay movimientos en {formatMonthName(month)}.</p>}
-    <div className="finance-list">
-      {data.latest.map((row) => {
-        const tone = movementTone(row)
-        return <div key={row.id} className="finance-movement">
-          <span className="finance-movement__date">{formatShortDate(row.purchaseDate)}</span>
-          <span className="finance-movement__main">
-            <span className={`finance-movement__desc${tone === 'off' ? ' finance-tone--off' : ''}`}>{row.description}</span>
-            <span className={row.flagged ? 'finance-movement__meta finance-warn-text' : 'finance-movement__meta'}>{movementMeta(row, true)}</span>
-          </span>
-          <span className="finance-movement__amount">
-            <strong className={`finance-tone--${tone}`}>{movementAmount(row)}</strong>
-            {row.exchange && <span className="finance-card__sub">{formatAmount(row.amount, row.currency)}</span>}
-          </span>
-        </div>
-      })}
-    </div>
-  </section>
+  </FinanceCard>
 }

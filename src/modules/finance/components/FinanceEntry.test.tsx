@@ -1,24 +1,24 @@
 // @vitest-environment happy-dom
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import type { NotiaLibrary } from '../../../types/notia'
 import type { EntryForm } from '../types/financeEntry'
-import type { FinanceMovements, FinanceOverview } from '../types/financeScreen'
+import { manage, movements, overview, payments, savings } from './financeTestData'
 import { FinanceScreen } from './FinanceScreen'
 
 const service = vi.hoisted(() => ({
   getFinanceOverview: vi.fn(),
+  getFinancePayments: vi.fn(),
   getFinanceMovements: vi.fn(),
-  getFinanceProducts: vi.fn(),
-  getFinanceSalarySavings: vi.fn(),
+  searchFinanceHistory: vi.fn(),
+  getFinanceSavings: vi.fn(),
+  listFinanceDevTables: vi.fn(() => Promise.resolve([])),
 }))
 const entry = vi.hoisted(() => ({
   getEntryMenu: vi.fn(),
   getEntryForm: vi.fn(),
   applyEntry: vi.fn(),
   getManage: vi.fn(),
-  resolveReview: vi.fn(),
-  searchHistory: vi.fn(),
   exportFinance: vi.fn(),
   newRequestId: vi.fn(() => 'pedido-1'),
 }))
@@ -26,140 +26,166 @@ const events = vi.hoisted(() => ({ notifyFinanceDataChanged: vi.fn(), subscribeT
 vi.mock('../services/financeService', () => service)
 vi.mock('../services/financeEntryService', () => entry)
 vi.mock('../services/financeDataEvents', () => events)
-vi.mock('../services/dollarQuotesService', () => ({ getDollarQuotes: () => Promise.resolve([]) }))
 vi.mock('../../../services/chat/chatComposerRequests', () => ({ requestChatComposerText: vi.fn() }))
 vi.mock('../../../store/hooks', () => ({ useAppDispatch: () => vi.fn() }))
-// El escritorio: la medición no existe en happy-dom.
+// The desktop: happy-dom does not measure.
 vi.mock('../../../hooks/useNarrowContainer', () => ({ useNarrowContainer: () => false }))
 
 const library = { id: 'library-1' } as NotiaLibrary
-const pesos = (amount: string) => ({ amount, currency: 'ARS' })
 
-const overview = {
-  review: [{ id: 'caso-1', label: 'Producto', parts: [{ text: '¿Es la misma leche?', strong: false }], actions: [
-    { label: 'Sí, unirlos', prompt: 'Sí.', primary: true, optionId: 'merge' },
-    { label: 'Responder en el chat', prompt: 'Sobre la duda…', primary: false, optionId: null },
-  ] }],
-  salary: null,
-  balance: { rows: [{ currency: 'ARS', income: '5000.00', salary: '0.00', otherIncome: '5000.00', expenses: '1500.50', savings: '0.00', left: '3499.50' }], otherIncomes: [] },
-  budgets: [{ id: 'b1', categoryId: 'c1', categoryName: 'Supermercado', currency: 'ARS', budget: '1000.00', spent: '1500.50', remaining: '-500.50', percent: 150.1, status: 'over' }],
-  loans: { rows: [{ id: 'auto', name: 'Auto', lender: null, currency: 'ARS', number: 1, expected: '1000.00', paid: null, status: 'pending', paidCount: 0, installmentCount: 3, remaining: '3000.00', nextDueDate: '2026-11-19' }], paid: [], pendingCount: 1 },
-  expenses: { totals: [pesos('1500.50')], count: 1, cardUnpaid: [], cardUnpaidCount: 0 },
-  saved: { contributions: [], reserves: [], bought: [], cost: [], withdrawals: [], rate: null },
-  categories: { rows: [], hasPrevious: false, previousMonth: '2026-10', categorizePrompt: null, uncategorizedCount: 0 },
-  cards: { statements: [], totals: [], installments: { pendingCount: 0, remaining: [], nextDueDate: null } },
-  services: { rows: [{ serviceId: 's1', name: 'Internet', provider: null, currency: 'ARS', expected: '15000.00', paid: null, status: 'pending', note: null, history: [] }], pendingCount: 1, historyPeriods: [] },
-  largest: [],
-  latest: [],
-  movementCount: 1,
-} as unknown as FinanceOverview
+function form(partial: Partial<EntryForm>): EntryForm {
+  return { kind: 'expense', id: null, title: 'Nuevo gasto', intro: null, submit: 'Guardar', fields: [], delete: null, ...partial }
+}
 
-const movements = {
-  month: '2026-11', filter: 'all', chips: [{ id: 'all', label: 'Todos', count: 1 }],
-  summary: { expenseCount: 1, expenseTotals: [pesos('1500.50')], exchangeCount: 0, incomeCount: 0 },
-  groups: [{ accountId: 'a1', badge: 'GA', name: 'Galicia', kindLabel: 'Banco', statement: null, totals: [pesos('1500.50')], savings: [], rows: [{
-    id: 'm1', kind: 'expense', status: 'confirmed', description: 'Coto', purchaseDate: '2026-11-18', effectiveDate: '2026-11-18', countsOnStatementDue: false,
-    accountId: 'a1', accountName: 'Galicia', categoryName: 'Supermercado', uncategorized: false, serviceName: null, origin: 'Carga manual', viaTelegram: false,
-    amount: '1500.50', currency: 'ARS', exchange: null, flagged: false, note: null,
-  }] }],
-  changePrompts: {},
-} as unknown as FinanceMovements
-
-const expenseForm: EntryForm = {
-  kind: 'expense', id: null, title: 'Nuevo gasto', intro: 'Con tarjeta queda a pagar.', submit: 'Guardar gasto', delete: null, actions: [],
+const expenseForm = form({
   fields: [
-    { key: 'amount', label: 'Importe', type: 'money', value: '', required: true },
-    { key: 'accountId', label: 'Cuenta', type: 'select', value: '', required: true, options: [{ value: 'a1', label: 'Galicia · banco · ARS' }] },
-    { key: 'effectiveDate', label: 'Fecha', type: 'date', value: '2026-11-18', required: true },
-    { key: 'description', label: 'Descripción', type: 'text', value: '', required: true },
+    { key: 'name', label: '¿En qué?', type: 'text', value: '', required: true },
+    { key: 'amount', label: 'Importe', type: 'money', value: '', required: true, currency: { key: 'currency', value: 'ARS', locked: false } },
+    { key: 'categoryId', label: 'Categoría', type: 'select', value: '', required: true, options: [{ value: 'category-transport', label: 'Transporte' }] },
   ],
+})
+
+async function flush() {
+  await act(async () => { await Promise.resolve() })
+  await act(async () => { await Promise.resolve() })
 }
 
-function setUp() {
+beforeEach(() => {
   service.getFinanceOverview.mockResolvedValue(overview)
+  service.getFinancePayments.mockResolvedValue(payments)
   service.getFinanceMovements.mockResolvedValue(movements)
-  entry.getEntryMenu.mockResolvedValue([{ title: 'Del día a día', items: [{ kind: 'expense', label: 'Gasto', description: 'Algo que pagaste.' }] }])
-  entry.getEntryForm.mockResolvedValue(expenseForm)
-}
+  service.getFinanceSavings.mockResolvedValue(savings)
+  entry.getManage.mockResolvedValue(manage)
+  entry.getEntryMenu.mockResolvedValue([{ title: 'Del día a día', items: [{ kind: 'expense', label: 'Gasto', description: 'Nombre, importe y categoría' }] }])
+})
 
-describe('Finanzas cargado a mano', () => {
-  afterEach(() => {
-    cleanup()
-    vi.clearAllMocks()
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+})
+
+describe('Finanzas', () => {
+  it('has Resumen, Pagos, Movimientos, Ahorro and Administrar, and nothing of tickets or products', async () => {
+    render(<FinanceScreen library={library} />)
+    await flush()
+    const tabs = screen.getAllByRole('tab').map((tab) => tab.textContent)
+    expect(tabs).toEqual(['Resumen', 'Pagos', 'Movimientos', 'Ahorro', 'Administrar', 'Dev'])
+    expect(screen.queryByText(/ticket|producto/i)).toBeNull()
   })
 
-  it('carga un gasto desde «Cargar»: muestra lo que falta y avisa cuando quedó guardado', async () => {
-    setUp()
-    entry.applyEntry
-      .mockResolvedValueOnce({ ok: false, message: 'Completá «Descripción».', errors: { description: 'Completá «Descripción».' }, savedId: null, duplicate: false })
-      .mockResolvedValueOnce({ ok: true, message: 'Gasto guardado: $ 1.500,50.', errors: {}, savedId: 'm2', duplicate: false })
+  it('tells what is left, what is missing to pay and how the budgets go', async () => {
     render(<FinanceScreen library={library} />)
-    await act(async () => undefined)
+    await flush()
+    expect(screen.getByText('Te queda')).toBeTruthy()
+    expect(screen.getByText('$ 1.000.000')).toBeTruthy()
+    expect(screen.getByText('Pagaste 1 de 3')).toBeTruthy()
+    expect(screen.getByText(/Te pasaste \$ 30\.000 del presupuesto/)).toBeTruthy()
+    expect(screen.getByText(/que el mes pasado/)).toBeTruthy()
+    // Paying a service from the overview opens its form with the service.
+    entry.getEntryForm.mockResolvedValue(form({ kind: 'service-payment', title: 'Pagar un servicio' }))
+    const internet = screen.getByText('Internet').closest('li') as HTMLElement
+    fireEvent.click(within(internet).getByRole('button', { name: 'Pagar' }))
+    await flush()
+    expect(entry.getEntryForm).toHaveBeenCalledWith(library, { kind: 'service-payment', prefill: { serviceId: 's1', month: '2026-11' } })
+  })
 
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cargar' })) })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Gasto/ })) })
-    expect(entry.getEntryForm).toHaveBeenCalledWith(library, { kind: 'expense' })
+  it('pays a card installment with one touch and can undo it', async () => {
+    entry.applyEntry.mockResolvedValueOnce({ ok: true, message: 'Cuota de Visa pagada: $ 60.000.', errors: {}, savedId: 'm9', undo: { kind: 'movements', id: null, action: 'delete', values: { ids: ['m9'] } }, duplicate: false })
+    render(<FinanceScreen library={library} />)
+    await flush()
+    fireEvent.click(screen.getByRole('tab', { name: 'Pagos' }))
+    await flush()
+    const fridge = screen.getByText('Heladera', { selector: '.finance-pay-row__name' }).closest('li') as HTMLElement
+    fireEvent.click(within(fridge).getByRole('button', { name: 'Pagar' }))
+    await flush()
+    expect(entry.applyEntry).toHaveBeenCalledWith(library, { kind: 'card-payment', id: null, values: { cardId: 'c1', installments: ['p1:3'] }, requestId: 'pedido-1' })
+    expect(screen.getByText('Cuota de Visa pagada: $ 60.000.')).toBeTruthy()
+    entry.applyEntry.mockResolvedValueOnce({ ok: true, message: '1 movimientos borrados.', errors: {}, savedId: 'm9', undo: null, duplicate: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Deshacer' }))
+    await flush()
+    expect(entry.applyEntry).toHaveBeenLastCalledWith(library, { kind: 'movements', id: null, action: 'delete', values: { ids: ['m9'] }, requestId: 'pedido-1' })
+    expect(screen.getByText('Listo, lo deshice.')).toBeTruthy()
+    expect(screen.getByText(/atrasada/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Pagar las 2 cuotas/ })).toBeTruthy()
+  })
+
+  it('loads by hand, names what to fix by field and keeps what was typed', async () => {
+    entry.getEntryForm.mockResolvedValue(expenseForm)
+    entry.applyEntry.mockResolvedValueOnce({ ok: false, message: 'Elegí la categoría.', errors: { categoryId: 'Elegí la categoría.' }, savedId: null, undo: null, duplicate: false })
+    render(<FinanceScreen library={library} />)
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'Cargar' }))
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: /^Gasto/ }))
+    await flush()
     const dialog = screen.getByRole('dialog', { name: 'Nuevo gasto' })
-    expect(within(dialog).getByText('Con tarjeta queda a pagar.')).toBeTruthy()
-    fireEvent.change(within(dialog).getByLabelText(/Importe/), { target: { value: '1.500,50' } })
-    fireEvent.change(within(dialog).getByLabelText(/Cuenta/), { target: { value: 'a1' } })
-    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Guardar gasto' })) })
-    expect(entry.applyEntry).toHaveBeenCalledWith(library, {
-      kind: 'expense', id: null, action: 'save', requestId: 'pedido-1',
-      values: { amount: '1.500,50', accountId: 'a1', effectiveDate: '2026-11-18', description: '' },
-    })
-    // Lo que falta queda junto a su campo; nada se cerró.
-    const description = within(dialog).getByLabelText(/Descripción/)
-    expect(description.getAttribute('aria-invalid')).toBe('true')
-    expect(within(dialog).getAllByText('Completá «Descripción».').length).toBeGreaterThan(0)
-
-    fireEvent.change(description, { target: { value: 'Coto' } })
-    expect(description.getAttribute('aria-invalid')).toBeNull()
-    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Guardar gasto' })) })
+    fireEvent.change(within(dialog).getByLabelText(/¿En qué\?/), { target: { value: 'Nafta' } })
+    fireEvent.change(within(dialog).getByLabelText(/Importe/), { target: { value: '45.000' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Guardar' }))
+    await flush()
+    expect(entry.applyEntry).toHaveBeenCalledWith(library, { kind: 'expense', id: null, action: 'save', values: { name: 'Nafta', amount: '45.000', currency: 'ARS', categoryId: '' }, requestId: 'pedido-1' })
+    expect(within(dialog).getByText('Elegí la categoría.')).toBeTruthy()
+    // Closing with something typed asks first: nothing is lost by accident.
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancelar' }))
+    expect(within(dialog).getByText('¿Descartar lo que cargaste?')).toBeTruthy()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Seguir cargando' }))
+    expect((within(dialog).getByLabelText(/¿En qué\?/) as HTMLInputElement).value).toBe('Nafta')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancelar' }))
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Descartar' }))
     expect(screen.queryByRole('dialog', { name: 'Nuevo gasto' })).toBeNull()
-    expect(screen.getByRole('status').textContent).toContain('Gasto guardado')
+  })
+
+  it('asks Rust for the form again when a field with reload changes', async () => {
+    const first = form({
+      kind: 'service-payment',
+      title: 'Pagar un servicio',
+      fields: [
+        { key: 'serviceId', label: 'Servicio', type: 'select', value: 's1', required: true, reload: true, options: [{ value: 's1', label: 'Internet' }, { value: 's2', label: 'Luz' }] },
+        { key: 'amount', label: 'Lo que pagaste', type: 'money', value: '25000', required: true, currency: { key: '', value: 'ARS', locked: true } },
+      ],
+    })
+    const second = { ...first, fields: [first.fields[0], { ...first.fields[1], value: '18000' }].map((field, index) => (index === 0 ? { ...field, value: 's2' } : field)) }
+    entry.getEntryForm.mockResolvedValueOnce(first).mockResolvedValueOnce(second)
+    render(<FinanceScreen library={library} />)
+    await flush()
+    fireEvent.click(screen.getByRole('tab', { name: 'Pagos' }))
+    await flush()
+    const internet = screen.getByText('Internet', { selector: '.finance-pay-row__name' }).closest('li') as HTMLElement
+    fireEvent.click(within(internet).getByRole('button', { name: 'Pagar' }))
+    await flush()
+    const dialog = screen.getByRole('dialog', { name: 'Pagar un servicio' })
+    fireEvent.change(within(dialog).getByLabelText(/Servicio/), { target: { value: 's2' } })
+    await flush()
+    expect(entry.getEntryForm).toHaveBeenLastCalledWith(library, { kind: 'service-payment', id: null, prefill: { serviceId: 's2', amount: '25000', _changed: 'serviceId' } })
+    expect((within(dialog).getByLabelText(/Lo que pagaste/) as HTMLInputElement).value).toBe('18000')
+  })
+
+  it('edits or deletes what is set up from Administrar', async () => {
+    entry.getEntryForm.mockResolvedValue(form({ kind: 'category', id: 'category-supermarket', title: 'Categoría', fields: [{ key: 'name', label: 'Nombre', type: 'text', value: 'Supermercado', required: true }], delete: { label: 'Borrar categoría', confirm: '¿Borrar la categoría?' } }))
+    entry.applyEntry.mockResolvedValueOnce({ ok: true, message: 'Categoría borrada.', errors: {}, savedId: 'category-supermarket', undo: null, duplicate: false })
+    render(<FinanceScreen library={library} />)
+    await flush()
+    fireEvent.click(screen.getByRole('tab', { name: 'Administrar' }))
+    await flush()
+    expect(screen.queryByText(/Desactivar/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Supermercado/ }))
+    await flush()
+    const dialog = screen.getByRole('dialog', { name: 'Categoría' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Borrar categoría' }))
+    fireEvent.click(within(within(dialog).getByRole('alertdialog')).getByRole('button', { name: 'Borrar categoría' }))
+    await flush()
+    expect(entry.applyEntry).toHaveBeenCalledWith(library, { kind: 'category', id: 'category-supermarket', action: 'delete', values: undefined, requestId: 'pedido-1' })
+    expect(screen.getByText('Categoría borrada.')).toBeTruthy()
     expect(events.notifyFinanceDataChanged).toHaveBeenCalled()
   })
 
-  it('paga un servicio y un préstamo desde el resumen, y resuelve una duda sin el chat', async () => {
-    setUp()
-    entry.resolveReview.mockResolvedValue({ ok: true, message: 'Listo, quedó resuelto.', errors: {}, savedId: null, duplicate: false })
+  it('shows savings without the salary', async () => {
     render(<FinanceScreen library={library} />)
-    await act(async () => undefined)
-
-    expect(screen.getByRole('region', { name: /Saldo de/ }).textContent).toContain('$ 3.499,50')
-    expect(screen.getByRole('region', { name: 'Presupuestos' }).textContent).toContain('Te pasaste')
-
-    const services = screen.getByRole('region', { name: /Servicios de/ })
-    await act(async () => { fireEvent.click(within(services).getByRole('button', { name: 'Pagar' })) })
-    expect(entry.getEntryForm).toHaveBeenLastCalledWith(library, { kind: 'service-payment', prefill: { serviceId: 's1' } })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancelar' })) })
-
-    const loans = screen.getByRole('region', { name: /Préstamos pagados/ })
-    await act(async () => { fireEvent.click(within(loans).getByRole('button', { name: 'Pagar' })) })
-    expect(entry.getEntryForm).toHaveBeenLastCalledWith(library, { kind: 'loan-payment', prefill: { loanId: 'auto' } })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancelar' })) })
-
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Sí, unirlos' })) })
-    expect(entry.resolveReview).toHaveBeenCalledWith(library, 'caso-1', 'merge')
-  })
-
-  it('edita un movimiento desde su detalle y lo administrable desde «Administrar»', async () => {
-    setUp()
-    entry.getManage.mockResolvedValue([{ key: 'accounts', title: 'Cuentas', addKind: 'account', addLabel: 'Nueva cuenta', empty: 'Sin cuentas.', rows: [{ id: 'a1', kind: 'account', title: 'Galicia', subtitle: 'Cuenta bancaria · ARS', inactive: false }] }])
-    render(<FinanceScreen library={library} />)
-    await act(async () => undefined)
-
-    await act(async () => { fireEvent.click(screen.getByRole('tab', { name: 'Movimientos' })) })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Editar' })) })
-    expect(entry.getEntryForm).toHaveBeenLastCalledWith(library, { kind: 'movement', id: 'm1' })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancelar' })) })
-
-    await act(async () => { fireEvent.click(screen.getByRole('tab', { name: 'Administrar' })) })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Galicia/ })) })
-    expect(entry.getEntryForm).toHaveBeenLastCalledWith(library, { kind: 'account', id: 'a1' })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Cancelar' })) })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Nueva cuenta/ })) })
-    expect(entry.getEntryForm).toHaveBeenLastCalledWith(library, { kind: 'account' })
+    await flush()
+    fireEvent.click(screen.getByRole('tab', { name: 'Ahorro' }))
+    await flush()
+    expect(screen.getByText('Ahorrado en pesos')).toBeTruthy()
+    expect(screen.getByText('30 % de $ 1.000.000')).toBeTruthy()
+    expect(screen.queryByText(/sueldo/i)).toBeNull()
   })
 })

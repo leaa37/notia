@@ -1,7 +1,7 @@
 import { callBackend } from '../../../services/transport'
 import type { NotiaLibrary } from '../../../types/notia'
 import { financeContext } from '../types/financeTypes'
-import type { ApplyResult, EntryForm, EntryMenuGroup, EntryRequest, EntryValues, ExportFile, FinanceSearch, ManageSection } from '../types/financeEntry'
+import type { ApplyResult, EntryForm, EntryMenuGroup, EntryRequest, EntryValues, ExportFile, ManageSection } from '../types/financeEntry'
 
 // Manual loads: Rust builds the forms and decides what is saved; these calls
 // only carry the person's intent and what they typed.
@@ -19,7 +19,7 @@ export function getEntryForm(library: NotiaLibrary, request: EntryRequest): Prom
 export interface ApplyRequest {
   kind: string
   id: string | null
-  /** `save` (the default), `delete` or the id of one of the form's actions. */
+  /** `save` (the default) or `delete`. */
   action?: string
   values?: EntryValues
   requestId: string
@@ -40,14 +40,6 @@ export function applyEntry(library: NotiaLibrary, request: ApplyRequest): Promis
 
 export function getManage(library: NotiaLibrary): Promise<ManageSection[]> {
   return callBackend<ManageSection[]>('finance_manage', { context: financeContext(library) })
-}
-
-export function resolveReview(library: NotiaLibrary, reviewItemId: string, optionId: string): Promise<ApplyResult> {
-  return callBackend<ApplyResult>('finance_resolve_review', { payload: { context: financeContext(library), reviewItemId, optionId } })
-}
-
-export function searchHistory(library: NotiaLibrary, request: { search: string; filter: string; page: number }): Promise<FinanceSearch> {
-  return callBackend<FinanceSearch>('finance_search', { payload: { context: financeContext(library), ...request } })
 }
 
 export function exportFinance(library: NotiaLibrary, request: { from: string | null; to: string | null; format: 'xlsx' | 'csv' }): Promise<ExportFile> {

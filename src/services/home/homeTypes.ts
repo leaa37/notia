@@ -82,13 +82,6 @@ export interface HomeTasks {
   focus?: HomeFocus | null
 }
 
-export interface HomeReserve {
-  id: string
-  name: string
-  currency: string
-  balance: string
-}
-
 export interface HomeFinance {
   /** `YYYY-MM`. */
   month: string
@@ -96,12 +89,13 @@ export interface HomeFinance {
   monthLabel: string
   expenses: Money[]
   expenseCount: number
-  uncategorizedPercent: number | null
+  income: Money[]
+  /** What is left of the month: income minus expenses minus savings. */
+  left: Money[]
+  /** What is still to pay this month (services, cards, loans). */
+  pending: Money[]
+  pendingCount: number
   saved: Money[]
-  reserve: HomeReserve | null
-  reviewCount: number
-  /** Every doubt of «Para revisar» as one request for the chat. */
-  reviewPrompt: string | null
 }
 
 export interface HomeRoutineDay {

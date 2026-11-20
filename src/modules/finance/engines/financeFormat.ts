@@ -11,10 +11,10 @@ function number(value: number, decimals: number): string {
   return value.toLocaleString('es-AR', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
 }
 
-/** `$ 5.250.432,63` or `USD 1.000,00`; `decimals: 0` rounds to whole units. */
+/** `$ 5.250.432,63` or `US$ 1.000,00`; `decimals: 0` rounds to whole units. */
 export function formatMoney(money: Money, decimals: 0 | 2 = 2): string {
   const value = Number(money.amount)
-  const prefix = money.currency === 'ARS' ? '$' : money.currency
+  const prefix = money.currency === 'ARS' ? '$' : money.currency === 'USD' ? 'US$' : money.currency
   if (!Number.isFinite(value)) return `${prefix} ${money.amount}`
   const sign = value < 0 ? '−' : ''
   return `${sign}${prefix} ${number(Math.abs(value), decimals)}`
@@ -22,6 +22,11 @@ export function formatMoney(money: Money, decimals: 0 | 2 = 2): string {
 
 export function formatAmount(amount: string | number, currency: string, decimals: 0 | 2 = 2): string {
   return formatMoney({ amount: String(amount), currency }, decimals)
+}
+
+/** Cents only when there are: `$ 60.000` or `$ 33.333,34`. */
+export function formatExact(amount: string | number, currency: string): string {
+  return formatAmount(amount, currency, Number.isInteger(Number(amount)) ? 0 : 2)
 }
 
 /** Each currency apart; `—` when there is nothing. */

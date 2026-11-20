@@ -14,9 +14,9 @@ import {
 describe('financeFormat', () => {
   it('writes money per currency, as the canvas does', () => {
     expect(formatMoney({ currency: 'ARS', amount: '5250432.63' })).toBe('$ 5.250.432,63')
-    expect(formatMoney({ currency: 'USD', amount: '1000.00' }, 0)).toBe('USD 1.000')
+    expect(formatMoney({ currency: 'USD', amount: '1000.00' }, 0)).toBe('US$ 1.000')
     expect(formatMoneyList([])).toBe('—')
-    expect(formatMoneyList([{ currency: 'ARS', amount: '10' }, { currency: 'USD', amount: '2' }], 0)).toBe('$ 10 · USD 2')
+    expect(formatMoneyList([{ currency: 'ARS', amount: '10' }, { currency: 'USD', amount: '2' }], 0)).toBe('$ 10 · US$ 2')
   })
 
   it('writes percents and dates in Spanish', () => {

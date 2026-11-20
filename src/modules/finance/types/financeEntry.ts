@@ -1,19 +1,23 @@
-// Manual loads of Finanzas: Rust builds every form (`finance_forms.rs`) and
-// applies it (`finance_entry.rs`); the screen only draws them and sends
-// what the person typed.
+// The forms Rust builds (`finance_forms.rs`) and what applying them returns
+// (`finance_entry.rs`). The screen draws them with one renderer.
 
-import type { Money, MovementRow } from './financeScreen'
+export type EntryValue = string | string[] | number | boolean | null
+export type EntryValues = Record<string, EntryValue>
 
 export interface EntryChoice {
   value: string
   label: string
+  detail?: string
 }
 
-export type EntryFieldType = 'text' | 'multiline' | 'money' | 'integer' | 'date' | 'month' | 'select' | 'toggle' | 'items'
+export interface CurrencyPick {
+  /** Key of the currency in the values; empty when it is locked. */
+  key: string
+  value: string
+  locked: boolean
+}
 
-export type EntryValue = string | boolean | EntryRow[]
-export type EntryRow = Record<string, string | boolean>
-export type EntryValues = Record<string, EntryValue>
+export type EntryFieldType = 'text' | 'money' | 'integer' | 'date' | 'month' | 'select' | 'checks' | 'info'
 
 export interface EntryField {
   key: string
@@ -25,10 +29,9 @@ export interface EntryField {
   placeholder?: string
   options?: EntryChoice[]
   suggestions?: string[]
-  /** The fields of each row of an `items` field. */
-  columns?: EntryField[]
-  addLabel?: string
-  readOnly?: boolean
+  currency?: CurrencyPick
+  /** Changing it asks Rust for the form again, with what was typed. */
+  reload?: boolean
 }
 
 export interface EntryForm {
@@ -39,28 +42,40 @@ export interface EntryForm {
   submit: string
   fields: EntryField[]
   delete: { label: string; confirm: string } | null
-  actions: Array<{ id: string; label: string; confirm: string | null }>
+}
+
+export interface EntryMenuItem {
+  kind: string
+  label: string
+  description: string
 }
 
 export interface EntryMenuGroup {
   title: string
-  items: Array<{ kind: string; label: string; description: string }>
+  items: EntryMenuItem[]
+}
+
+export interface EntryRequest {
+  kind: string
+  id?: string | null
+  /** What the screen preselects (the service, the card, the month). */
+  prefill?: EntryValues
+}
+
+export interface Undo {
+  kind: string
+  id: string | null
+  action: string
+  values: EntryValues
 }
 
 export interface ApplyResult {
   ok: boolean
   message: string
-  /** What to fix in each field, by its key. */
   errors: Record<string, string>
   savedId: string | null
+  undo: Undo | null
   duplicate: boolean
-}
-
-/** What opens a form: a new load (with what the screen preselects) or a stored record. */
-export interface EntryRequest {
-  kind: string
-  id?: string | null
-  prefill?: Record<string, string>
 }
 
 export interface ManageRow {
@@ -68,26 +83,16 @@ export interface ManageRow {
   kind: string
   title: string
   subtitle: string
-  inactive: boolean
+  muted: boolean
 }
 
 export interface ManageSection {
   key: string
   title: string
-  addKind: string | null
-  addLabel: string | null
+  addKind: string
+  addLabel: string
   empty: string
   rows: ManageRow[]
-}
-
-export interface FinanceSearch {
-  search: string
-  filter: string
-  count: number
-  page: number
-  hasMore: boolean
-  months: Array<{ month: string; rows: MovementRow[]; expenseTotals: Money[] }>
-  expenseTotals: Money[]
 }
 
 export interface ExportFile {

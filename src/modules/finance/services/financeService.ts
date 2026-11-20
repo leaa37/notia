@@ -1,38 +1,35 @@
 import { callBackend } from '../../../services/transport'
 import type { NotiaLibrary } from '../../../types/notia'
-import type { FinanceContext, FinanceDevQueryResult, FinanceDevTable } from '../types/financeTypes'
+import type { FinanceDevQueryResult, FinanceDevTable } from '../types/financeTypes'
 import { financeContext } from '../types/financeTypes'
-import type { FinanceMovements, FinanceOverview, FinanceProducts, FinanceSalarySavings, ProductSort } from '../types/financeScreen'
+import type { FinanceMovements, FinanceOverview, FinancePayments, FinanceSavings, FinanceSearch, MovementFilter } from '../types/financeScreen'
 
-// The Finanzas screen only reads: every change goes through the assistant,
-// in the app chat or Telegram, and its tools in the Rust backend. Rust also
-// derives every figure the screen shows (`finance_screen.rs`).
+// The tabs of Finanzas read what `finance_screen.rs` builds; nothing is
+// computed here.
 
-export type FinanceActor = string | { libraryUserId?: string; source?: FinanceContext['source'] } | undefined
-const context = (library: NotiaLibrary, actor?: FinanceActor) => (
-  typeof actor === 'object' && actor !== null
-    ? financeContext(library, actor.libraryUserId, actor.source)
-    : financeContext(library, actor)
-)
-
-/** «Resumen»: the month's salary use, cards, services, categories and doubts. */
-export function getFinanceOverview(library: NotiaLibrary, month: string, actor?: FinanceActor): Promise<FinanceOverview> {
-  return callBackend<FinanceOverview>('finance_overview', { payload: { context: context(library, actor), month } })
+/** «Resumen» of a month. */
+export function getFinanceOverview(library: NotiaLibrary, month: string): Promise<FinanceOverview> {
+  return callBackend<FinanceOverview>('finance_overview', { payload: { context: financeContext(library), month } })
 }
 
-/** «Movimientos»: the month's movements by account, filtered and searched by Rust. */
-export function getFinanceMovements(library: NotiaLibrary, request: { month: string; filter: string; search: string }, actor?: FinanceActor): Promise<FinanceMovements> {
-  return callBackend<FinanceMovements>('finance_movements', { payload: { context: context(library, actor), ...request } })
+/** «Pagos»: services, cards and loans of a month. */
+export function getFinancePayments(library: NotiaLibrary, month: string): Promise<FinancePayments> {
+  return callBackend<FinancePayments>('finance_payments', { payload: { context: financeContext(library), month } })
 }
 
-/** «Productos y tickets»: products with their prices per merchant, and the tickets. */
-export function getFinanceProducts(library: NotiaLibrary, request: { search: string; sort: ProductSort; selectedId: string | null }, actor?: FinanceActor): Promise<FinanceProducts> {
-  return callBackend<FinanceProducts>('finance_products', { payload: { context: context(library, actor), ...request } })
+/** «Movimientos» of a month, filtered by Rust. */
+export function getFinanceMovements(library: NotiaLibrary, month: string, filter: MovementFilter): Promise<FinanceMovements> {
+  return callBackend<FinanceMovements>('finance_movements', { payload: { context: financeContext(library), month, filter } })
 }
 
-/** «Sueldo y ahorro»: salary history, shares of the salary, quotes and reserves. */
-export function getFinanceSalarySavings(library: NotiaLibrary, month: string, actor?: FinanceActor): Promise<FinanceSalarySavings> {
-  return callBackend<FinanceSalarySavings>('finance_salary_savings', { payload: { context: context(library, actor), month } })
+/** The whole history, with the filters of «Movimientos». */
+export function searchFinanceHistory(library: NotiaLibrary, filter: MovementFilter, page: number): Promise<FinanceSearch> {
+  return callBackend<FinanceSearch>('finance_search', { payload: { context: financeContext(library), filter, page } })
+}
+
+/** «Ahorro»: reserves, the dollar and their movements. */
+export function getFinanceSavings(library: NotiaLibrary): Promise<FinanceSavings> {
+  return callBackend<FinanceSavings>('finance_savings', { payload: { context: financeContext(library) } })
 }
 
 export function listFinanceDevTables(): Promise<FinanceDevTable[]> {
@@ -40,19 +37,17 @@ export function listFinanceDevTables(): Promise<FinanceDevTable[]> {
 }
 
 export function queryFinanceDevTable(library: NotiaLibrary, tableName: string, page: number, pageSize = 50): Promise<FinanceDevQueryResult> {
-  return callBackend<FinanceDevQueryResult>('finance_dev_query_table', { payload: { context: context(library), tableName, page, pageSize } })
+  return callBackend<FinanceDevQueryResult>('finance_dev_query_table', { payload: { context: financeContext(library), tableName, page, pageSize } })
 }
 
 export function queryFinanceDevSql(library: NotiaLibrary, sql: string, page: number, pageSize = 50): Promise<FinanceDevQueryResult> {
-  return callBackend<FinanceDevQueryResult>('finance_dev_query_sql', { payload: { context: context(library), sql, page, pageSize } })
+  return callBackend<FinanceDevQueryResult>('finance_dev_query_sql', { payload: { context: financeContext(library), sql, page, pageSize } })
 }
 
 export function seedFinanceDevData(library: NotiaLibrary): Promise<void> {
-  return callBackend('finance_dev_seed_demo_data', { context: context(library) })
+  return callBackend('finance_dev_seed_demo_data', { context: financeContext(library) })
 }
 
-export function clearAllFinanceData(library: NotiaLibrary, actor?: FinanceActor): Promise<void> {
-  return callBackend('finance_clear_all_data', { context: context(library, actor) })
+export function clearAllFinanceData(library: NotiaLibrary): Promise<void> {
+  return callBackend('finance_clear_all_data', { context: financeContext(library) })
 }
-
-export type { FinanceContext }

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { CircleAlert, CreditCard } from 'lucide-react'
+import { CreditCard } from 'lucide-react'
 import type { HomeCard, HomeFinance } from '../../../../services/home/homeTypes'
 import { getDollarQuotes, type DollarQuote, type DollarQuoteKind } from '../../../../modules/finance/services/dollarQuotesService'
-import { formatAmount, formatMoney, formatMoneyList, formatUpdatedAt } from '../../../../modules/finance/engines/financeFormat'
+import { formatMoney, formatMoneyList, formatUpdatedAt } from '../../../../modules/finance/engines/financeFormat'
 import { HomeCardShell, HomeMoreButton } from './HomeCardShell'
 import { countLabel } from './homeDisplay'
 
@@ -23,7 +23,7 @@ function quoteValue(quote: DollarQuote | undefined): string {
   return quote ? quote.sell.toLocaleString('es-AR', { maximumFractionDigits: 0 }) : '—'
 }
 
-/** The month of Finanzas: expenses, savings, the first reserve and the dollar. */
+/** The month of Finanzas: expenses, what is left, what is still to pay and the dollar. */
 export function HomeFinanceCard({ card, onOpenFinance, onOpenChat }: HomeFinanceCardProps) {
   const finance = card.data
   const [quotes, setQuotes] = useState<DollarQuote[] | null>(null)
@@ -53,23 +53,20 @@ export function HomeFinanceCard({ card, onOpenFinance, onOpenChat }: HomeFinance
         <>
           <div className="home-finance__month">
             <span className="home-card__sub">Gastos de {finance.monthLabel}</span>
-            <span className="home-number">{finance.expenses.length > 0 ? formatMoneyList(finance.expenses) : 'Sin gastos'}</span>
-            <span className="home-card__sub">
-              {countLabel(finance.expenseCount, 'gasto', 'gastos')}
-              {finance.uncategorizedPercent ? ` · ${finance.uncategorizedPercent} % sin categoría` : ''}
-            </span>
+            <span className="home-number">{finance.expenses.length > 0 ? formatMoneyList(finance.expenses, 0) : 'Sin gastos'}</span>
+            <span className="home-card__sub">{countLabel(finance.expenseCount, 'gasto', 'gastos')}</span>
           </div>
           <div className="home-finance__pair">
             <div className="home-finance__figure">
-              <span className="home-card__sub">Ahorrado este mes</span>
+              <span className="home-card__sub">Te queda</span>
               <span className="home-finance__value home-finance__value--saved">
-                {finance.saved.length > 0 ? finance.saved.map((money) => `+ ${formatMoney(money, 0)}`).join(' · ') : '—'}
+                {finance.income.length > 0 ? finance.left.map((money) => formatMoney(money, 0)).join(' · ') || '$ 0' : '—'}
               </span>
             </div>
             <div className="home-finance__figure">
-              <span className="home-card__sub">{finance.reserve ? `Reserva ${finance.reserve.name}` : 'Reserva'}</span>
+              <span className="home-card__sub">Falta pagar</span>
               <span className="home-finance__value">
-                {finance.reserve ? formatAmount(finance.reserve.balance, finance.reserve.currency, 0) : '—'}
+                {finance.pendingCount > 0 ? finance.pending.map((money) => formatMoney(money, 0)).join(' · ') : 'Nada'}
               </span>
             </div>
           </div>
@@ -88,20 +85,10 @@ export function HomeFinanceCard({ card, onOpenFinance, onOpenChat }: HomeFinance
             </div>
           </div>
           <div className="home-spacer" />
-          {finance.reviewCount > 0 ? (
-            <button type="button" className="home-button home-button--warn home-finance__review" onClick={() => onOpenChat(finance.reviewPrompt)}>
-              <span className="home-finance__review-count">
-                <CircleAlert size={15} strokeWidth={2} aria-hidden="true" />
-                {finance.reviewCount} para revisar
-              </span>
-              <span className="home-finance__review-action">Revisar en el chat</span>
-            </button>
-          ) : (
-            <button type="button" className="home-button home-finance__review" onClick={() => onOpenChat(null)}>
-              <span>Nada para revisar</span>
-              <span className="home-finance__review-action">Cargar con el asistente</span>
-            </button>
-          )}
+          <button type="button" className="home-button home-finance__review" onClick={() => onOpenChat(null)}>
+            <span>{finance.pendingCount > 0 ? `${countLabel(finance.pendingCount, 'pago', 'pagos')} del mes por hacer` : 'Pagos del mes al día'}</span>
+            <span className="home-finance__review-action">Cargar con el asistente</span>
+          </button>
         </>
       ) : null}
     </HomeCardShell>

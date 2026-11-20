@@ -82,7 +82,7 @@ pub struct MovementRow {
     pub amount: String,
     pub currency: String,
     pub date: String,
-    /// What it pays: «Cuota 3/12 · Visa», «Servicio de noviembre».
+    /// What it pays: «Visa · Hogar», «Préstamo», «Servicio de noviembre 2026».
     pub detail: Option<String>,
     /// `card`, `loan`, `service` or `salary`.
     pub tag: Option<&'static str>,
@@ -93,8 +93,9 @@ struct Names {
     categories: HashMap<String, String>,
     accounts: HashMap<String, String>,
     cards: HashMap<String, String>,
-    purchases: HashMap<String, (String, u32)>,
-    loans: HashMap<String, (String, u32)>,
+    /// The card of each purchase.
+    purchases: HashMap<String, String>,
+    loans: std::collections::HashSet<String>,
 }
 
 fn names(connection: &Connection) -> rusqlite::Result<Names> {
@@ -103,18 +104,19 @@ fn names(connection: &Connection) -> rusqlite::Result<Names> {
         categories: model::list_categories(connection)?.into_iter().map(|category| (category.id, category.name)).collect(),
         accounts: to_map(model::list_accounts(connection)?),
         cards: to_map(model::list_cards(connection)?),
-        purchases: model::list_purchases(connection)?.into_iter().map(|purchase| (purchase.id, (purchase.card_id, purchase.installment_count))).collect(),
-        loans: model::list_loans(connection)?.into_iter().map(|loan| (loan.id, (loan.name, loan.installment_count))).collect(),
+        purchases: model::list_purchases(connection)?.into_iter().map(|purchase| (purchase.id, purchase.card_id)).collect(),
+        loans: model::list_loans(connection)?.into_iter().map(|loan| loan.id).collect(),
     })
 }
 
 fn row(movement: &Movement, names: &Names) -> MovementRow {
-    let (detail, tag) = if let Some((card_id, count)) = movement.card_purchase_id.as_ref().and_then(|id| names.purchases.get(id)) {
+    let category = movement.category_id.as_ref().and_then(|id| names.categories.get(id)).cloned();
+    // The name of a payment already says which installment it is.
+    let (detail, tag) = if let Some(card_id) = movement.card_purchase_id.as_ref().and_then(|id| names.purchases.get(id)) {
         let card = names.cards.get(card_id).cloned().unwrap_or_default();
-        let detail = if *count == 1 { card } else { format!("Cuota {}/{count} · {card}", movement.installment_number.unwrap_or(1)) };
-        (Some(detail), Some("card"))
-    } else if let Some((_, count)) = movement.loan_id.as_ref().and_then(|id| names.loans.get(id)) {
-        (Some(format!("Préstamo · cuota {}/{count}", movement.installment_number.unwrap_or(1))), Some("loan"))
+        (Some(category.as_ref().map_or(card.clone(), |category| format!("{card} · {category}"))), Some("card"))
+    } else if movement.loan_id.as_ref().is_some_and(|id| names.loans.contains(id)) {
+        (Some("Préstamo".to_string()), Some("loan"))
     } else if movement.service_id.is_some() {
         (movement.service_month.as_deref().map(|month| format!("Servicio de {}", month_label(month))), Some("service"))
     } else if movement.kind == "income" && movement.category_id.as_deref() == Some(CATEGORY_SALARY.0) {
@@ -127,7 +129,7 @@ fn row(movement: &Movement, names: &Names) -> MovementRow {
         kind: movement.kind.clone(),
         name: movement.name.clone(),
         category_id: movement.category_id.clone(),
-        category: movement.category_id.as_ref().and_then(|id| names.categories.get(id)).cloned(),
+        category,
         account: movement.account_id.as_ref().and_then(|id| names.accounts.get(id)).cloned(),
         amount: movement.amount.clone(),
         currency: movement.currency.clone(),
