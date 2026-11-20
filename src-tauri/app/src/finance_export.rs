@@ -9,8 +9,8 @@ use std::io::Write as _;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::finance::{validate_context, valid_iso_date, FinanceCommandResult, FinanceContext};
-use crate::finance_screen::ExportRow;
+use crate::finance::{read, valid_iso_date, FinanceCommandError, FinanceCommandResult, FinanceContext};
+use crate::finance_screen::MovementRow;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,24 +34,20 @@ pub struct ExportFile {
     pub rows: usize,
 }
 
-const HEADERS: [&str; 11] =
-    ["Fecha", "Fecha de compra", "Tipo", "Descripción", "Categoría", "Cuenta", "Servicio", "Importe", "Moneda", "Estado", "Origen"];
+const HEADERS: [&str; 8] = ["Fecha", "Tipo", "Nombre", "Categoría", "Cuenta", "Detalle", "Importe", "Moneda"];
 /// Column of the amount, the only number.
-const AMOUNT_COLUMN: usize = 7;
+const AMOUNT_COLUMN: usize = 6;
 
-fn cells(row: &ExportRow) -> [String; 11] {
+fn cells(row: &MovementRow) -> [String; 8] {
     [
-        day_text(&row.effective_date),
-        day_text(&row.purchase_date),
-        row.kind.to_string(),
-        row.description.clone(),
-        row.category.clone(),
-        row.account.clone(),
-        row.service.clone(),
+        day_text(&row.date),
+        (if row.kind == "income" { "Ingreso" } else { "Gasto" }).to_string(),
+        row.name.clone(),
+        row.category.clone().unwrap_or_default(),
+        row.account.clone().unwrap_or_default(),
+        row.detail.clone().unwrap_or_default(),
         row.amount.clone(),
         row.currency.clone(),
-        row.status.to_string(),
-        row.origin.clone(),
     ]
 }
 
@@ -66,19 +62,20 @@ fn day_text(date: &str) -> String {
 pub fn finance_export(app: crate::host::AppHandle, payload: ExportPayload) -> FinanceCommandResult<ExportFile> {
     for date in [payload.from.as_deref(), payload.to.as_deref()].into_iter().flatten() {
         if !valid_iso_date(date) {
-            return Err("Las fechas de la exportación tienen que ser días válidos.".into());
+            return Err(FinanceCommandError::invalid("Las fechas de la exportación tienen que ser días válidos."));
         }
     }
-    let connection = validate_context(&payload.context, &app)?;
-    let rows = crate::finance_screen::export_rows(&connection, payload.from.as_deref(), payload.to.as_deref())?;
+    let rows = read(&app, &payload.context, |connection| {
+        crate::finance_screen::rows_between(connection, payload.from.as_deref().unwrap_or("0000-01-01"), payload.to.as_deref().unwrap_or("9999-12-31"))
+    })?;
     let name = match (payload.from.as_deref(), payload.to.as_deref()) {
         (None, None) => "finanzas-historial".to_string(),
         (from, to) => format!("finanzas-{}-a-{}", from.unwrap_or("inicio"), to.unwrap_or("hoy")),
     };
     let (extension, media_type, bytes) = match payload.format.as_deref().unwrap_or("xlsx") {
         "csv" => ("csv", "text/csv", csv(&rows).into_bytes()),
-        "xlsx" => ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx(&rows)?),
-        _ => return Err("El formato tiene que ser xlsx o csv.".into()),
+        "xlsx" => ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsx(&rows).map_err(FinanceCommandError::storage)?),
+        _ => return Err(FinanceCommandError::invalid("El formato tiene que ser xlsx o csv.")),
     };
     Ok(ExportFile {
         file_name: format!("{name}.{extension}"),
@@ -96,7 +93,7 @@ fn csv_cell(value: &str) -> String {
     }
 }
 
-pub(crate) fn csv(rows: &[ExportRow]) -> String {
+pub(crate) fn csv(rows: &[MovementRow]) -> String {
     let mut text = String::from("\u{feff}");
     text.push_str(&HEADERS.join(";"));
     text.push_str("\r\n");
@@ -131,9 +128,9 @@ fn column_name(index: usize) -> String {
     name
 }
 
-fn sheet(rows: &[ExportRow]) -> String {
+fn sheet(rows: &[MovementRow]) -> String {
     let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="2" width="13" customWidth="1"/><col min="3" max="3" width="16" customWidth="1"/><col min="4" max="4" width="42" customWidth="1"/><col min="5" max="7" width="20" customWidth="1"/><col min="8" max="8" width="14" customWidth="1"/><col min="9" max="9" width="9" customWidth="1"/><col min="10" max="11" width="20" customWidth="1"/></cols><sheetData>"#,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="12" customWidth="1"/><col min="2" max="2" width="10" customWidth="1"/><col min="3" max="3" width="36" customWidth="1"/><col min="4" max="4" width="20" customWidth="1"/><col min="5" max="5" width="16" customWidth="1"/><col min="6" max="6" width="24" customWidth="1"/><col min="7" max="7" width="14" customWidth="1"/><col min="8" max="8" width="9" customWidth="1"/></cols><sheetData>"#,
     );
     let header = HEADERS.iter().map(|header| header.to_string()).collect::<Vec<_>>();
     let mut push_row = |number: usize, values: &[String], bold: bool| {
@@ -168,7 +165,7 @@ const WORKBOOK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="
 /// Style 1: bold header; style 2: an amount with thousands and two decimals.
 const STYLES: &str = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"##;
 
-pub(crate) fn xlsx(rows: &[ExportRow]) -> Result<Vec<u8>, String> {
+pub(crate) fn xlsx(rows: &[MovementRow]) -> Result<Vec<u8>, String> {
     let failed = |error: std::io::Error| format!("No se pudo armar la planilla: {error}");
     let zipped = |error: zip::result::ZipError| format!("No se pudo armar la planilla: {error}");
     let mut buffer = std::io::Cursor::new(Vec::new());
@@ -195,19 +192,19 @@ pub(crate) fn xlsx(rows: &[ExportRow]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
-    fn row(description: &str, amount: &str) -> ExportRow {
-        ExportRow {
-            effective_date: "2026-11-02".into(),
-            purchase_date: "2026-10-28".into(),
-            kind: "Gasto",
-            description: description.into(),
-            category: "Supermercado".into(),
-            account: "Visa".into(),
-            service: String::new(),
+    fn row(name: &str, amount: &str) -> MovementRow {
+        MovementRow {
+            id: "m".into(),
+            kind: "expense".into(),
+            name: name.into(),
+            category_id: Some("c".into()),
+            category: Some("Supermercado".into()),
+            account: Some("Banco".into()),
             amount: amount.into(),
             currency: "ARS".into(),
-            status: "Cuenta",
-            origin: "Carga manual".into(),
+            date: "2026-11-02".into(),
+            detail: Some("Cuota 1/3 · Visa".into()),
+            tag: Some("card"),
         }
     }
 
@@ -217,7 +214,7 @@ mod tests {
         assert!(text.starts_with('\u{feff}'), "with a BOM for the accents");
         let lines = text.trim_start_matches('\u{feff}').split("\r\n").collect::<Vec<_>>();
         assert_eq!(lines[0], HEADERS.join(";"));
-        assert_eq!(lines[1], "02/11/2026;28/10/2026;Gasto;\"Coto; sucursal \"\"centro\"\"\";Supermercado;Visa;;15000,50;ARS;Cuenta;Carga manual");
+        assert_eq!(lines[1], "02/11/2026;Gasto;\"Coto; sucursal \"\"centro\"\"\";Supermercado;Banco;Cuota 1/3 · Visa;15000,50;ARS");
     }
 
     #[test]
@@ -229,9 +226,9 @@ mod tests {
         }
         let mut sheet = String::new();
         std::io::Read::read_to_string(&mut archive.by_name("xl/worksheets/sheet1.xml").expect("sheet"), &mut sheet).expect("read");
-        assert!(sheet.contains("<c r=\"H2\" s=\"2\"><v>1200.5</v></c>"), "{sheet}");
+        assert!(sheet.contains("<c r=\"G2\" s=\"2\"><v>1200.5</v></c>"), "{sheet}");
         assert!(sheet.contains("Leche &amp; pan &lt;2&gt;"), "text is escaped");
-        assert!(sheet.contains("<autoFilter ref=\"A1:K2\"/>"));
+        assert!(sheet.contains("<autoFilter ref=\"A1:H2\"/>"));
     }
 
     #[test]

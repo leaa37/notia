@@ -1,7 +1,7 @@
 //! Verification of a finance final answer against what the turn really did:
 //! the agent must not claim or promise a financial write that no tool
-//! executed, must not leave a document received by Telegram unpersisted and
-//! must ask for missing data through a clarification, not as final text.
+//! executed and must ask for missing data through a clarification, not as
+//! final text.
 
 /// What the turn executed, derived from its tool calls and results.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -10,16 +10,6 @@ pub struct FinanceTurnFacts {
     pub mutation_executed: bool,
     /// The agent asked the user through `request_user_clarification`.
     pub clarification_requested: bool,
-    /// A Telegram message carried a document (ticket, receipt, statement).
-    pub document_received: bool,
-    /// Names of the tools that reported a change.
-    pub changed_tools: Vec<String>,
-}
-
-impl FinanceTurnFacts {
-    fn persisted(&self, tool: &str) -> bool {
-        self.changed_tools.iter().any(|name| name == tool)
-    }
 }
 
 fn fold(value: &str) -> String {
@@ -48,16 +38,6 @@ fn has_phrase(words: &[&str], sequence: &[&[&str]]) -> bool {
     })
 }
 
-const DETECTED: &[&str] = &["detectado", "detectada", "identificado", "identificada"];
-
-fn reports_detected(words: &[&str], subjects: &[&[&[&str]]]) -> bool {
-    subjects.iter().any(|subject| {
-        let mut sequence = subject.to_vec();
-        sequence.push(DETECTED);
-        has_phrase(words, &sequence)
-    })
-}
-
 /// Correction for the model. `blocking` corrections describe an answer that
 /// misreports a write and must never reach the user; the others (a question
 /// asked as final text) may be delivered once the retries run out.
@@ -75,33 +55,6 @@ const fn blocking(message: &'static str) -> Option<FinanceCorrection> {
 pub fn finance_answer_correction(answer: &str, facts: &FinanceTurnFacts) -> Option<FinanceCorrection> {
     let folded = fold(answer);
     let words = words(&folded);
-    if facts.document_received {
-        let ticket = reports_detected(&words, &[&[&["ticket"]], &[&["ticket"], &["de"], &["compra"]]]);
-        let salary = reports_detected(
-            &words,
-            &[&[&["recibo"], &["de"], &["sueldo"]], &[&["liquidacion"], &["de"], &["haberes"]]],
-        );
-        let statement = reports_detected(
-            &words,
-            &[&[&["resumen"], &["de"], &["tarjeta"]], &[&["resumen"], &["de"], &["tarjeta"], &["de"], &["credito"]]],
-        );
-        let invoice = reports_detected(
-            &words,
-            &[&[&["factura", "boleta"], &["servicio"]], &[&["factura", "boleta"], &["de"], &["servicio"]]],
-        );
-        if ticket && !facts.persisted("create_finance_purchase") {
-            return blocking("Detectaste un ticket recibido por Telegram, pero aún no fue persistido. No finalices con un resumen: usa create_finance_purchase con la cuenta, categoría, comercio, fecha, total, líneas y sourceReference disponibles. Espera ok:true antes de responder que el ticket quedó registrado.");
-        }
-        if salary && !facts.persisted("create_finance_salary") {
-            return blocking("Detectaste un recibo de sueldo recibido por Telegram, pero aún no fue persistido. Usa create_finance_salary con cuenta, período, fecha de cobro, empleador, bruto, descuentos, neto, moneda, conceptos y sourceReference. Espera ok:true antes de responder que quedó registrado.");
-        }
-        if statement && !facts.persisted("create_finance_credit_card_statement") {
-            return blocking("Detectaste un resumen de tarjeta recibido por Telegram, pero aún no fue persistido. Usa create_finance_credit_card_statement con la cuenta credit_card, período, fechas, moneda, saldos, totales, líneas y sourceReference. Espera ok:true antes de responder que quedó registrado.");
-        }
-        if invoice && !facts.persisted("create_finance_service_invoice") {
-            return blocking("Detectaste una factura o boleta de servicio recibida por Telegram, pero aún no fue persistida. Usa create_finance_service_invoice con período, importe, moneda y la referencia opaca disponible; no generes un gasto genérico adicional.");
-        }
-    }
     if facts.mutation_executed {
         return None;
     }
@@ -127,13 +80,13 @@ pub fn finance_answer_correction(answer: &str, facts: &FinanceTurnFacts) -> Opti
         &[&["voy", "vamos", "procedere"], &["a"], &["registrar", "guardar", "cargar", "anotar", "crear"]],
     );
     if claims_persisted || promises_mutation {
-        return blocking("No afirmes ni prometas que el movimiento fue registrado o que lo registrarás: ninguna mutación financiera se ejecutó. Si falta la cuenta o categoría, usa request_user_clarification. Si todos los datos están completos, llama create_finance_transaction y espera su resultado antes de responder.");
+        return blocking("No afirmes ni prometas que el movimiento fue registrado o que lo registrarás: ninguna mutación financiera se ejecutó. Si falta un dato (el importe, la categoría), usa request_user_clarification. Si todos los datos están completos, llama la herramienta de Finanzas que corresponde (save_finance_expense, pay_finance_service…) y espera su resultado antes de responder.");
     }
-    const FIELDS: &[&str] = &["cuenta", "categoria", "fecha", "moneda"];
+    const FIELDS: &[&str] = &["categoria", "fecha", "moneda", "importe", "tarjeta"];
     let asks_field = has_phrase(&words, &[&["que", "cual"], FIELDS])
         || (answer.contains('?') && words.iter().any(|word| FIELDS.contains(word)));
     (asks_field && !facts.clarification_requested).then_some(FinanceCorrection {
-        message: "No hagas la pregunta financiera como texto final. Llama request_user_clarification con la cuenta, categoría, fecha o moneda que falta y espera su respuesta dentro de esta misma operación; así se conserva la referencia del ticket y no se inicia otra conversación.",
+        message: "No hagas la pregunta financiera como texto final. Llama request_user_clarification con el dato que falta (categoría, importe, fecha, moneda o tarjeta) y espera su respuesta dentro de esta misma operación, así no se inicia otra conversación.",
         blocking: false,
     })
 }
@@ -157,22 +110,8 @@ mod tests {
     #[test]
     fn missing_fields_go_through_a_clarification() {
         let facts = FinanceTurnFacts::default();
-        assert!(finance_answer_correction("¿En qué cuenta lo registro?", &facts).is_some());
+        assert!(finance_answer_correction("¿En qué categoría lo registro?", &facts).is_some());
         let asked = FinanceTurnFacts { clarification_requested: true, ..FinanceTurnFacts::default() };
-        assert!(finance_answer_correction("¿Qué cuenta usaste?", &asked).is_none());
-    }
-
-    #[test]
-    fn detected_documents_must_be_persisted() {
-        let facts = FinanceTurnFacts { document_received: true, ..FinanceTurnFacts::default() };
-        assert!(finance_answer_correction("Ticket de compra detectado en Coto.", &facts)
-            .is_some_and(|correction| correction.blocking && correction.message.contains("create_finance_purchase")));
-        let saved = FinanceTurnFacts {
-            document_received: true,
-            mutation_executed: true,
-            changed_tools: vec!["create_finance_purchase".into()],
-            ..FinanceTurnFacts::default()
-        };
-        assert!(finance_answer_correction("Ticket detectado y guardado.", &saved).is_none());
+        assert!(finance_answer_correction("¿Qué categoría uso?", &asked).is_none());
     }
 }

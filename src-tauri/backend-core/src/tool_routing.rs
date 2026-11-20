@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(tool_area("export_document"), Some(ToolArea::Library));
         assert_eq!(tool_area("create_task_ticket"), Some(ToolArea::Tasks));
         assert_eq!(tool_area("save_routine_task"), Some(ToolArea::Routine));
-        assert_eq!(tool_area("create_finance_transaction"), Some(ToolArea::Finance));
+        assert_eq!(tool_area("save_finance_expense"), Some(ToolArea::Finance));
         assert_eq!(tool_area("trash_gmail_messages"), Some(ToolArea::Mail));
         assert_eq!(tool_area("browser_click"), Some(ToolArea::Browser));
         assert_eq!(tool_area("whatsapp_send_message"), Some(ToolArea::WhatsApp));
@@ -665,12 +665,12 @@ mod tests {
 
     #[test]
     fn a_turn_keeps_the_common_tools_and_the_areas_that_fit() {
-        let tools = ["search_web", "read_library_documents", "create_task_ticket", "get_finance_dashboard", "list_finance_accounts", "trash_gmail_messages"]
+        let tools = ["search_web", "read_library_documents", "create_task_ticket", "get_finance_month", "get_finance_setup", "trash_gmail_messages"]
             .map(tool)
             .to_vec();
         assert_eq!(offered_areas(&tools), vec![ToolArea::Library, ToolArea::Tasks, ToolArea::Finance, ToolArea::Mail]);
         let names = |tools: Vec<ToolDefinition>| tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
-        assert_eq!(names(tools_for_areas(tools.clone(), &[ToolArea::Mail, ToolArea::Finance], 10)), ["search_web", "get_finance_dashboard", "list_finance_accounts", "trash_gmail_messages"]);
+        assert_eq!(names(tools_for_areas(tools.clone(), &[ToolArea::Mail, ToolArea::Finance], 10)), ["search_web", "get_finance_month", "get_finance_setup", "trash_gmail_messages"]);
         // Finance (2 tools) no longer fits after mail; the next area that fits is added.
         assert_eq!(names(tools_for_areas(tools.clone(), &[ToolArea::Mail, ToolArea::Finance, ToolArea::Library], 3)), ["search_web", "read_library_documents", "trash_gmail_messages"]);
         assert_eq!(names(tools_for_areas(tools, &[], 10)), ["search_web"]);
@@ -683,9 +683,9 @@ mod tests {
             tool("search_web"),
             writer("create_task_ticket"),
             tool("search_task_tickets"),
-            tool("get_finance_dashboard"),
-            writer("create_finance_transaction"),
-            tool("list_finance_accounts"),
+            tool("get_finance_month"),
+            writer("save_finance_expense"),
+            tool("get_finance_setup"),
             writer("trash_gmail_messages"),
             tool("list_gmail_messages"),
         ];
@@ -693,7 +693,7 @@ mod tests {
         let areas = [ToolArea::Tasks, ToolArea::Finance, ToolArea::Mail];
         // The first area comes whole; Finanzas only reads; Correo does not fit.
         let round = tools_for_areas(pool.clone(), &areas, 5);
-        assert_eq!(names(&round), ["search_web", "create_task_ticket", "search_task_tickets", "get_finance_dashboard", "list_finance_accounts"]);
+        assert_eq!(names(&round), ["search_web", "create_task_ticket", "search_task_tickets", "get_finance_month", "get_finance_setup"]);
         let coverage = area_coverage(&pool, &round, &areas);
         assert_eq!(coverage, AreaCoverage { full: vec![ToolArea::Tasks], read_only: vec![ToolArea::Finance], missing: vec![ToolArea::Mail] });
         let note = coverage.note();
@@ -783,13 +783,13 @@ mod tests {
 
     #[test]
     fn every_module_routes_and_the_agent_can_change_areas() {
-        let pool = ["search_web", "get_finance_dashboard", "log_meal", "create_recipe"].map(tool).to_vec();
+        let pool = ["search_web", "get_finance_month", "log_meal", "create_recipe"].map(tool).to_vec();
         assert!(needs_routing(&pool));
-        assert!(!needs_routing(&["search_web", "get_finance_dashboard"].map(tool)));
+        assert!(!needs_routing(&["search_web", "get_finance_month"].map(tool)));
         // A round has its areas plus the switch, which lists what it may reach.
         let names = |tools: &[ToolDefinition]| tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
         let round = turn_tools(&pool, &[ToolArea::Finance], 10);
-        assert_eq!(names(&round), ["search_web", "get_finance_dashboard", SWITCH_AREA_TOOL]);
+        assert_eq!(names(&round), ["search_web", "get_finance_month", SWITCH_AREA_TOOL]);
         let switch = round.last().expect("switch");
         assert!(switch.description.contains("Áreas actuales: finanzas.") && switch.description.contains("- salud:"));
         assert_eq!(switch.input_schema["properties"]["areas"]["items"]["enum"], serde_json::json!(["finanzas", "recetas", "salud"]));

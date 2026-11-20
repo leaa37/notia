@@ -133,79 +133,31 @@ pub fn canonical_tool_catalog() -> Vec<ToolDefinition> {
     ));
     catalog.extend(finance_tools(
         [
-            "get_finance_dashboard",
+            "get_finance_month",
+            "get_finance_payments",
+            "list_finance_movements",
+            "get_finance_setup",
             "get_finance_dollar_quotes",
             "get_finance_inflation_indices",
             "get_finance_historical_dollar_quotes",
-            "list_finance_accounts",
-            "list_finance_categories",
-            "list_finance_movements",
-            "search_finance_categories",
-            "list_finance_credit_card_statements",
-            "list_finance_salaries",
-            "list_finance_purchases",
-            "list_finance_price_history",
-            "list_finance_services",
-            "list_finance_service_occurrences",
-            "list_finance_service_invoices",
-            "list_finance_review_items",
-            "list_finance_products",
-            "list_finance_merchants",
-            "get_finance_full_snapshot",
-            "get_finance_record",
-            "list_finance_records",
         ],
         true,
     ));
     catalog.extend(finance_tools(
         [
-            "create_finance_transaction",
-            "create_finance_savings_movement",
-            "create_finance_savings_exchange",
-            "create_finance_category",
-            "create_finance_purchase",
-            "create_finance_salary",
-            "create_finance_credit_card_statement",
-            "update_finance_transaction_status",
-            "create_finance_service",
-            "create_finance_service_occurrence",
-            "create_finance_service_invoice",
-            "save_finance_account",
-            "save_finance_category",
-            "save_finance_transaction",
-            "save_finance_savings_reserve",
-            "save_finance_savings_movement",
-            "save_finance_savings_exchange",
-            "save_finance_purchase",
+            "save_finance_expense",
+            "save_finance_income",
             "save_finance_salary",
-            "save_finance_credit_card_statement",
-            "save_finance_installment_plan",
-            "save_finance_service",
-            "save_finance_service_occurrence",
-            "save_finance_service_invoice",
-            "link_finance_savings_account",
-            "set_finance_service_active",
+            "save_finance_card_purchase",
+            "pay_finance_card",
+            "pay_finance_loan_installment",
+            "pay_finance_service",
+            "save_finance_savings_movement",
+            "save_finance_dollar_exchange",
+            "save_finance_setup",
             "delete_finance_record",
-            "reverse_finance_transaction",
-            "clear_finance_data",
-            "extract_finance_document",
-            "link_finance_records",
-            "unlink_finance_records",
-            "resolve_finance_review_item",
-            "rename_finance_product",
-            "rename_finance_merchant",
-            "merge_finance_products",
-            "merge_finance_merchants",
         ],
         false,
-    ));
-    catalog.extend(finance_tools(
-        [
-            "list_finance_installment_plans",
-            "list_finance_installments",
-            "list_finance_artifacts",
-        ],
-        true,
     ));
     catalog.extend(routine_tools(
         &[
@@ -724,20 +676,7 @@ pub fn tool_policy(tool_name: &str) -> ToolPolicy {
         name if name.starts_with("list_finance_") || name.starts_with("get_finance_") => {
             ToolPolicy::FinanceRead
         }
-        name if name.starts_with("create_finance_")
-            || name.starts_with("save_finance_")
-            || name.starts_with("update_finance_")
-            || name.starts_with("set_finance_")
-            || name.starts_with("delete_finance_")
-            || name.starts_with("reverse_finance_")
-            || name.starts_with("clear_finance_")
-            || name.starts_with("link_finance_")
-            || name.starts_with("unlink_finance_")
-            || name.starts_with("resolve_finance_")
-            || name.starts_with("rename_finance_")
-            || name.starts_with("merge_finance_")
-            || name == "extract_finance_document" =>
-        {
+        name if name.starts_with("save_finance_") || name.starts_with("pay_finance_") || name.starts_with("delete_finance_") => {
             ToolPolicy::FinanceWrite
         }
         _ => ToolPolicy::LibraryWrite,
@@ -1037,7 +976,7 @@ mod tests {
         let catalog = canonical_tool_catalog();
         let tool = catalog
             .iter()
-            .find(|tool| tool.name == "create_finance_transaction")
+            .find(|tool| tool.name == "save_finance_expense")
             .expect("tool");
         assert!(tool.input_schema["properties"]["amount"].is_object());
         assert!(tool.requires_confirmation);
@@ -1342,7 +1281,7 @@ mod tests {
         assert_eq!(coverage.full.first(), Some(&ToolArea::Tasks));
         assert!(coverage.missing.is_empty(), "{coverage:?}");
         assert_ne!(coverage, AreaCoverage { full: areas.to_vec(), ..AreaCoverage::default() });
-        for name in ["get_finance_dashboard", "list_agenda", "list_gmail_messages", "get_task_board_summary"] {
+        for name in ["get_finance_month", "list_agenda", "list_gmail_messages", "get_task_board_summary"] {
             assert!(round.iter().any(|tool| tool.name == name), "{name}");
         }
     }
@@ -1423,7 +1362,7 @@ mod tests {
         let tools = project_tool_catalog(
             &context(BackendScope::Finance),
             &principal,
-            &[tool("get_finance_dashboard", BackendScope::Finance, true)],
+            &[tool("get_finance_month", BackendScope::Finance, true)],
             ToolCatalogProjection::Full,
         )
         .expect("catalog projects");

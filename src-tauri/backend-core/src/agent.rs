@@ -851,7 +851,7 @@ fn run_agent_inner(
             // Finance answers are checked wherever the turn can write
             // Finanzas: its scope, or the library chat with finance tools.
             if !summarized && offers_finance_writes(request, &tools) {
-                let facts = finance_turn_facts(request, &messages, &tool_results);
+                let facts = finance_turn_facts(&messages, &tool_results);
                 if let Some(correction) = super::finance_answer::finance_answer_correction(&content, &facts) {
                     if finance_corrections < options.max_pending_action_corrections && has_rounds_left(rounds, options) {
                         finance_corrections += 1;
@@ -1593,7 +1593,6 @@ fn browser_steps(messages: &[ProviderMessage]) -> usize {
 
 /// What a finance turn executed, for the final answer verification.
 fn finance_turn_facts(
-    request: &AgentRequest,
     messages: &[ProviderMessage],
     tool_results: &[ToolResult],
 ) -> super::finance_answer::FinanceTurnFacts {
@@ -1602,25 +1601,9 @@ fn finance_turn_facts(
         .flat_map(|message| message.tool_calls.iter())
         .map(|call| (call.id.as_str(), call.name.as_str()))
         .collect::<HashMap<_, _>>();
-    // Only the person's latest message: files of earlier messages stay in the
-    // history and were already handled.
-    let latest_has_files = request
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == MessageRole::User)
-        .is_some_and(|message| !message.images.is_empty() || !message.attachments.is_empty());
-    let document_received = request.context.channel == super::context::BackendChannel::Telegram
-        && (!request.attachments.is_empty() || latest_has_files);
     super::finance_answer::FinanceTurnFacts {
         mutation_executed: tool_results.iter().any(|result| result.changed),
         clarification_requested: names.values().any(|name| *name == "request_user_clarification"),
-        document_received,
-        changed_tools: tool_results
-            .iter()
-            .filter(|result| result.changed)
-            .filter_map(|result| names.get(result.call_id.as_str()).map(|name| name.to_string()))
-            .collect(),
     }
 }
 
@@ -2623,7 +2606,7 @@ mod tests {
         assert!(result.ok && result.data.as_ref().is_some_and(|data| data["accepted"] == true));
         let note = approved_plan_note(&plan_from_call(&plan).expect("plan"), PlanApproval::ConfirmAll);
         assert!(note.contains("Confirmar todos") && note.contains("2. Mover bancos"));
-        assert!(is_plan_tool("update_agent_plan") && !is_plan_tool("save_finance_transaction"));
+        assert!(is_plan_tool("update_agent_plan") && !is_plan_tool("save_finance_expense"));
     }
 
     #[test]
@@ -2640,12 +2623,12 @@ mod tests {
             }]),
             calls: Mutex::new(0),
         };
-        let mut save = tool("save_finance_transaction", false);
+        let mut save = tool("save_finance_expense", false);
         save.requires_confirmation = true;
         let request = request(vec![save]);
         let pending_call = ToolCall {
             id: "call-1".into(),
-            name: "save_finance_transaction".into(),
+            name: "save_finance_expense".into(),
             arguments: serde_json::json!({"record": {"id": "tx-1", "categoryId": "tecnologia"}}),
             round: 1,
         };
@@ -3169,13 +3152,13 @@ mod tests {
 
     #[test]
     fn a_tool_of_an_area_not_loaded_says_how_to_get_it() {
-        let pool = vec![tool("search_web", true), tool("get_finance_dashboard", true)];
-        let error = unavailable_tool_error("get_finance_dashboard", Some(&pool));
+        let pool = vec![tool("search_web", true), tool("get_finance_month", true)];
+        let error = unavailable_tool_error("get_finance_month", Some(&pool));
         assert_eq!(error.code, BackendErrorCode::InvalidInput);
         assert!(error.message.contains("change_tool_areas con «finanzas»"), "{}", error.message);
         // A tool the actor cannot use, or a run without areas, stays forbidden.
         assert_eq!(unavailable_tool_error("log_meal", Some(&pool)).code, BackendErrorCode::Forbidden);
-        assert_eq!(unavailable_tool_error("get_finance_dashboard", None).code, BackendErrorCode::Forbidden);
+        assert_eq!(unavailable_tool_error("get_finance_month", None).code, BackendErrorCode::Forbidden);
     }
 
     #[test]
@@ -3188,7 +3171,7 @@ mod tests {
             assistant("Listo, registré la milanesa.", Vec::new()),
         ]);
         let executor = read_executor();
-        let mut routed = request(vec![tool("search_web", true), tool("get_finance_dashboard", true), tool("log_meal", true)]);
+        let mut routed = request(vec![tool("search_web", true), tool("get_finance_month", true), tool("log_meal", true)]);
         routed.tool_areas = Some(vec!["finanzas".into()]);
         let response = run_agent(
             &provider,
@@ -3203,7 +3186,7 @@ mod tests {
         .expect("agent completes");
         assert_eq!(response.response.markdown, "Listo, registré la milanesa.");
         let offered = provider.offered.lock().expect("offered").clone();
-        assert_eq!(offered[0], ["search_web", "get_finance_dashboard", SWITCH_AREA_TOOL]);
+        assert_eq!(offered[0], ["search_web", "get_finance_month", SWITCH_AREA_TOOL]);
         assert_eq!(offered[1], ["search_web", "log_meal", SWITCH_AREA_TOOL]);
         // An area the actor cannot use is refused and the areas stay.
         assert_eq!(offered[2], offered[1]);
@@ -3213,10 +3196,10 @@ mod tests {
 
         // Without areas, the tools are offered as they come.
         let plain = RecordingProvider::new(vec![assistant("Hola.", Vec::new())]);
-        let request = request(vec![tool("search_web", true), tool("get_finance_dashboard", true), tool("log_meal", true)]);
+        let request = request(vec![tool("search_web", true), tool("get_finance_month", true), tool("log_meal", true)]);
         run_agent(&plain, &read_executor(), &NoopAgentState, &VecEventSink::default(), &request, &principal(), &RequestControl::new(None), &AgentRuntimeOptions::default())
             .expect("agent completes");
-        assert_eq!(plain.offered.lock().expect("offered")[0], ["search_web", "get_finance_dashboard", "log_meal"]);
+        assert_eq!(plain.offered.lock().expect("offered")[0], ["search_web", "get_finance_month", "log_meal"]);
     }
 
     #[test]
@@ -3232,7 +3215,7 @@ mod tests {
             assistant("Leí el chat entero.", Vec::new()),
         ]);
         let executor = read_executor();
-        let mut routed = request(vec![tool("search_web", true), tool("get_finance_dashboard", true), tool("log_meal", true)]);
+        let mut routed = request(vec![tool("search_web", true), tool("get_finance_month", true), tool("log_meal", true)]);
         routed.tool_areas = Some(vec!["finanzas".into()]);
         routed.messages[0].attachments.push(MessageAttachment {
             name: "chat.md".into(),
@@ -3357,10 +3340,10 @@ mod tests {
     fn finance_answers_are_checked_where_finance_can_be_written() {
         let library = request(Vec::new());
         assert!(!offers_finance_writes(&library, &[tool("read_library_documents", true)]));
-        assert!(offers_finance_writes(&library, &[tool("create_finance_purchase", false)]));
+        assert!(offers_finance_writes(&library, &[tool("save_finance_expense", false)]));
         let mut finance = request(Vec::new());
         finance.context.scope = BackendScope::Finance;
-        assert!(offers_finance_writes(&finance, &[tool("get_finance_dashboard", true)]));
+        assert!(offers_finance_writes(&finance, &[tool("get_finance_month", true)]));
         assert!(!offers_finance_writes(&finance, &[]));
     }
 
@@ -3785,7 +3768,7 @@ mod tests {
         assert!(contains_pending_action("Ahora crearé la nota."));
         assert!(!contains_pending_action("```Ahora crearé la nota```"));
         assert_eq!(
-            crate::catalog::tool_policy("get_finance_dashboard"),
+            crate::catalog::tool_policy("get_finance_month"),
             ToolPolicy::FinanceRead
         );
     }

@@ -1,33 +1,51 @@
 //! Formularios de Finanzas: qué se carga a mano y cómo se pide.
 //!
-//! Rust arma cada formulario (campos, opciones, valores, ayuda) y la web y
-//! la app de Android solo lo dibujan con un renderizador genérico. Las
-//! claves de los campos son las de los argumentos de las herramientas del
-//! asistente (`amount`, `accountId`, `effectiveDate`…), así la carga manual
-//! pasa por los mismos constructores y los errores nombran el mismo campo.
+//! Rust arma cada formulario (campos, opciones, valores por defecto, ayuda)
+//! y la web y la app de Android solo lo dibujan. Se pide lo mínimo: lo
+//! demás tiene un valor por defecto que no hace falta tocar (la fecha es
+//! hoy, la moneda es pesos, la primera cuota es el mes que viene).
+//!
+//! Un campo con `reload` vuelve a pedir el formulario cuando cambia, con
+//! los valores cargados y `_changed`: así el pago de un servicio trae el
+//! importe del servicio elegido y el pago de una tarjeta, sus cuotas.
 
+use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::finance::{FinanceAccount, FinanceCategory, FinanceSavingsReserve, FinanceService};
-use crate::finance_budgets::money_text;
-use crate::finance_loans::LoanSummary;
-
-pub(crate) type Values = Map<String, Value>;
+use crate::finance::{
+    add_months, amount_input, current_month, money_text, month_label, month_short, today, CATEGORY_OTHER, CATEGORY_OTHER_INCOME,
+    CATEGORY_SALARY,
+};
+use crate::finance_model::{self as model, cents, Category, LoanState, Named, PurchaseState, Reserve, Service};
+use crate::finance_ops::{text, Values};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Choice {
     pub value: String,
     pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 fn choice(value: impl Into<String>, label: impl Into<String>) -> Choice {
-    Choice { value: value.into(), label: label.into() }
+    Choice { value: value.into(), label: label.into(), detail: None }
 }
 
-/// One field. `type` is `text`, `multiline`, `money`, `integer`, `date`,
-/// `month`, `select`, `toggle` or `items` (rows with `columns`).
+/// The currency next to an amount: its own key in the values.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrencyPick {
+    pub key: String,
+    pub value: String,
+    /// The amount is in this currency and it cannot change.
+    pub locked: bool,
+}
+
+/// One field. `type` is `text`, `money`, `integer`, `date`, `month`,
+/// `select`, `checks` (several options, the value is the list of chosen
+/// ones) or `info` (a line to read).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Field {
@@ -45,12 +63,10 @@ pub struct Field {
     pub options: Vec<Choice>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub columns: Vec<Field>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub add_label: Option<String>,
+    pub currency: Option<CurrencyPick>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub read_only: bool,
+    pub reload: bool,
 }
 
 impl Field {
@@ -65,19 +81,18 @@ impl Field {
             placeholder: None,
             options: Vec::new(),
             suggestions: Vec::new(),
-            columns: Vec::new(),
-            add_label: None,
-            read_only: false,
+            currency: None,
+            reload: false,
         }
     }
     fn text(key: &str, label: &str) -> Self {
         Self::new("text", key, label)
     }
-    fn multiline(key: &str, label: &str) -> Self {
-        Self::new("multiline", key, label)
+    fn money(key: &str, label: &str, currency: &str) -> Self {
+        Field { currency: Some(CurrencyPick { key: "currency".into(), value: currency.into(), locked: false }), ..Self::new("money", key, label) }
     }
-    fn money(key: &str, label: &str) -> Self {
-        Self::new("money", key, label)
+    fn locked_money(key: &str, label: &str, currency: &str) -> Self {
+        Field { currency: Some(CurrencyPick { key: String::new(), value: currency.into(), locked: true }), ..Self::new("money", key, label) }
     }
     fn integer(key: &str, label: &str) -> Self {
         Self::new("integer", key, label)
@@ -91,11 +106,12 @@ impl Field {
     fn select(key: &str, label: &str, options: Vec<Choice>) -> Self {
         Field { options, ..Self::new("select", key, label) }
     }
-    fn toggle(key: &str, label: &str) -> Self {
-        Field { value: Value::Bool(false), ..Self::new("toggle", key, label) }
+    fn checks(key: &str, label: &str, options: Vec<Choice>) -> Self {
+        let chosen = options.iter().map(|option| Value::String(option.value.clone())).collect();
+        Field { options, value: Value::Array(chosen), ..Self::new("checks", key, label) }
     }
-    fn items(key: &str, label: &str, add_label: &str, columns: Vec<Field>) -> Self {
-        Field { value: Value::Array(Vec::new()), columns, add_label: Some(add_label.into()), ..Self::new("items", key, label) }
+    fn info(key: &str, label: &str, text: impl Into<String>) -> Self {
+        Field { value: Value::String(text.into()), ..Self::new("info", key, label) }
     }
     fn required(mut self) -> Self {
         self.required = true;
@@ -117,8 +133,14 @@ impl Field {
         self.value = value.into();
         self
     }
-    fn read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
+    fn reload(mut self) -> Self {
+        self.reload = true;
+        self
+    }
+    fn currency_value(mut self, value: &str) -> Self {
+        if let Some(currency) = &mut self.currency {
+            currency.value = value.into();
+        }
         self
     }
 }
@@ -128,16 +150,6 @@ impl Field {
 pub struct FormDelete {
     pub label: String,
     pub confirm: String,
-}
-
-/// Another thing the form's record can do (for example, take back the
-/// payment of an installment).
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct FormAction {
-    pub id: String,
-    pub label: String,
-    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -150,35 +162,10 @@ pub struct EntryForm {
     pub submit: String,
     pub fields: Vec<Field>,
     pub delete: Option<FormDelete>,
-    pub actions: Vec<FormAction>,
 }
 
-/// What the forms offer to choose from.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Catalog {
-    pub accounts: Vec<FinanceAccount>,
-    pub categories: Vec<FinanceCategory>,
-    pub services: Vec<FinanceService>,
-    pub reserves: Vec<FinanceSavingsReserve>,
-    pub loans: Vec<LoanSummary>,
-    pub merchants: Vec<(String, String)>,
-    pub products: Vec<(String, String)>,
-    pub today: String,
-}
-
-/// How the form treats the record it edits.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Editing {
-    pub id: Option<String>,
-    /// The document a movement belongs to: its amount, date and account
-    /// are corrected there.
-    pub owner: Option<&'static str>,
-}
-
-impl Editing {
-    fn is_edit(&self) -> bool {
-        self.id.is_some()
-    }
+fn delete(label: &str, confirm: &str) -> Option<FormDelete> {
+    Some(FormDelete { label: label.into(), confirm: confirm.into() })
 }
 
 // ---------------------------------------------------------------------------
@@ -200,811 +187,651 @@ pub struct MenuGroup {
     pub items: Vec<MenuItem>,
 }
 
-/// Every kind of load, grouped as the «Cargar» menu shows them.
+fn item(kind: &'static str, label: &'static str, description: &'static str) -> MenuItem {
+    MenuItem { kind, label, description }
+}
+
 pub(crate) fn menu() -> Vec<MenuGroup> {
-    let item = |kind, label, description| MenuItem { kind, label, description };
     vec![
         MenuGroup {
             title: "Del día a día",
             items: vec![
-                item("expense", "Gasto", "Algo que pagaste, en efectivo, débito o tarjeta."),
-                item("income", "Ingreso", "Plata que entró y no es el sueldo."),
-                item("transfer", "Transferencia", "Entre dos cuentas tuyas de la misma moneda."),
-                item("service-payment", "Pago de servicio", "Marca el servicio del mes como pagado."),
-                item("loan-payment", "Pago de préstamo", "La próxima cuota de un préstamo."),
+                item("expense", "Gasto", "Nombre, importe y categoría"),
+                item("card-purchase", "Compra con tarjeta", "En una o en varias cuotas"),
+                item("income", "Ingreso", "Lo que entra aparte del sueldo"),
+                item("salary", "Sueldo", "Lo que cobraste este mes"),
+            ],
+        },
+        MenuGroup {
+            title: "Pagos del mes",
+            items: vec![
+                item("service-payment", "Pagar un servicio", "Luz, internet, alquiler…"),
+                item("card-payment", "Pagar la tarjeta", "Las cuotas que vencen"),
+                item("loan-payment", "Pagar una cuota de préstamo", "Con lo que pagaste"),
             ],
         },
         MenuGroup {
             title: "Ahorro",
             items: vec![
-                item("savings-movement", "Movimiento de ahorro", "Aporte, retiro, rendimiento o ajuste de una reserva."),
-                item("exchange", "Compra o venta de dólares", "Pesos que pasan al ahorro en dólares, o al revés."),
-            ],
-        },
-        MenuGroup {
-            title: "Documentos",
-            items: vec![
-                item("purchase", "Ticket", "Una compra con sus productos y precios."),
-                item("card-statement", "Resumen de tarjeta", "Ya pagado: sus consumos cuentan en el mes del vencimiento."),
-                item("salary", "Sueldo", "El recibo del mes, con o sin sus conceptos."),
-                item("installment-plan", "Plan de cuotas", "Una compra en cuotas con tarjeta."),
-                item("service-invoice", "Factura de servicio", "Lo que te facturó un servicio en un período."),
+                item("savings", "Guardar o sacar ahorro", "En pesos o en dólares"),
+                item("exchange", "Comprar o vender dólares", "Con los pesos que pagaste"),
             ],
         },
         MenuGroup {
             title: "Configurar",
             items: vec![
-                item("account", "Cuenta", "Banco, efectivo, billetera o tarjeta."),
-                item("category", "Categoría", "Para ordenar gastos o ingresos."),
-                item("service", "Servicio", "Algo que pagás todos los meses."),
-                item("reserve", "Reserva de ahorro", "Donde guardás lo ahorrado."),
-                item("loan", "Préstamo", "Lo que debés y sus cuotas."),
-                item("budget", "Presupuesto", "Un tope mensual para una categoría."),
+                item("card", "Tarjeta", "Para cargarle compras"),
+                item("service", "Servicio", "Lo que pagás todos los meses"),
+                item("loan", "Préstamo", "Monto y cuotas"),
+                item("budget", "Presupuesto", "Un tope por categoría"),
+                item("category", "Categoría", "De gastos o de ingresos"),
+                item("reserve", "Reserva de ahorro", "Con un objetivo, si querés"),
+                item("account", "Cuenta", "Para anotar de dónde sale la plata"),
             ],
         },
     ]
 }
 
-/// The title of a kind, for messages.
-pub(crate) fn kind_label(kind: &str) -> &'static str {
-    menu()
-        .into_iter()
-        .flat_map(|group| group.items)
-        .find(|item| item.kind == kind)
-        .map(|item| item.label)
-        .unwrap_or(match kind {
-            "merchant" => "Comercio",
-            "product" => "Producto",
-            _ => "Registro",
-        })
-}
-
 // ---------------------------------------------------------------------------
-// Options
+// What the forms offer
 // ---------------------------------------------------------------------------
 
-fn account_label(account: &FinanceAccount) -> String {
-    let kind = match account.account_type.as_str() {
-        "credit_card" => "tarjeta",
-        "cash" => "efectivo",
-        "wallet" => "billetera",
-        "bank" => "banco",
-        _ => "cuenta",
-    };
-    format!("{} · {kind} · {}", account.name, account.currency)
+/// Everything a form may offer to choose from.
+pub(crate) struct Catalog {
+    pub categories: Vec<Category>,
+    pub accounts: Vec<Named>,
+    pub cards: Vec<Named>,
+    pub services: Vec<Service>,
+    pub loans: Vec<LoanState>,
+    pub purchases: Vec<PurchaseState>,
+    pub reserves: Vec<Reserve>,
+    /// Names of recent expenses, to suggest while typing.
+    pub recent_names: Vec<String>,
 }
 
-fn accounts(catalog: &Catalog, only_cards: bool) -> Vec<Choice> {
-    catalog
-        .accounts
-        .iter()
-        .filter(|account| account.active && (!only_cards || account.account_type == "credit_card"))
-        .map(|account| choice(&account.id, account_label(account)))
-        .collect()
+pub(crate) fn catalog(connection: &Connection) -> rusqlite::Result<Catalog> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM finance_movements WHERE kind='expense' AND card_purchase_id IS NULL AND loan_id IS NULL AND service_id IS NULL
+         GROUP BY name ORDER BY MAX(date) DESC LIMIT 40",
+    )?;
+    let recent_names = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+    Ok(Catalog {
+        categories: model::list_categories(connection)?,
+        accounts: model::list_accounts(connection)?,
+        cards: model::list_cards(connection)?,
+        services: model::list_services(connection)?,
+        loans: model::loan_states(connection)?,
+        purchases: model::purchase_states(connection)?,
+        reserves: model::list_reserves(connection)?,
+        recent_names,
+    })
 }
 
-fn categories(catalog: &Catalog, kind: &str, none: Option<&str>) -> Vec<Choice> {
-    let mut options = none.map(|label| vec![choice("", label)]).unwrap_or_default();
-    let mut found = catalog
-        .categories
-        .iter()
-        .filter(|category| category.active && category.kind == kind)
-        .map(|category| choice(&category.id, &category.name))
-        .collect::<Vec<_>>();
-    found.sort_by_key(|option| option.label.to_lowercase());
-    options.extend(found);
-    options
-}
-
-fn cents(value: &str) -> i128 {
-    crate::finance::parse_cents(value).unwrap_or_default()
-}
-
-fn services(catalog: &Catalog) -> Vec<Choice> {
-    catalog
-        .services
-        .iter()
-        .filter(|service| service.active)
-        .map(|service| choice(&service.id, format!("{} · {}", service.name, money_text(cents(&service.expected_amount), &service.currency))))
-        .collect()
-}
-
-fn reserves(catalog: &Catalog) -> Vec<Choice> {
-    catalog
-        .reserves
-        .iter()
-        .filter(|reserve| reserve.active)
-        .map(|reserve| choice(&reserve.id, format!("{} · {}", reserve.name, money_text(cents(&reserve.balance), &reserve.currency))))
-        .collect()
-}
-
-fn loans(catalog: &Catalog) -> Vec<Choice> {
-    catalog
-        .loans
-        .iter()
-        .filter(|summary| summary.loan.active && summary.next_due.is_some())
-        .map(|summary| {
-            let next = summary.next_due.as_ref().map(|item| format!(" · cuota {}/{}", item.number, summary.loan.installment_count)).unwrap_or_default();
-            choice(&summary.loan.id, format!("{}{next}", summary.loan.name))
-        })
-        .collect()
-}
-
-fn currencies(with_default: Option<&str>) -> Vec<Choice> {
-    let mut options = with_default.map(|label| vec![choice("", label)]).unwrap_or_default();
-    options.push(choice("ARS", "Pesos (ARS)"));
-    options.push(choice("USD", "Dólares (USD)"));
-    options
-}
-
-fn active_toggle(editing: &Editing) -> Option<Field> {
-    editing.is_edit().then(|| Field::toggle("active", "Activo").default(true).help("Lo inactivo no aparece para elegir en las cargas nuevas."))
-}
-
-// ---------------------------------------------------------------------------
-// Forms
-// ---------------------------------------------------------------------------
-
-fn form(kind: &str, editing: &Editing, title_new: &str, title_edit: &str, submit: &str, fields: Vec<Option<Field>>) -> EntryForm {
-    EntryForm {
-        kind: kind.into(),
-        id: editing.id.clone(),
-        title: if editing.is_edit() { title_edit } else { title_new }.into(),
-        intro: None,
-        submit: submit.into(),
-        fields: fields.into_iter().flatten().collect(),
-        delete: None,
-        actions: Vec::new(),
+impl Catalog {
+    fn categories(&self, kind: &str) -> Vec<Choice> {
+        self.categories.iter().filter(|category| category.kind == kind).map(|category| choice(&category.id, &category.name)).collect()
     }
-}
 
-fn deletable(mut form: EntryForm, label: &str, confirm: &str) -> EntryForm {
-    if form.id.is_some() {
-        form.delete = Some(FormDelete { label: label.into(), confirm: confirm.into() });
+    fn named(list: &[Named]) -> Vec<Choice> {
+        list.iter().map(|item| choice(&item.id, &item.name)).collect()
     }
-    form
-}
 
-fn intro(mut form: EntryForm, intro: Option<String>) -> EntryForm {
-    form.intro = intro;
-    form
-}
-
-fn movement_fields(catalog: &Catalog, editing: &Editing, category_kind: &str) -> Vec<Option<Field>> {
-    let owned = editing.owner.is_some();
-    let owned_help = editing.owner.map(|owner| format!("Se corrige desde el {owner}."));
-    let locked = |field: Field| {
-        let field = field.read_only(owned);
-        match &owned_help {
-            Some(help) => field.help(help.clone()),
-            None => field,
-        }
-    };
-    vec![
-        Some(locked(Field::money("amount", "Importe").required().placeholder("Ej.: 15.000,50"))),
-        Some(locked(Field::select("accountId", "Cuenta", accounts(catalog, false)).required())),
-        Some(
-            locked(Field::select("currency", "Moneda", currencies(Some("La de la cuenta"))))
-                .help("Solo una tarjeta acepta pesos y dólares; las demás cuentas usan su moneda."),
-        ),
-        Some(locked(Field::date("effectiveDate", "Fecha").required().default(catalog.today.clone()))),
-        Some(Field::select(
-            "categoryId",
-            "Categoría",
-            categories(catalog, category_kind, Some("Sin categoría")),
-        )),
-        Some(Field::text("description", "Descripción").required().placeholder("Ej.: Almuerzo con amigos")),
-    ]
-}
-
-fn expense(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let mut fields = movement_fields(catalog, editing, "expense");
-    fields.push(Some(
-        Field::select("serviceId", "Servicio", {
-            let mut options = vec![choice("", "No es un servicio")];
-            options.extend(services(catalog));
-            options
-        })
-        .help("Si es el pago de un servicio, ese mes queda pagado."),
-    ));
-    let form = form("expense", editing, "Nuevo gasto", "Editar gasto", "Guardar gasto", fields);
-    let form = intro(
-        form,
-        Some("Con tarjeta de crédito queda «En tarjeta, a pagar» hasta que cargues el resumen que la incluye.".into()),
-    );
-    deletable(form, "Eliminar gasto", "¿Eliminar este gasto? No se puede deshacer.")
-}
-
-fn income(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let form = form("income", editing, "Nuevo ingreso", "Editar ingreso", "Guardar ingreso", movement_fields(catalog, editing, "income"));
-    let form = intro(form, Some("El sueldo se carga con «Sueldo» para que cuente en «¿A dónde fue el sueldo?».".into()));
-    deletable(form, "Eliminar ingreso", "¿Eliminar este ingreso? No se puede deshacer.")
-}
-
-fn transfer(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::money("amount", "Importe").required()),
-        Some(Field::select("accountId", "Desde", accounts(catalog, false)).required()),
-        Some(Field::select("destinationAccountId", "Hacia", accounts(catalog, false)).required()),
-        Some(Field::date("effectiveDate", "Fecha").required().default(catalog.today.clone())),
-        Some(Field::text("description", "Descripción").required().default("Transferencia")),
-    ];
-    let form = form("transfer", editing, "Nueva transferencia", "Editar transferencia", "Guardar transferencia", fields);
-    deletable(form, "Eliminar transferencia", "¿Eliminar esta transferencia? No se puede deshacer.")
-}
-
-fn service_payment(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::select("serviceId", "Servicio", services(catalog)).required()),
-        Some(Field::money("amount", "Importe pagado").help("Vacío: el importe esperado del servicio.")),
-        Some(Field::select("accountId", "Cuenta", {
-            let mut options = vec![choice("", "La habitual del servicio")];
-            options.extend(accounts(catalog, false));
-            options
-        })),
-        Some(Field::date("effectiveDate", "Fecha de pago").required().default(catalog.today.clone())),
-        Some(Field::text("description", "Descripción").placeholder("Vacío: «Pago de» y el servicio")),
-    ];
-    intro(
-        form("service-payment", editing, "Pago de servicio", "Pago de servicio", "Registrar pago", fields),
-        (catalog.services.iter().all(|service| !service.active)).then(|| "Todavía no hay servicios: creá uno en «Servicio».".to_string()),
-    )
-}
-
-fn loan_payment(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::select("loanId", "Préstamo", loans(catalog)).required()),
-        Some(Field::money("amount", "Importe pagado").help("Vacío: el importe de la cuota. Si cambió (un préstamo UVA), escribí lo que pagaste.")),
-        Some(Field::select("accountId", "Cuenta", {
-            let mut options = vec![choice("", "La habitual del préstamo")];
-            options.extend(accounts(catalog, false));
-            options
-        })),
-        Some(Field::date("effectiveDate", "Fecha de pago").required().default(catalog.today.clone())),
-    ];
-    intro(
-        form("loan-payment", editing, "Pago de préstamo", "Pago de préstamo", "Pagar cuota", fields),
-        Some(if catalog.loans.iter().any(|summary| summary.loan.active && summary.next_due.is_some()) {
-            "Se paga la próxima cuota sin pagar del préstamo; cuenta como gasto de «Préstamos».".into()
-        } else {
-            "No hay préstamos con cuotas por pagar: creá uno en «Préstamo».".into()
-        }),
-    )
-}
-
-fn savings_movement(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let types = vec![
-        choice("contribution", "Aporte"),
-        choice("withdrawal", "Retiro"),
-        choice("return", "Rendimiento"),
-        choice("loss", "Pérdida"),
-        choice("adjustment", "Ajuste"),
-    ];
-    let fields = vec![
-        Some(Field::select("reserveId", "Reserva", reserves(catalog)).required()),
-        Some(Field::select("movementType", "Tipo", types).required().default("contribution")),
-        Some(Field::money("amount", "Importe").required()),
-        Some(Field::select("accountId", "Cuenta", {
-            let mut options = vec![choice("", "Ninguna")];
-            options.extend(accounts(catalog, false));
-            options
-        })
-        .help("De dónde salió un aporte o adónde fue un retiro.")),
-        Some(Field::date("effectiveDate", "Fecha").required().default(catalog.today.clone())),
-        Some(Field::text("description", "Descripción")),
-        Some(Field::text("reason", "Motivo").help("Obligatorio para un retiro.")),
-    ];
-    let form = form("savings-movement", editing, "Movimiento de ahorro", "Editar movimiento de ahorro", "Guardar", fields);
-    let form = intro(form, catalog.reserves.iter().all(|reserve| !reserve.active).then(|| "Todavía no hay reservas: creá una en «Reserva de ahorro».".to_string()));
-    deletable(form, "Eliminar movimiento", "¿Eliminar este movimiento de ahorro?")
-}
-
-fn exchange(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::select("direction", "Operación", vec![choice("buy", "Compra: pesos al ahorro"), choice("sell", "Venta: del ahorro a una cuenta")]).required().default("buy")),
-        Some(Field::select("reserveId", "Reserva", reserves(catalog)).required()),
-        Some(Field::select("sourceAccountId", "Cuenta", accounts(catalog, false)).required().help("De donde salen los pesos, o adonde vuelven en una venta.")),
-        Some(Field::money("sourceAmount", "Importe en la moneda de la cuenta").required().placeholder("Ej.: 1.250.000")),
-        Some(Field::money("savingsAmount", "Importe en la moneda de la reserva").required().placeholder("Ej.: 1.000")),
-        Some(Field::date("effectiveDate", "Fecha").required().default(catalog.today.clone())),
-        Some(Field::text("description", "Descripción").default("Compra de dólares")),
-    ];
-    let form = form("exchange", editing, "Compra o venta de dólares", "Compra o venta de dólares", "Guardar", fields);
-    intro(form, Some("No es un gasto ni un ingreso: cambia de moneda lo que tenés.".into()))
-}
-
-fn salary(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let concepts = vec![
-        Field::text("name", "Concepto").required(),
-        Field::select("conceptType", "Tipo", vec![choice("earning", "Haber"), choice("deduction", "Descuento")]).required().default("earning"),
-        Field::money("amount", "Importe").required(),
-    ];
-    let fields = vec![
-        Some(Field::text("employer", "Empleador").required()),
-        Some(Field::month("period", "Período").required().default(catalog.today.get(..7).unwrap_or_default().to_string())),
-        Some(Field::date("paymentDate", "Fecha de cobro").required().default(catalog.today.clone())),
-        Some(Field::select("accountId", "Cuenta donde cobrás", accounts(catalog, false)).required()),
-        Some(Field::money("netAmount", "Neto").required()),
-        Some(Field::money("grossAmount", "Bruto").help("Vacío: igual al neto.")),
-        Some(Field::money("deductionsTotal", "Descuentos").help("Vacío: bruto menos neto.")),
-        Some(Field::items("concepts", "Conceptos del recibo", "Agregar concepto", concepts)),
-    ];
-    let form = form("salary", editing, "Nuevo sueldo", "Editar sueldo", "Guardar sueldo", fields);
-    deletable(form, "Eliminar sueldo", "¿Eliminar este recibo de sueldo y su ingreso?")
-}
-
-fn purchase(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let items = vec![
-        Field::text("originalDescription", "Producto").required(),
-        Field::money("quantity", "Cantidad").default("1"),
-        Field::money("unitPrice", "Precio unitario").required(),
-        Field::money("lineTotal", "Total de la línea").help("Vacío: cantidad por precio."),
-    ];
-    let fields = vec![
-        Some(Field::text("merchantName", "Comercio").required().suggestions(catalog.merchants.iter().map(|(_, name)| name.clone()).collect())),
-        Some(Field::date("observedAt", "Fecha").required().default(catalog.today.clone())),
-        Some(Field::select("accountId", "Cuenta", accounts(catalog, false)).required()),
-        Some(Field::select("currency", "Moneda", currencies(Some("La de la cuenta")))),
-        Some(Field::select("categoryId", "Categoría", categories(catalog, "expense", Some("Sin categoría")))),
-        Some(Field::items("items", "Productos", "Agregar producto", items).required()),
-        Some(Field::money("discountAmount", "Descuentos")),
-        Some(Field::money("totalAmount", "Total pagado").help("Vacío: la suma de los productos menos los descuentos.")),
-    ];
-    let form = form("purchase", editing, "Nuevo ticket", "Editar ticket", "Guardar ticket", fields);
-    deletable(form, "Eliminar ticket", "¿Eliminar este ticket con sus productos y su gasto?")
-}
-
-fn card_statement(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let types = vec![
-        choice("purchase", "Consumo"),
-        choice("fee", "Cargo"),
-        choice("interest", "Interés"),
-        choice("tax", "Impuesto"),
-        choice("payment", "Pago"),
-        choice("credit", "Crédito o devolución"),
-    ];
-    let lines = vec![
-        Field::date("purchaseDate", "Fecha").required(),
-        Field::text("description", "Descripción").required(),
-        Field::money("amount", "Importe").required(),
-        Field::select("itemType", "Tipo", types).required().default("purchase"),
-        Field::integer("installmentNumber", "Cuota"),
-        Field::integer("installmentCount", "De"),
-        Field::select("categoryId", "Categoría", categories(catalog, "expense", Some("La habitual del comercio"))),
-    ];
-    let fields = vec![
-        Some(Field::select("accountId", "Tarjeta", accounts(catalog, true)).required()),
-        Some(Field::select("currency", "Moneda", currencies(None)).required().default("ARS").help("Un resumen con pesos y dólares se carga dos veces, una por moneda.")),
-        Some(Field::text("issuer", "Banco o emisor").required()),
-        Some(Field::text("cardLastFour", "Últimos 4 dígitos").placeholder("Opcional")),
-        Some(Field::month("period", "Período").required().default(catalog.today.get(..7).unwrap_or_default().to_string())),
-        Some(Field::date("closingDate", "Cierre").required()),
-        Some(Field::date("dueDate", "Vencimiento").required()),
-        Some(Field::money("totalDue", "Total a pagar").required()),
-        Some(Field::money("minimumPayment", "Pago mínimo")),
-        Some(Field::money("previousBalance", "Saldo anterior").help("Vacío: cero.")),
-        Some(Field::money("paymentsAmount", "Pagos del período").help("Vacío: cero.")),
-        Some(Field::items("items", "Líneas del resumen", "Agregar línea", lines).required()),
-    ];
-    let form = form("card-statement", editing, "Nuevo resumen de tarjeta", "Editar resumen de tarjeta", "Guardar resumen", fields);
-    let form = intro(
-        form,
-        Some("Cargar el resumen es decir que ya se pagó. Los consumos, cargos, intereses e impuestos se suman solos desde las líneas; los gastos con tarjeta que esperaban este resumen se unen a su línea.".into()),
-    );
-    deletable(form, "Eliminar resumen", "¿Eliminar este resumen? Sus gastos vuelven a quedar «En tarjeta, a pagar» o se borran.")
-}
-
-fn installment_plan(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::select("accountId", "Tarjeta o cuenta", accounts(catalog, false)).required()),
-        Some(Field::text("merchantName", "Comercio").suggestions(catalog.merchants.iter().map(|(_, name)| name.clone()).collect())),
-        Some(Field::text("description", "Descripción").required()),
-        Some(Field::date("purchaseDate", "Fecha de compra").required().default(catalog.today.clone())),
-        Some(Field::select("currency", "Moneda", currencies(None)).required().default("ARS")),
-        Some(Field::money("totalAmount", "Total").required()),
-        Some(Field::integer("installmentCount", "Cuotas").required().default("3")),
-    ];
-    let form = form("installment-plan", editing, "Nuevo plan de cuotas", "Editar plan de cuotas", "Guardar plan", fields);
-    let form = intro(form, Some("Las cuotas no son gastos todavía: cada una cuenta cuando la paga un resumen.".into()));
-    deletable(form, "Eliminar plan", "¿Eliminar este plan de cuotas?")
-}
-
-fn service_invoice(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::select("serviceId", "Servicio", services(catalog)).required()),
-        Some(Field::month("period", "Período").required().default(catalog.today.get(..7).unwrap_or_default().to_string())),
-        Some(Field::money("amount", "Importe").required()),
-        Some(Field::date("dueDate", "Vencimiento")),
-        Some(Field::text("provider", "Proveedor")),
-    ];
-    let form = form("service-invoice", editing, "Nueva factura de servicio", "Editar factura", "Guardar factura", fields);
-    let form = intro(form, Some("Registrar la factura no crea un gasto: el pago se carga con «Pago de servicio».".into()));
-    deletable(form, "Eliminar factura", "¿Eliminar esta factura?")
-}
-
-fn account(_catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let types = vec![
-        choice("bank", "Cuenta bancaria"),
-        choice("cash", "Efectivo"),
-        choice("wallet", "Billetera virtual"),
-        choice("credit_card", "Tarjeta de crédito"),
-        choice("other", "Otra"),
-    ];
-    let fields = vec![
-        Some(Field::text("name", "Nombre").required().placeholder("Ej.: Galicia, Mercado Pago, Visa")),
-        Some(Field::select("accountType", "Tipo", types).required().default("bank")),
-        Some(Field::select("currency", "Moneda", currencies(None)).required().default("ARS").help("Una tarjeta acepta pesos y dólares igual.")),
-        active_toggle(editing),
-    ];
-    let form = form("account", editing, "Nueva cuenta", "Editar cuenta", "Guardar cuenta", fields);
-    deletable(form, "Desactivar cuenta", "¿Desactivar esta cuenta? Sus movimientos quedan.")
-}
-
-fn category(_catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::text("name", "Nombre").required()),
-        Some(Field::select("kind", "Para", vec![choice("expense", "Gastos"), choice("income", "Ingresos")]).required().default("expense")),
-        Some(Field::multiline("description", "Qué entra").help("Le sirve al asistente para elegirla.")),
-        active_toggle(editing),
-    ];
-    let form = form("category", editing, "Nueva categoría", "Editar categoría", "Guardar categoría", fields);
-    deletable(form, "Desactivar categoría", "¿Desactivar esta categoría? Sus movimientos quedan.")
-}
-
-fn service(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::text("name", "Nombre").required().placeholder("Ej.: Internet Fibertel")),
-        Some(Field::select("categoryId", "Categoría", categories(catalog, "expense", None)).required()),
-        Some(Field::select("currency", "Moneda", currencies(None)).required().default("ARS")),
-        Some(Field::money("expectedAmount", "Importe esperado").required()),
-        Some(Field::select("modality", "Importe", vec![choice("fixed", "Fijo"), choice("variable", "Variable")]).required().default("fixed")),
-        Some(Field::integer("dueDay", "Día de vencimiento").placeholder("1 a 31")),
-        Some(Field::select("defaultAccountId", "Cuenta habitual", {
-            let mut options = vec![choice("", "Ninguna")];
-            options.extend(accounts(catalog, false));
-            options
-        })),
-        Some(Field::text("provider", "Proveedor")),
-        active_toggle(editing),
-    ];
-    let form = form("service", editing, "Nuevo servicio", "Editar servicio", "Guardar servicio", fields);
-    deletable(form, "Eliminar servicio", "¿Eliminar este servicio? Sus pagos quedan como gastos.")
-}
-
-fn reserve(_catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::text("name", "Nombre").required().placeholder("Ej.: Dólares, Fondo de emergencia")),
-        Some(Field::select("currency", "Moneda", currencies(None)).required().default("USD")),
-        Some(Field::money("openingBalance", "Saldo inicial").default("0")),
-        Some(Field::text("objective", "Objetivo").placeholder("Opcional")),
-        active_toggle(editing),
-    ];
-    let form = form("reserve", editing, "Nueva reserva", "Editar reserva", "Guardar reserva", fields);
-    deletable(form, "Eliminar reserva", "¿Eliminar esta reserva con sus movimientos?")
-}
-
-fn loan(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::text("name", "Nombre").required().placeholder("Ej.: Préstamo del auto")),
-        Some(Field::text("lender", "Quién te lo dio").placeholder("Banco, financiera o persona")),
-        Some(Field::select("currency", "Moneda", currencies(None)).required().default("ARS")),
-        Some(Field::money("principal", "Lo que recibiste").placeholder("Opcional")),
-        Some(Field::integer("installmentCount", "Cantidad de cuotas").required().default("12")),
-        Some(Field::money("installmentAmount", "Importe de cada cuota").required()),
-        Some(Field::date("firstDueDate", "Primer vencimiento").required().default(catalog.today.clone())),
-        Some(Field::select("accountId", "Cuenta habitual de pago", {
-            let mut options = vec![choice("", "Ninguna")];
-            options.extend(accounts(catalog, false));
-            options
-        })),
-        Some(Field::multiline("notes", "Notas")),
-        active_toggle(editing),
-    ];
-    let form = form("loan", editing, "Nuevo préstamo", "Editar préstamo", "Guardar préstamo", fields);
-    let mut form = intro(form, Some("Las cuotas vencen una por mes desde el primer vencimiento. Cambiar el importe o la cantidad cambia solo las cuotas sin pagar.".into()));
-    if let Some(summary) = editing.id.as_ref().and_then(|id| catalog.loans.iter().find(|summary| &summary.loan.id == id)) {
-        if let Some(last) = summary.installments.iter().rev().find(|item| item.transaction_id.is_some()) {
-            form.actions.push(FormAction {
-                id: "unpay-last".into(),
-                label: format!("Desmarcar la cuota {}", last.number),
-                confirm: Some(format!("¿Desmarcar la cuota {} y borrar su gasto?", last.number)),
-            });
-        }
-    }
-    deletable(form, "Eliminar préstamo", "¿Eliminar este préstamo y los gastos de sus cuotas pagadas?")
-}
-
-fn budget(catalog: &Catalog, editing: &Editing) -> EntryForm {
-    let fields = vec![
-        Some(Field::select("categoryId", "Categoría", categories(catalog, "expense", None)).required()),
-        Some(Field::select("currency", "Moneda", currencies(None)).required().default("ARS")),
-        Some(Field::money("amount", "Tope del mes").required()),
-        active_toggle(editing),
-    ];
-    let form = form("budget", editing, "Nuevo presupuesto", "Editar presupuesto", "Guardar presupuesto", fields);
-    let form = intro(form, Some("Al llegar al 80 % y al pasarte, Notia te avisa por Telegram.".into()));
-    deletable(form, "Eliminar presupuesto", "¿Eliminar este presupuesto?")
-}
-
-fn rename_merge(kind: &str, others: &[(String, String)], editing: &Editing, title: &str) -> EntryForm {
-    let mut targets = vec![choice("", "No unir")];
-    targets.extend(
-        others
+    fn reserves(&self, currency: Option<&str>) -> Vec<Choice> {
+        self.reserves
             .iter()
-            .filter(|(id, _)| Some(id) != editing.id.as_ref())
-            .map(|(id, name)| choice(id, name)),
-    );
-    let fields = vec![
-        Some(Field::text("name", "Nombre").required()),
-        Some(Field::select("intoId", "Unir con", targets).help("Si es el mismo que otro, sus precios y compras pasan a ese.")),
-    ];
-    form(kind, editing, title, title, "Guardar", fields)
+            .filter(|reserve| currency.is_none_or(|currency| reserve.currency == currency))
+            .map(|reserve| choice(&reserve.id, format!("{} ({})", reserve.name, if reserve.currency == "USD" { "US$" } else { "$" })))
+            .collect()
+    }
 }
 
-/// The form of `kind`, with `values` (a stored record, what the screen
-/// preselected) over its defaults. `None` for an unknown kind.
-pub(crate) fn build(kind: &str, catalog: &Catalog, editing: &Editing, values: &Values) -> Option<EntryForm> {
-    let mut form = match kind {
-        "expense" => expense(catalog, editing),
-        "income" => income(catalog, editing),
-        "transfer" => transfer(catalog, editing),
-        "service-payment" => service_payment(catalog, editing),
-        "loan-payment" => loan_payment(catalog, editing),
-        "savings-movement" => savings_movement(catalog, editing),
-        "exchange" => exchange(catalog, editing),
-        "salary" => salary(catalog, editing),
-        "purchase" => purchase(catalog, editing),
-        "card-statement" => card_statement(catalog, editing),
-        "installment-plan" => installment_plan(catalog, editing),
-        "service-invoice" => service_invoice(catalog, editing),
-        "account" => account(catalog, editing),
-        "category" => category(catalog, editing),
-        "service" => service(catalog, editing),
-        "reserve" => reserve(catalog, editing),
-        "loan" => loan(catalog, editing),
-        "budget" => budget(catalog, editing),
-        "merchant" => rename_merge("merchant", &catalog.merchants, editing, "Comercio"),
-        "product" => rename_merge("product", &catalog.products, editing, "Producto"),
-        _ => return None,
+/// The optional account of a movement, only when there are accounts.
+fn account_field(catalog: &Catalog) -> Option<Field> {
+    if catalog.accounts.is_empty() {
+        return None;
+    }
+    let mut options = vec![choice("", "Sin cuenta")];
+    options.extend(Catalog::named(&catalog.accounts));
+    Some(Field::select("accountId", "Cuenta", options))
+}
+
+fn date_field() -> Field {
+    Field::date("date", "Fecha").default(today())
+}
+
+// ---------------------------------------------------------------------------
+// Building a form
+// ---------------------------------------------------------------------------
+
+/// The form of `kind`: blank (with `prefill`), or `id` to edit. `prefill`
+/// also carries what is typed when a field with `reload` changes, with
+/// `_changed` set to that field's key.
+pub(crate) fn build(connection: &Connection, catalog: &Catalog, kind: &str, id: Option<&str>, prefill: &Values) -> rusqlite::Result<Option<EntryForm>> {
+    let stored = match id {
+        Some(id) => match stored_values(connection, catalog, kind, id)? {
+            Some(stored) => Some(stored),
+            None => return Ok(None),
+        },
+        None => None,
     };
-    for field in &mut form.fields {
-        if let Some(value) = values.get(&field.key).filter(|value| !value.is_null()) {
-            field.value = field_value(field, value);
+    let (kind, stored_values) = match &stored {
+        Some((kind, values)) => (kind.as_str(), values.clone()),
+        None => (kind, Map::new()),
+    };
+    let changed = text(prefill, "_changed");
+    let mut values = stored_values;
+    for (key, value) in prefill {
+        if key != "_changed" {
+            values.insert(key.clone(), value.clone());
         }
     }
-    Some(form)
-}
-
-/// `value` as the field shows it: amounts with a decimal comma, numbers as
-/// text, rows with their own columns.
-fn field_value(field: &Field, value: &Value) -> Value {
-    match (field.kind, value) {
-        ("money", Value::String(text)) => Value::String(money_input(text)),
-        ("money" | "integer" | "text" | "select", Value::Number(number)) => Value::String(match field.kind {
-            "money" => money_input(&number.to_string()),
-            _ => number.to_string(),
-        }),
-        ("toggle", Value::Bool(_)) => value.clone(),
-        ("date", Value::String(text)) => Value::String(text.get(..10).unwrap_or(text).to_string()),
-        ("month", Value::String(text)) => Value::String(text.get(..7).unwrap_or(text).to_string()),
-        ("items", Value::Array(rows)) => Value::Array(
-            rows.iter()
-                .filter_map(Value::as_object)
-                .map(|row| {
-                    let mut shown = Map::new();
-                    for column in &field.columns {
-                        let cell = row.get(&column.key).filter(|value| !value.is_null()).map_or_else(|| column.value.clone(), |value| field_value(column, value));
-                        shown.insert(column.key.clone(), cell);
-                    }
-                    Value::Object(shown)
-                })
-                .collect(),
-        ),
-        (_, Value::String(_)) => value.clone(),
-        _ => field.value.clone(),
-    }
-}
-
-/// A stored amount (`1234.5`) as it is typed in Argentina (`1234,50`).
-pub(crate) fn money_input(value: &str) -> String {
-    let trimmed = value.trim();
-    let Some((whole, fraction)) = trimmed.split_once('.') else {
-        return trimmed.to_string();
-    };
-    if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) || !fraction.chars().all(|c| c.is_ascii_digit()) {
-        return trimmed.to_string();
-    }
-    match fraction.len() {
-        0 => whole.to_string(),
-        1 => format!("{whole},{fraction}0"),
-        _ => format!("{whole},{fraction}"),
-    }
-}
-
-/// The values of a form as the builders read them: text trimmed, empty
-/// text gone, the columns `integer` of item rows as numbers.
-pub(crate) fn clean_values(form: &EntryForm, values: &Values) -> Values {
-    let mut clean = Map::new();
-    for field in &form.fields {
-        let Some(value) = values.get(&field.key) else { continue };
-        if let Some(value) = clean_value(field, value) {
-            clean.insert(field.key.clone(), value);
-        }
-    }
-    clean
-}
-
-fn clean_value(field: &Field, value: &Value) -> Option<Value> {
-    match (field.kind, value) {
-        ("toggle", Value::Bool(_)) => Some(value.clone()),
-        ("toggle", Value::String(text)) => Some(Value::Bool(matches!(text.as_str(), "true" | "1" | "on"))),
-        ("integer", Value::String(text)) => text.trim().parse::<u64>().ok().map(|number| json!(number)),
-        ("integer", Value::Number(_)) => Some(value.clone()),
-        ("items", Value::Array(rows)) => Some(Value::Array(
-            rows.iter()
-                .filter_map(Value::as_object)
-                .map(|row| {
-                    let mut cells = Map::new();
-                    for column in &field.columns {
-                        if let Some(cell) = row.get(&column.key).and_then(|cell| clean_value(column, cell)) {
-                            cells.insert(column.key.clone(), cell);
-                        }
-                    }
-                    Value::Object(cells)
-                })
-                .filter(|row| row.as_object().is_some_and(|cells| !cells.is_empty()))
-                .collect(),
-        )),
-        (_, Value::String(text)) => Some(text.trim()).filter(|text| !text.is_empty()).map(|text| Value::String(text.to_string())),
-        (_, Value::Number(_)) => Some(value.clone()),
+    let editing = id.is_some();
+    let form = match kind {
+        "expense" => Some(expense_form(catalog, editing)),
+        "income" => Some(income_form(catalog, editing)),
+        "salary" => Some(salary_form(connection, catalog, editing)?),
+        "payment" => Some(payment_form(connection, catalog, &values)?),
+        "card-purchase" => Some(purchase_form(catalog, &values, editing)),
+        "card-payment" => Some(card_payment_form(catalog, &values, changed.as_deref())),
+        "loan-payment" => Some(loan_payment_form(catalog, &values, changed.as_deref())),
+        "service-payment" => Some(service_payment_form(connection, catalog, &values, changed.as_deref())?),
+        "savings" => Some(savings_form(catalog, &values)),
+        "exchange" => Some(exchange_form(catalog, &values)),
+        "category" => Some(category_form(editing)),
+        "account" => Some(named_form("account", "Cuenta", "Banco, efectivo, billetera…", editing)),
+        "card" => Some(named_form("card", "Tarjeta", "Visa, Mastercard…", editing)),
+        "service" => Some(service_form(editing)),
+        "loan" => Some(loan_form(&values, editing)),
+        "budget" => Some(budget_form(catalog, editing)),
+        "reserve" => Some(reserve_form(editing)),
         _ => None,
-    }
+    };
+    Ok(form.map(|mut form| {
+        fill(&mut form.fields, &values);
+        form.id = id.map(str::to_string);
+        if !editing {
+            form.delete = None;
+        } else if form.kind == "payment" {
+            form.kind = "movement".into();
+        }
+        form
+    }))
 }
 
-/// The required fields left empty, with the message for each.
-pub(crate) fn missing_required(form: &EntryForm, values: &Values) -> Vec<(String, String)> {
-    let mut missing = Vec::new();
-    for field in form.fields.iter().filter(|field| field.required && !field.read_only) {
-        let empty = match values.get(&field.key) {
-            None | Some(Value::Null) => true,
-            Some(Value::String(text)) => text.trim().is_empty(),
-            Some(Value::Array(rows)) => rows.is_empty(),
-            _ => false,
-        };
-        if empty {
-            let what = if field.kind == "items" { format!("Agregá al menos una fila en «{}».", field.label) } else { format!("Completá «{}».", field.label) };
-            missing.push((field.key.clone(), what));
+/// Puts each value in its field (and the currency in its pick).
+fn fill(fields: &mut [Field], values: &Values) {
+    for field in fields {
+        if field.kind == "info" {
             continue;
         }
-        if let (Some(Value::Array(rows)), false) = (values.get(&field.key), field.columns.is_empty()) {
-            for (index, row) in rows.iter().enumerate() {
-                for column in field.columns.iter().filter(|column| column.required) {
-                    let cell_empty = row.get(&column.key).is_none_or(|cell| cell.as_str().is_some_and(|text| text.trim().is_empty()) || cell.is_null());
-                    if cell_empty {
-                        missing.push((field.key.clone(), format!("Completá «{}» en la fila {}.", column.label, index + 1)));
-                        break;
-                    }
+        if let Some(value) = values.get(&field.key).filter(|value| !value.is_null()) {
+            field.value = match (field.kind, value) {
+                ("money", Value::String(text)) => Value::String(money_text_input(text)),
+                ("integer", Value::Number(number)) => Value::String(number.to_string()),
+                _ => value.clone(),
+            };
+        }
+        if field.kind == "money" {
+            if let Value::String(text) = &field.value {
+                field.value = Value::String(money_text_input(text));
+            }
+        }
+        if let Some(pick) = &mut field.currency {
+            if !pick.locked {
+                if let Some(currency) = values.get(&pick.key).and_then(Value::as_str).filter(|currency| crate::finance::valid_currency(currency)) {
+                    pick.value = currency.to_string();
                 }
             }
         }
     }
-    missing
 }
 
-/// The label of a field of `form`, for a message about it.
-pub(crate) fn field_label<'a>(form: &'a EntryForm, key: &str) -> Option<&'a str> {
-    form.fields.iter().find(|field| field.key == key).map(|field| field.label.as_str())
+/// A stored amount (`1500.50`) as it is typed (`1500,50`); what is being
+/// typed stays as it is.
+fn money_text_input(value: &str) -> String {
+    let stored = value.split_once('.').is_some_and(|(whole, fraction)| {
+        !whole.is_empty() && whole.chars().all(|c| c.is_ascii_digit()) && fraction.len() == 2 && fraction.chars().all(|c| c.is_ascii_digit())
+    });
+    if stored {
+        amount_input(cents(value))
+    } else {
+        value.to_string()
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The values of a stored record, and the form that edits it.
+fn stored_values(connection: &Connection, catalog: &Catalog, kind: &str, id: &str) -> rusqlite::Result<Option<(String, Values)>> {
+    let object = |value: Value| value.as_object().cloned().unwrap_or_default();
+    Ok(match kind {
+        "movement" | "expense" | "income" | "salary" => model::load_movement(connection, id)?.map(|movement| {
+            let form = if movement.card_purchase_id.is_some() || movement.loan_id.is_some() || movement.service_id.is_some() {
+                "payment"
+            } else if movement.kind == "income" && movement.category_id.as_deref() == Some(CATEGORY_SALARY.0) {
+                "salary"
+            } else if movement.kind == "income" {
+                "income"
+            } else {
+                "expense"
+            };
+            let values = object(json!({
+                "name": movement.name,
+                "amount": movement.amount,
+                "currency": movement.currency,
+                "categoryId": movement.category_id.unwrap_or_default(),
+                "accountId": movement.account_id.unwrap_or_default(),
+                "date": movement.date,
+                "_movement": movement.id,
+            }));
+            (form.to_string(), values)
+        }),
+        "card-purchase" => catalog.purchases.iter().find(|state| state.purchase.id == id).map(|state| {
+            let purchase = &state.purchase;
+            ("card-purchase".into(), object(json!({
+                "cardId": purchase.card_id,
+                "name": purchase.name,
+                "total": purchase.total,
+                "currency": purchase.currency,
+                "installmentCount": purchase.installment_count,
+                "categoryId": purchase.category_id.clone().unwrap_or_default(),
+                "firstMonth": purchase.first_month,
+                "_paid": state.paid_count,
+            })))
+        }),
+        "savings" | "exchange" => model::load_savings_movement(connection, id)?.map(|movement| {
+            let exchange = movement.pesos.is_some();
+            let values = if exchange {
+                object(json!({
+                    "type": if movement.kind == "withdrawal" { "sell" } else { "buy" },
+                    "dollars": movement.amount,
+                    "pesos": movement.pesos,
+                    "reserveId": movement.reserve_id,
+                    "date": movement.date,
+                }))
+            } else {
+                object(json!({
+                    "type": movement.kind,
+                    "reserveId": movement.reserve_id,
+                    "amount": movement.amount,
+                    "date": movement.date,
+                    "note": movement.note,
+                }))
+            };
+            ((if exchange { "exchange" } else { "savings" }).to_string(), values)
+        }),
+        "category" => catalog.categories.iter().find(|category| category.id == id).map(|category| {
+            ("category".into(), object(json!({ "name": category.name, "kind": category.kind })))
+        }),
+        "account" => catalog.accounts.iter().find(|account| account.id == id).map(|account| ("account".into(), object(json!({ "name": account.name })))),
+        "card" => catalog.cards.iter().find(|card| card.id == id).map(|card| ("card".into(), object(json!({ "name": card.name })))),
+        "service" => catalog.services.iter().find(|service| service.id == id).map(|service| {
+            ("service".into(), object(json!({ "name": service.name, "amount": service.amount, "currency": service.currency })))
+        }),
+        "loan" => catalog.loans.iter().find(|state| state.loan.id == id).map(|state| {
+            let loan = &state.loan;
+            ("loan".into(), object(json!({
+                "name": loan.name,
+                "amount": loan.amount,
+                "currency": loan.currency,
+                "installmentCount": loan.installment_count,
+                "firstMonth": loan.first_month,
+                "_paid": state.paid_count,
+                "_totalPaid": state.total_paid,
+            })))
+        }),
+        "budget" => model::list_budgets(connection)?.into_iter().find(|budget| budget.id == id).map(|budget| {
+            ("budget".into(), object(json!({ "categoryId": budget.category_id, "amount": budget.amount, "currency": budget.currency })))
+        }),
+        "reserve" => catalog.reserves.iter().find(|reserve| reserve.id == id).map(|reserve| {
+            ("reserve".into(), object(json!({ "name": reserve.name, "currency": reserve.currency, "goal": reserve.goal.clone().unwrap_or_default() })))
+        }),
+        _ => None,
+    })
+}
 
-    fn catalog() -> Catalog {
-        Catalog {
-            accounts: vec![
-                FinanceAccount { id: "galicia".into(), name: "Galicia".into(), account_type: "bank".into(), currency: "ARS".into(), active: true },
-                FinanceAccount { id: "visa".into(), name: "Visa".into(), account_type: "credit_card".into(), currency: "ARS".into(), active: true },
-                FinanceAccount { id: "vieja".into(), name: "Vieja".into(), account_type: "bank".into(), currency: "ARS".into(), active: false },
-            ],
-            categories: vec![
-                FinanceCategory { id: "super".into(), name: "Supermercado".into(), kind: "expense".into(), active: true, parent_id: None, description: None },
-                FinanceCategory { id: "extra".into(), name: "Changas".into(), kind: "income".into(), active: true, parent_id: None, description: None },
-            ],
-            today: "2026-11-18".into(),
-            ..Catalog::default()
+fn form(kind: &str, title: &str, submit: &str, fields: Vec<Field>) -> EntryForm {
+    EntryForm { kind: kind.into(), id: None, title: title.into(), intro: None, submit: submit.into(), fields, delete: None }
+}
+
+fn with_intro(mut form: EntryForm, intro: impl Into<String>) -> EntryForm {
+    form.intro = Some(intro.into());
+    form
+}
+
+fn push_account(fields: &mut Vec<Field>, catalog: &Catalog) {
+    if let Some(field) = account_field(catalog) {
+        fields.push(field);
+    }
+}
+
+fn expense_form(catalog: &Catalog, editing: bool) -> EntryForm {
+    let mut fields = vec![
+        Field::text("name", "¿En qué?").required().placeholder("Nafta, almuerzo, farmacia…").suggestions(catalog.recent_names.clone()),
+        Field::money("amount", "Importe", "ARS").required(),
+        Field::select("categoryId", "Categoría", catalog.categories("expense")).required(),
+        date_field(),
+    ];
+    push_account(&mut fields, catalog);
+    let mut form = form("expense", if editing { "Gasto" } else { "Nuevo gasto" }, "Guardar", fields);
+    form.delete = delete("Borrar gasto", "¿Borrar este gasto?");
+    form
+}
+
+fn income_form(catalog: &Catalog, editing: bool) -> EntryForm {
+    let mut fields = vec![
+        Field::text("name", "¿De qué?").required().placeholder("Venta, regalo, changa…"),
+        Field::money("amount", "Importe", "ARS").required(),
+        Field::select("categoryId", "Categoría", catalog.categories("income")).default(CATEGORY_OTHER_INCOME.0),
+        date_field(),
+    ];
+    push_account(&mut fields, catalog);
+    let mut form = form("income", if editing { "Ingreso" } else { "Nuevo ingreso" }, "Guardar", fields);
+    form.delete = delete("Borrar ingreso", "¿Borrar este ingreso?");
+    form
+}
+
+fn salary_form(connection: &Connection, catalog: &Catalog, editing: bool) -> rusqlite::Result<EntryForm> {
+    let last: Option<(String, String, Option<String>)> = connection
+        .query_row(
+            "SELECT amount,currency,account_id FROM finance_movements WHERE kind='income' AND category_id=?1 ORDER BY date DESC, created_at DESC LIMIT 1",
+            [CATEGORY_SALARY.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+    let mut amount = Field::money("amount", "Lo que cobraste", "ARS").required();
+    let mut fields = Vec::new();
+    if let (Some((last_amount, currency, account)), false) = (&last, editing) {
+        amount = amount.default(last_amount.clone()).currency_value(currency).help(format!("El último fue de {}.", money_text(cents(last_amount), currency)));
+        if let Some(account) = account {
+            fields.push(("accountId", account.clone()));
         }
     }
-
-    fn field<'a>(form: &'a EntryForm, key: &str) -> &'a Field {
-        form.fields.iter().find(|field| field.key == key).unwrap_or_else(|| panic!("{key}"))
-    }
-
-    #[test]
-    fn every_kind_of_the_menu_has_its_form() {
-        for item in menu().into_iter().flat_map(|group| group.items) {
-            let form = build(item.kind, &catalog(), &Editing::default(), &Values::new()).unwrap_or_else(|| panic!("{}", item.kind));
-            assert_eq!(form.kind, item.kind);
-            assert!(!form.fields.is_empty(), "{}", item.kind);
-            assert!(form.delete.is_none(), "a new record has nothing to delete: {}", item.kind);
+    let mut list = vec![amount, date_field()];
+    push_account(&mut list, catalog);
+    for (key, value) in fields {
+        if let Some(field) = list.iter_mut().find(|field| field.key == key) {
+            field.value = Value::String(value);
         }
-        assert!(build("nada", &catalog(), &Editing::default(), &Values::new()).is_none());
     }
+    let mut form = with_intro(form("salary", "Sueldo", "Guardar", list), "En mano, lo que entró a la cuenta.");
+    form.delete = delete("Borrar sueldo", "¿Borrar este sueldo?");
+    Ok(form)
+}
 
-    #[test]
-    fn an_expense_offers_active_accounts_and_expense_categories_and_starts_today() {
-        let form = build("expense", &catalog(), &Editing::default(), &Values::new()).expect("form");
-        let accounts = field(&form, "accountId").options.iter().map(|option| option.value.as_str()).collect::<Vec<_>>();
-        assert_eq!(accounts, vec!["galicia", "visa"], "an inactive account is not offered");
-        let categories = field(&form, "categoryId").options.iter().map(|option| option.value.as_str()).collect::<Vec<_>>();
-        assert_eq!(categories, vec!["", "super"]);
-        assert_eq!(field(&form, "effectiveDate").value, json!("2026-11-18"));
+/// A payment already made: what it pays stays, the rest can change.
+fn payment_form(connection: &Connection, catalog: &Catalog, values: &Values) -> rusqlite::Result<EntryForm> {
+    let id = text(values, "_movement").unwrap_or_default();
+    let movement = model::load_movement(connection, &id)?;
+    let mut what = String::new();
+    let mut card_payment = false;
+    if let Some(movement) = &movement {
+        if let Some(purchase) = movement.card_purchase_id.as_deref().and_then(|id| catalog.purchases.iter().find(|state| state.purchase.id == id)) {
+            card_payment = true;
+            let card = catalog.cards.iter().find(|card| card.id == purchase.purchase.card_id).map(|card| card.name.clone()).unwrap_or_default();
+            what = format!("Cuota {}/{} de {} · {card}", movement.installment_number.unwrap_or(1), purchase.purchase.installment_count, purchase.purchase.name);
+        } else if let Some(loan) = movement.loan_id.as_deref().and_then(|id| catalog.loans.iter().find(|state| state.loan.id == id)) {
+            what = format!("Cuota {}/{} de {}", movement.installment_number.unwrap_or(1), loan.loan.installment_count, loan.loan.name);
+        } else if let Some(service) = movement.service_id.as_deref().and_then(|id| catalog.services.iter().find(|service| service.id == id)) {
+            what = format!("{} de {}", service.name, movement.service_month.as_deref().map(month_label).unwrap_or_default());
+        }
     }
+    let currency = movement.as_ref().map(|movement| movement.currency.clone()).unwrap_or_else(|| "ARS".into());
+    let mut fields = vec![
+        Field::info("what", "Pago de", what),
+        Field::text("name", "Nombre").required(),
+        Field::locked_money("amount", "Importe", &currency).required(),
+    ];
+    if card_payment {
+        fields.push(Field::select("categoryId", "Categoría", catalog.categories("expense")));
+    }
+    fields.push(date_field());
+    push_account(&mut fields, catalog);
+    let mut form = form("payment", "Pago", "Guardar", fields);
+    form.delete = delete("Deshacer el pago", "¿Deshacer este pago? Vuelve a quedar pendiente.");
+    Ok(form)
+}
 
-    #[test]
-    fn a_stored_record_fills_the_form_as_people_type_it() {
-        let mut values = Values::new();
-        values.insert("amount".into(), json!("15000.5"));
-        values.insert("effectiveDate".into(), json!("2026-11-02T00:00:00Z"));
-        values.insert("categoryId".into(), json!("super"));
-        let editing = Editing { id: Some("t1".into()), owner: None };
-        let form = build("expense", &catalog(), &editing, &values).expect("form");
-        assert_eq!(field(&form, "amount").value, json!("15000,50"));
-        assert_eq!(field(&form, "effectiveDate").value, json!("2026-11-02"));
-        assert_eq!(field(&form, "categoryId").value, json!("super"));
-        assert!(form.delete.is_some(), "an edited movement can be deleted");
+fn purchase_form(catalog: &Catalog, values: &Values, editing: bool) -> EntryForm {
+    let mut fields = Vec::new();
+    if catalog.cards.is_empty() {
+        fields.push(Field::text("newCard", "Tarjeta").required().placeholder("Visa, Mastercard…").help("Todavía no tenés tarjetas: se crea con este nombre."));
+    } else {
+        let mut card = Field::select("cardId", "Tarjeta", Catalog::named(&catalog.cards)).required();
+        if catalog.cards.len() == 1 {
+            card = card.default(catalog.cards[0].id.clone());
+        }
+        fields.push(card);
     }
+    fields.extend([
+        Field::text("name", "¿Qué compraste?").required().placeholder("Heladera, zapatillas…"),
+        Field::money("total", "Total, con intereses", "ARS").required(),
+        Field::integer("installmentCount", "Cuotas").default("1").required(),
+        Field::select("categoryId", "Categoría", catalog.categories("expense")).default(CATEGORY_OTHER.0),
+        Field::month("firstMonth", "Primera cuota").default(add_months(&current_month(), 1)).help("El mes en que la pagás con el resumen."),
+    ]);
+    let paid = values.get("_paid").and_then(Value::as_u64).unwrap_or(0);
+    let mut form = form("card-purchase", if editing { "Compra con tarjeta" } else { "Nueva compra con tarjeta" }, "Guardar", fields);
+    if editing && paid > 0 {
+        form.intro = Some(format!("Ya pagaste {paid} {}.", if paid == 1 { "cuota" } else { "cuotas" }));
+    }
+    form.delete = delete("Borrar compra", "¿Borrar la compra? Se borran las cuotas que faltan; las ya pagadas quedan en Movimientos.");
+    form
+}
 
-    #[test]
-    fn a_movement_of_a_document_only_changes_what_the_document_does_not_own() {
-        let editing = Editing { id: Some("t1".into()), owner: Some("ticket") };
-        let form = build("expense", &catalog(), &editing, &Values::new()).expect("form");
-        assert!(field(&form, "amount").read_only && field(&form, "accountId").read_only && field(&form, "effectiveDate").read_only);
-        assert_eq!(field(&form, "amount").help.as_deref(), Some("Se corrige desde el ticket."));
-        assert!(!field(&form, "categoryId").read_only && !field(&form, "description").read_only);
-        let mut values = Values::new();
-        values.insert("description".into(), json!("Compra"));
-        assert!(
-            missing_required(&form, &values).is_empty(),
-            "read-only fields are not asked for: {:?}",
-            missing_required(&form, &values)
-        );
+fn card_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) -> EntryForm {
+    let card_id = text(values, "cardId").or_else(|| catalog.cards.first().map(|card| card.id.clone())).unwrap_or_default();
+    let month = text(values, "month").filter(|month| crate::finance::valid_month(month)).unwrap_or_else(current_month);
+    let due = model::card_installments(&catalog.purchases, &card_id, &month).into_iter().filter(|installment| installment.paid.is_none()).collect::<Vec<_>>();
+    let options = due
+        .iter()
+        .map(|installment| {
+            let label = if installment.count == 1 { installment.name.clone() } else { format!("{} · cuota {}/{}", installment.name, installment.number, installment.count) };
+            let late = if installment.late { format!(" · de {}", month_short(&installment.month)) } else { String::new() };
+            Choice {
+                value: format!("{}:{}", installment.purchase_id, installment.number),
+                label,
+                detail: Some(format!("{}{late}", money_text(cents(&installment.amount), &installment.currency))),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut fields = vec![
+        Field::select("cardId", "Tarjeta", Catalog::named(&catalog.cards)).required().default(card_id.clone()).reload(),
+        Field::month("month", "Resumen de").default(month.clone()).reload(),
+    ];
+    if options.is_empty() {
+        fields.push(Field::info("installments", "Cuotas", format!("No hay cuotas para pagar hasta {}.", month_label(&month))));
+    } else {
+        let mut totals = std::collections::BTreeMap::<String, i128>::new();
+        for installment in &due {
+            *totals.entry(installment.currency.clone()).or_default() += cents(&installment.amount);
+        }
+        let total = totals.iter().map(|(currency, amount)| money_text(*amount, currency)).collect::<Vec<_>>().join(" + ");
+        let mut checks = Field::checks("installments", "Cuotas a pagar", options).required().help(format!("Todas: {total}."));
+        if changed.is_none() {
+            if let Some(chosen) = values.get("installments").filter(|value| value.is_array()) {
+                checks.value = chosen.clone();
+            }
+        }
+        fields.push(checks);
     }
+    fields.push(date_field());
+    push_account(&mut fields, catalog);
+    let form = form("card-payment", "Pagar la tarjeta", "Pagar", fields);
+    if catalog.cards.is_empty() {
+        return with_intro(form, "Todavía no tenés tarjetas. Creá una desde Cargar → Tarjeta.");
+    }
+    form
+}
 
-    #[test]
-    fn values_are_cleaned_and_required_ones_are_named() {
-        let form = build("purchase", &catalog(), &Editing::default(), &Values::new()).expect("form");
-        let mut values = Values::new();
-        values.insert("merchantName".into(), json!("  Coto "));
-        values.insert("items".into(), json!([{ "originalDescription": "Leche", "unitPrice": "1.200" }, { "originalDescription": "" }]));
-        let clean = clean_values(&form, &values);
-        assert_eq!(clean["merchantName"], json!("Coto"));
-        assert_eq!(clean["items"], json!([{ "originalDescription": "Leche", "unitPrice": "1.200" }]), "an empty row goes away");
-        let missing = missing_required(&form, &clean).into_iter().map(|(key, _)| key).collect::<Vec<_>>();
-        assert!(missing.contains(&"accountId".to_string()), "{missing:?}");
-        assert!(!missing.contains(&"merchantName".to_string()));
-        let mut incomplete = Values::new();
-        incomplete.insert("items".into(), json!([{ "originalDescription": "Pan" }]));
-        let messages = missing_required(&form, &incomplete);
-        assert!(messages.iter().any(|(key, message)| key == "items" && message.contains("Precio unitario") && message.contains("fila 1")), "{messages:?}");
+fn loan_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) -> EntryForm {
+    let open = catalog.loans.iter().filter(|state| !state.finished).collect::<Vec<_>>();
+    let loan_id = text(values, "loanId").or_else(|| open.first().map(|state| state.loan.id.clone())).unwrap_or_default();
+    let state = catalog.loans.iter().find(|state| state.loan.id == loan_id);
+    let mut fields = vec![Field::select("loanId", "Préstamo", open.iter().map(|state| choice(&state.loan.id, &state.loan.name)).collect())
+        .required()
+        .default(loan_id.clone())
+        .reload()];
+    if let Some(state) = state {
+        let unpaid = state
+            .installments
+            .iter()
+            .filter(|installment| installment.paid.is_none())
+            .map(|installment| choice(installment.number.to_string(), format!("Cuota {} de {} · {}", installment.number, state.loan.installment_count, month_short(&installment.month))))
+            .collect::<Vec<_>>();
+        let mut number = Field::select("number", "Cuota", unpaid).required().default(state.next_number.map(|number| number.to_string()).unwrap_or_default());
+        let mut amount = Field::locked_money("amount", "Lo que pagaste", &state.loan.currency).required();
+        if let Some(last) = &state.last_paid {
+            amount = amount.default(last.clone()).help(format!("La anterior fue de {}.", money_text(cents(last), &state.loan.currency)));
+        }
+        if changed == Some("loanId") {
+            number.value = Value::String(state.next_number.map(|number| number.to_string()).unwrap_or_default());
+        }
+        fields.push(number);
+        fields.push(amount);
     }
+    fields.push(date_field());
+    push_account(&mut fields, catalog);
+    let form = form("loan-payment", "Pagar una cuota", "Pagar", fields);
+    if open.is_empty() {
+        return with_intro(form, "No tenés préstamos con cuotas por pagar. Creá uno desde Cargar → Préstamo.");
+    }
+    form
+}
 
-    #[test]
-    fn integers_of_item_rows_travel_as_numbers() {
-        let form = build("card-statement", &catalog(), &Editing::default(), &Values::new()).expect("form");
-        let mut values = Values::new();
-        values.insert("items".into(), json!([{ "description": "Heladera", "installmentNumber": "3", "installmentCount": "12" }]));
-        let clean = clean_values(&form, &values);
-        assert_eq!(clean["items"][0]["installmentNumber"], json!(3));
-        assert_eq!(clean["items"][0]["installmentCount"], json!(12));
-        assert_eq!(field(&form, "accountId").options.iter().map(|option| option.value.as_str()).collect::<Vec<_>>(), vec!["visa"], "only cards");
+fn service_payment_form(connection: &Connection, catalog: &Catalog, values: &Values, changed: Option<&str>) -> rusqlite::Result<EntryForm> {
+    let service_id = text(values, "serviceId").or_else(|| catalog.services.first().map(|service| service.id.clone())).unwrap_or_default();
+    let mut fields = vec![
+        Field::select("serviceId", "Servicio", catalog.services.iter().map(|service| choice(&service.id, &service.name)).collect())
+            .required()
+            .default(service_id.clone())
+            .reload(),
+        Field::month("month", "Mes").default(current_month()),
+    ];
+    if let Some(service) = catalog.services.iter().find(|service| service.id == service_id) {
+        let estimate = model::service_estimate(connection, service)?;
+        let mut amount = Field::locked_money("amount", "Lo que pagaste", &service.currency).required().default(estimate.clone());
+        if estimate != service.amount {
+            amount = amount.help(format!("El mes pasado: {}.", money_text(cents(&estimate), &service.currency)));
+        }
+        fields.push(amount);
     }
+    fields.push(date_field());
+    push_account(&mut fields, catalog);
+    let mut form = form("service-payment", "Pagar un servicio", "Pagar", fields);
+    if changed == Some("serviceId") {
+        // The amount of the newly chosen service, not the one typed before.
+        if let Some(service) = catalog.services.iter().find(|service| service.id == service_id) {
+            let estimate = model::service_estimate(connection, service)?;
+            if let Some(field) = form.fields.iter_mut().find(|field| field.key == "amount") {
+                field.value = Value::String(estimate);
+            }
+        }
+    }
+    if catalog.services.is_empty() {
+        return Ok(with_intro(form, "Todavía no tenés servicios. Creá uno desde Cargar → Servicio."));
+    }
+    Ok(form)
+}
 
-    #[test]
-    fn stored_amounts_read_with_a_decimal_comma() {
-        assert_eq!(money_input("1234.5"), "1234,50");
-        assert_eq!(money_input("1234.56"), "1234,56");
-        assert_eq!(money_input("1234"), "1234");
-        assert_eq!(money_input("1.234,50"), "1.234,50", "what the person typed stays");
+fn savings_form(catalog: &Catalog, values: &Values) -> EntryForm {
+    let reserve_id = text(values, "reserveId").or_else(|| catalog.reserves.first().map(|reserve| reserve.id.clone())).unwrap_or_default();
+    let currency = catalog.reserves.iter().find(|reserve| reserve.id == reserve_id).map(|reserve| reserve.currency.as_str()).unwrap_or("ARS");
+    let fields = vec![
+        Field::select("type", "", vec![choice("deposit", "Guardar"), choice("withdrawal", "Sacar")]).default("deposit").required(),
+        Field::select("reserveId", "Reserva", catalog.reserves(None)).required().default(reserve_id.clone()).reload(),
+        Field::locked_money("amount", "Importe", currency).required(),
+        date_field(),
+        Field::text("note", "Nota").placeholder("Opcional"),
+    ];
+    let mut form = form("savings", "Ahorro", "Guardar", fields);
+    form.delete = delete("Borrar movimiento", "¿Borrar este movimiento de ahorro?");
+    form
+}
+
+fn exchange_form(catalog: &Catalog, values: &Values) -> EntryForm {
+    let selling = text(values, "type").as_deref() == Some("sell");
+    let fields = vec![
+        Field::select("type", "", vec![choice("buy", "Comprar dólares"), choice("sell", "Vender dólares")]).default("buy").required().reload(),
+        Field::locked_money("dollars", "Dólares", "USD").required(),
+        Field::locked_money("pesos", if selling { "Pesos que recibiste" } else { "Pesos que pagaste" }, "ARS").required(),
+        Field::select("reserveId", "Reserva", catalog.reserves(Some("USD"))).default(catalog.reserves.iter().find(|reserve| reserve.currency == "USD").map(|reserve| reserve.id.clone()).unwrap_or_default()),
+        date_field(),
+    ];
+    let mut form = with_intro(form("exchange", "Dólares", "Guardar", fields), "Los pesos cuentan como ahorro del mes; los dólares quedan en la reserva.");
+    form.delete = delete("Borrar", "¿Borrar esta compra o venta de dólares?");
+    form
+}
+
+fn category_form(editing: bool) -> EntryForm {
+    let mut form = form(
+        "category",
+        if editing { "Categoría" } else { "Nueva categoría" },
+        "Guardar",
+        vec![
+            Field::text("name", "Nombre").required(),
+            Field::select("kind", "Es de", vec![choice("expense", "Gastos"), choice("income", "Ingresos")]).default("expense").required(),
+        ],
+    );
+    form.delete = delete("Borrar categoría", "¿Borrar la categoría? Sus movimientos quedan sin categoría y se borra su presupuesto.");
+    form
+}
+
+fn named_form(kind: &str, title: &str, placeholder: &str, editing: bool) -> EntryForm {
+    let mut form = form(kind, &if editing { title.to_string() } else { format!("Nueva {}", title.to_lowercase()) }, "Guardar", vec![
+        Field::text("name", "Nombre").required().placeholder(placeholder),
+    ]);
+    form.delete = match kind {
+        "card" => delete("Borrar tarjeta", "¿Borrar la tarjeta y sus compras? Las cuotas que faltan desaparecen; las ya pagadas quedan en Movimientos."),
+        _ => delete("Borrar cuenta", "¿Borrar la cuenta? Sus movimientos quedan, sin cuenta."),
+    };
+    form
+}
+
+fn service_form(editing: bool) -> EntryForm {
+    let mut form = with_intro(
+        form("service", if editing { "Servicio" } else { "Nuevo servicio" }, "Guardar", vec![
+            Field::text("name", "Nombre").required().placeholder("Luz, internet, alquiler…"),
+            Field::money("amount", "Importe por mes", "ARS").required().help("Más o menos: cada mes cargás lo que pagaste."),
+        ]),
+        "Se paga cada mes y va a la categoría Servicios.",
+    );
+    form.delete = delete("Borrar servicio", "¿Borrar el servicio? Sus pagos quedan en Movimientos.");
+    form
+}
+
+fn loan_form(values: &Values, editing: bool) -> EntryForm {
+    let mut form = form("loan", if editing { "Préstamo" } else { "Nuevo préstamo" }, "Guardar", vec![
+        Field::text("name", "Nombre").required().placeholder("Préstamo del banco…"),
+        Field::money("amount", "Monto", "ARS").required().help("Lo que te prestaron."),
+        Field::integer("installmentCount", "Cuotas").required(),
+        Field::month("firstMonth", "Primera cuota").default(add_months(&current_month(), 1)),
+    ]);
+    if editing {
+        let paid = values.get("_paid").and_then(Value::as_u64).unwrap_or(0);
+        let currency = text(values, "currency").unwrap_or_else(|| "ARS".into());
+        let total = text(values, "_totalPaid").map(|total| money_text(cents(&total), &currency)).unwrap_or_default();
+        form.intro = Some(if paid == 0 { "Todavía no pagaste ninguna cuota.".into() } else { format!("Pagaste {paid} cuotas: {total}.") });
     }
+    form.delete = delete("Borrar préstamo", "¿Borrar el préstamo? Las cuotas ya pagadas quedan en Movimientos.");
+    form
+}
+
+fn budget_form(catalog: &Catalog, editing: bool) -> EntryForm {
+    let mut form = with_intro(
+        form("budget", if editing { "Presupuesto" } else { "Nuevo presupuesto" }, "Guardar", vec![
+            Field::select("categoryId", "Categoría", catalog.categories("expense")).required(),
+            Field::money("amount", "Tope por mes", "ARS").required(),
+        ]),
+        "Te aviso por Telegram al llegar al 80 % y al pasarte.",
+    );
+    form.delete = delete("Borrar presupuesto", "¿Borrar este presupuesto?");
+    form
+}
+
+fn reserve_form(editing: bool) -> EntryForm {
+    let mut form = form("reserve", if editing { "Reserva" } else { "Nueva reserva" }, "Guardar", vec![
+        Field::text("name", "Nombre").required().placeholder("Vacaciones, fondo de emergencia…"),
+        Field::money("goal", "Objetivo", "ARS").placeholder("Opcional"),
+    ]);
+    form.delete = delete("Borrar reserva", "¿Borrar la reserva y sus movimientos?");
+    form
 }

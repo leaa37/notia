@@ -752,16 +752,17 @@ mod tests {
         let host = library();
         let (copy, path) = copy_of(&host);
         let since = last_seq(&host).expect("seq");
-        let merchant =
-            "INSERT INTO finance_merchants (id, name, normalized_name, created_at, updated_at) VALUES (?1, 'Kiosco', 'kiosco', 'x', 'x')";
-        copy.execute(merchant, ["copia"]).expect("copy merchant");
-        host.execute(merchant, ["host"]).expect("host merchant");
+        // One budget per category and currency.
+        let budget =
+            "INSERT INTO finance_budgets (id, category_id, currency, amount, created_at, updated_at) VALUES (?1, 'category-other', 'ARS', '100.00', 'x', 'x')";
+        copy.execute(budget, ["copia"]).expect("copy budget");
+        host.execute(budget, ["host"]).expect("host budget");
         let (pushed, pulled, _) = reconcile(&host, &copy, since);
         assert_eq!((pushed.applied, pushed.failed), (0, 1), "{pushed:?}");
         assert_eq!(pulled.failed, 1, "{pulled:?}");
         let ids = |connection: &Connection| -> Vec<String> {
             connection
-                .prepare("SELECT id FROM finance_merchants WHERE normalized_name = 'kiosco'")
+                .prepare("SELECT id FROM finance_budgets WHERE category_id = 'category-other'")
                 .expect("query")
                 .query_map([], |row| row.get(0))
                 .expect("rows")

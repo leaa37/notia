@@ -300,7 +300,7 @@ pub fn is_finance_request(value: &str) -> bool {
     static TERMS: OnceLock<(Regex, Regex, Regex)> = OnceLock::new();
     let (terms, amount, verb) = TERMS.get_or_init(|| {
         (
-            Regex::new(r"\b(finanzas?|financier[oa]s?|gast(?:o|os|e|aste|amos|ar)|pague|pagaste|pago|cobre|cobraste|cobro|ingreso|ingresos|saldo|saldos|cuenta|cuentas|categoria|categorias|ahorro|ahorros|retiro|aporte|transferencia|movimiento|movimientos|sueldo|ticket|factura|boleta|servicio|luz|gas|internet|precio|nafta|combustible|cotizacion(?:es)?|dolar(?:es)?|inflacion|ipc|oficial|blue)\b").expect("finance terms"),
+            Regex::new(r"\b(finanzas?|financier[oa]s?|gast(?:o|os|e|aste|amos|ar)|pague|pagaste|pago|cobre|cobraste|cobro|ingreso|ingresos|saldo|saldos|cuenta|cuentas|categoria|categorias|ahorro|ahorros|retiro|aporte|transferencia|movimiento|movimientos|sueldo|ticket|factura|boleta|servicio|servicios|tarjetas?|cuotas?|prestamos?|presupuestos?|visa|mastercard|luz|gas|internet|precio|nafta|combustible|cotizacion(?:es)?|dolar(?:es)?|inflacion|ipc|oficial|blue)\b").expect("finance terms"),
             Regex::new(r"(?:\$\s*\d|\b\d+(?:[.,]\d{1,2})?\s*(?:ars|usd|pesos?)\b)").expect("money amount"),
             Regex::new(r"\b(carg(?:a|ue|aste|amos|ar|ado)|anot(?:a|alo|arla|ar|e|aste|amos|ado)|registr(?:a|alo|arla|ar|e|aste|amos|ado))\b").expect("finance verb"),
         )
@@ -353,9 +353,9 @@ pub fn tool_label(tool: &str) -> &'static str {
         "request_user_clarification" => "preparando una pregunta para vos",
         "get_finance_dollar_quotes" | "get_finance_historical_dollar_quotes" => "consultando cotizaciones",
         "get_finance_inflation_indices" => "consultando índices económicos",
-        "extract_finance_document" => "leyendo el documento financiero",
         name if name.starts_with("get_finance_") || name.starts_with("list_finance_") => "consultando tus finanzas",
-        name if name.starts_with("create_finance_") || name.starts_with("save_finance_") => "preparando el registro financiero",
+        name if name.starts_with("pay_finance_") => "preparando el pago",
+        name if name.starts_with("save_finance_") || name.starts_with("delete_finance_") => "preparando el registro financiero",
         "get_gym_summary" | "get_gym_routine" | "list_gym_workouts" => "revisando tus entrenamientos",
         "search_gym_exercises" | "get_gym_exercise" | "list_gym_equipment" => "buscando ejercicios",
         "control_gym_session" => "actualizando tu entrenamiento",
@@ -794,6 +794,8 @@ mod tests {
         assert!(is_mail_request("¿qué tengo en el calendario mañana?"));
         assert!(is_finance_request("pagué la cuenta de la luz"));
         assert!(!is_mail_request("pagué la cuenta de la luz"));
+        assert!(is_finance_request("compré una heladera en 12 cuotas con la visa"));
+        assert!(is_finance_request("pagué la cuota del préstamo"));
     }
 
     #[test]

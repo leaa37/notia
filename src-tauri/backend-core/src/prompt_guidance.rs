@@ -196,8 +196,8 @@ fn general(guidance: &mut Guidance, context: &BackendRequestContext) {
     } else {
         "set_agent_execution_plan"
     };
-    if context.channel == BackendChannel::Telegram && guidance.has("create_finance_transaction") {
-        guidance.push("En Telegram con Finanzas no uses herramientas de planes: cada mutación financiera ya pide su propia confirmación. Si recibiste varios comprobantes, registralos uno por uno, cada uno con su confirmación, hasta terminar con todos.");
+    if context.channel == BackendChannel::Telegram && guidance.has("save_finance_expense") {
+        guidance.push("En Telegram con Finanzas no uses herramientas de planes: cada mutación financiera ya pide su propia confirmación. Si te pasaron varios gastos, registralos uno por uno, cada uno con su confirmación, hasta terminar con todos.");
     } else if guidance.has(plan_tool) {
         guidance.push(format!(
             "Si el pedido requiere dos o más cambios independientes, llamá {plan_tool} con un paso concreto por cambio antes de la primera mutación (steps: textos u objetos con label). Esperá la aprobación, ejecutá los pasos en orden y detenete si uno es rechazado o falla. Un plan aprobado no autoriza cambios distintos de sus pasos."
@@ -320,30 +320,21 @@ fn graph(guidance: &mut Guidance) {
 }
 
 fn finance(guidance: &mut Guidance, today: &str) {
-    guidance.push("Estás en Finanzas. Para datos financieros usá exclusivamente las herramientas financieras; no modifiques saldos directamente.");
-    guidance.push("Finanzas es un seguimiento informal: las cuentas indican de dónde salió el dinero y no llevan saldo. Distinguí gastos del mes, lo pagado de tarjetas, lo que está en tarjeta a pagar y lo ahorrado.");
+    guidance.push("Estás en Finanzas. Para datos financieros usá exclusivamente las herramientas financieras.");
     finance_tools(guidance, today);
 }
 
 fn finance_tools(guidance: &mut Guidance, today: &str) {
+    guidance.push("Finanzas es simple: un gasto es nombre, importe y categoría (la cuenta es opcional y no se pregunta); el sueldo es solo lo cobrado en mano; una compra con tarjeta tiene total con intereses y cuotas, y cada cuota cuenta como gasto el mes en que se paga; los servicios y las cuotas de préstamos se pagan cada mes con su importe. No hay tickets, resúmenes ni recibos para cargar: si te mandan una foto, leé de ahí nombre, importe y fecha y cargalo como gasto.");
+    guidance.push_if(&["get_finance_month"], "Para preguntas del mes (cuánto gasté, cuánto me queda, en qué se fue, qué falta pagar, cómo vengo con los presupuestos) usá get_finance_month; para los pagos pendientes, get_finance_payments; para buscar movimientos, list_finance_movements.");
     guidance.push_if(&["get_finance_dollar_quotes", "get_finance_inflation_indices"], "Para cotizaciones actuales usá get_finance_dollar_quotes (DolarApi); para IPC usá get_finance_inflation_indices y para el historial del dólar oficial get_finance_historical_dollar_quotes (ArgentinaDatos). Informá siempre la fuente y la fecha; si una consulta externa falla, decilo.");
-    guidance.push_if(&["list_finance_salaries"], "Para \"últimos sueldos\" sin filtro usá list_finance_salaries y presentá los tres recibos más recientes; para un rango convertí el período a from/to.");
-    guidance.push_if(&["get_finance_full_snapshot", "list_finance_records"], "Para inventarios, presupuestos o resúmenes globales usá get_finance_full_snapshot. Para una entidad concreta usá list_finance_records con entity, limit y offset y respetá total/hasMore; no presentes una página como el total.");
-    if guidance.has("create_finance_transaction") {
-        guidance.push(format!("La fecha actual para registrar operaciones sin fecha indicada es {today}. Usala solo cuando el usuario no indique otra."));
-        guidance.push("Antes de registrar un movimiento listá las cuentas. Si el usuario no indicó una cuenta inequívoca, pedí una aclaración y esperá. Las herramientas aceptan el ID o el nombre exacto de cuenta y categoría.");
-        guidance.push("Nunca anuncies una carga como realizada sin ejecutar la herramienta correspondiente y recibir ok:true. Si la herramienta devuelve invalidFields, corregí solo esos campos y reintentá.");
-        guidance.push("ARS y USD son libros separados: nunca conviertas ni sumes monedas. Informá cada moneda por separado.");
+    if guidance.has("save_finance_expense") {
+        guidance.push(format!("Hoy es {today}: es la fecha de lo que se cargue sin fecha. No la pases si la persona no dijo otra."));
+        guidance.push("Las herramientas reciben categorías, tarjetas, servicios, préstamos y reservas por nombre. Si no sabés cuáles hay, leé get_finance_setup. Si la categoría de un gasto no es clara, elegí la más razonable de las que existen y contáselo; si ninguna sirve, preguntá con request_user_clarification.");
+        guidance.push("«Pagué la luz» es pay_finance_service; «pagué la Visa» o «pagué la tarjeta» es pay_finance_card (sin installments paga todas las cuotas del mes); «pagué la cuota del préstamo» es pay_finance_loan_installment con el importe pagado. Una compra en cuotas es save_finance_card_purchase, no un gasto.");
+        guidance.push("Nunca anuncies una carga como realizada sin ejecutar la herramienta correspondiente y recibir ok:true. Si la herramienta rechaza un campo, corregilo o preguntá por él.");
+        guidance.push("ARS y USD van separados: nunca conviertas ni sumes monedas. Informá cada moneda por separado.");
     }
-    guidance.push_if(&["create_finance_category"], "Buscá categorías existentes antes de crear una. Si no hay ninguna adecuada, proponé una nueva relacionada con el hecho con create_finance_category.");
-    guidance.push_if(&["create_finance_service"], "Para dar de alta un servicio hacen falta su nombre, el proveedor, el importe esperado por mes, la moneda, la categoría y si es fijo o variable. Si el pedido no los trae (por ejemplo solo «Servicio»), preguntá los que faltan en un solo mensaje antes de llamar create_finance_service; no los inventes. Si la herramienta devuelve invalidFields, su instruction dice qué pide cada campo.");
-    guidance.push_if(&["create_finance_transaction"], "Si un gasto mezcla categorías (un pedido con supermercado y tabaco) y sabés cuánto es cada parte, registralo una vez con splits, una parte por categoría que sumen el total; si no sabés el desglose, registralo en una categoría y contáselo.");
-    guidance.push_if(&["create_finance_purchase", "create_finance_service_invoice", "create_finance_salary", "create_finance_credit_card_statement"], "Si recibís una imagen o PDF, clasificala: ticket de compra (create_finance_purchase), factura o boleta de servicio (create_finance_service_invoice), recibo de sueldo (create_finance_salary) o resumen de tarjeta (create_finance_credit_card_statement, con una cuenta de tipo credit_card). Un resumen cargado es un resumen ya pagado: su total es lo pagado de la tarjeta, nunca otro gasto, y no se registra el pago aparte.");
-    guidance.push_if(&["list_finance_products"], "Antes de guardar un ticket consultá list_finance_products y list_finance_merchants y escribí productos y comercio con los nombres que ya existen cuando sean los mismos.");
-    guidance.push_if(&["create_finance_purchase", "create_finance_credit_card_statement", "create_finance_transaction"], "Después de cada alta leé links y reviewItems del resultado. Contá los vínculos automáticos en una sola línea (por ejemplo: «lo vinculé al consumo de la Visa del 12/9») y aclarale que puede pedir deshacerlo. Cada reviewItem es una pregunta para la persona: hacela con sus opciones y, cuando responda, aplicala con resolve_finance_review_item.");
-    guidance.push_if(&["list_finance_review_items"], "Si la persona pregunta qué falta revisar en Finanzas, usá list_finance_review_items y hacé las preguntas pendientes de a una.");
-    guidance.push_if(&["unlink_finance_records"], "Si la persona dice que un vínculo automático está mal, deshacelo con unlink_finance_records usando el id del vínculo o la línea del resumen. Para borrar cualquier registro usá delete_finance_record con la entidad del documento, no el movimiento.");
-    guidance.push_if(&["create_finance_savings_exchange"], "Cuando la persona compre moneda para ahorrar usá create_finance_savings_exchange con direction buy; cuando venda ahorro para usar la plata, con direction sell. Resolvé reserva y cuenta por nombre; nunca pidas IDs internos. Ninguna de las dos es gasto ni ingreso del mes.");
     guidance.push("Las preguntas sobre datos financieros locales se responden con las herramientas financieras y nunca requieren search_web.");
 }
 
@@ -360,7 +351,7 @@ fn library(guidance: &mut Guidance, context: &BackendRequestContext, today: &str
     guidance.push_if(&["search_task_tickets"], "Para tickets, grupos y tableros de Task Manager usá sus herramientas, no la búsqueda ni la lectura de documentos.");
     task_tools(guidance);
     routine_tools(guidance);
-    let transversal = guidance.has("create_finance_transaction") || guidance.has("list_finance_records");
+    let transversal = guidance.has("save_finance_expense") || guidance.has("get_finance_month");
     if transversal {
         guidance.push("Esta conversación tiene acceso transversal: además de la biblioteca y Task Manager, podés consultar y operar Finanzas con sus herramientas tipadas. Si el pedido mezcla áreas, consultá ambas fuentes.");
         finance_tools(guidance, today);
@@ -521,14 +512,14 @@ mod tests {
     fn finance_guidance_includes_the_date_only_when_it_can_write() {
         let read_only = scope_guidance(
             &context(BackendScope::Finance, BackendChannel::App),
-            &tools(&["list_finance_records", "get_finance_full_snapshot"]),
+            &tools(&["list_finance_movements", "get_finance_month"]),
             None,
             "2026-09-22",
         );
         assert!(!read_only.contains("2026-09-22"));
         let writable = scope_guidance(
             &context(BackendScope::Finance, BackendChannel::App),
-            &tools(&["create_finance_transaction"]),
+            &tools(&["save_finance_expense"]),
             None,
             "2026-09-22",
         );
@@ -593,7 +584,7 @@ mod tests {
     fn telegram_gets_html_rules_and_no_plans_with_finance() {
         let text = scope_guidance(
             &context(BackendScope::Library, BackendChannel::Telegram),
-            &tools(&["create_finance_transaction", "set_agent_execution_plan"]),
+            &tools(&["save_finance_expense", "set_agent_execution_plan"]),
             None,
             "2026-09-22",
         );

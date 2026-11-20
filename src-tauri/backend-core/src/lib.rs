@@ -40,7 +40,6 @@ pub mod export;
 pub mod export_render;
 pub mod finance_answer;
 pub mod folder_contexts;
-pub mod finance_insights;
 pub mod formatting;
 pub mod gitbook_blocks;
 pub mod interaction;

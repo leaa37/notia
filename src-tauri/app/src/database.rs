@@ -12,7 +12,7 @@ use crate::host::{
 
 const NOTIA_DIRECTORY: &str = ".notia";
 const DATABASE_FILE_NAME: &str = "notia.db";
-pub const CURRENT_SCHEMA_VERSION: i64 = 35;
+pub const CURRENT_SCHEMA_VERSION: i64 = 36;
 /// A client's copy that never got its host's database.
 pub(crate) const COPY_WITHOUT_DATABASE: &str =
     "La copia de este equipo no tiene la base de datos de la biblioteca: conectate al host para completarla.";
@@ -262,50 +262,10 @@ fn database_path(library_path: &str) -> Result<PathBuf, String> {
     Ok(library_root.join(NOTIA_DIRECTORY).join(DATABASE_FILE_NAME))
 }
 
-fn table_has_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-) -> Result<bool, rusqlite::Error> {
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
-            params![table, column],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count > 0)
-}
-
-fn ensure_finance_service_link_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
-    let transaction = connection.unchecked_transaction()?;
-
-    if !table_has_column(&transaction, "finance_transactions", "service_id")? {
-        transaction.execute(
-            "ALTER TABLE finance_transactions ADD COLUMN service_id TEXT REFERENCES finance_services(id)",
-            [],
-        )?;
-    }
-    if !table_has_column(&transaction, "finance_purchases", "service_id")? {
-        transaction.execute(
-            "ALTER TABLE finance_purchases ADD COLUMN service_id TEXT REFERENCES finance_services(id)",
-            [],
-        )?;
-    }
-    transaction.execute(
-        "CREATE INDEX IF NOT EXISTS idx_finance_transactions_service ON finance_transactions(service_id)",
-        [],
-    )?;
-    transaction.execute(
-        "CREATE INDEX IF NOT EXISTS idx_finance_purchases_service ON finance_purchases(service_id)",
-        [],
-    )?;
-    transaction.commit()
-}
-
-/// Keeps a copy of a library with Finanzas movements before schema 26
-/// rewrites them, next to the database file. In-memory databases and
-/// libraries without movements are not copied.
-fn copy_before_finance_rework(connection: &Connection) -> Result<(), rusqlite::Error> {
+/// Keeps a copy of a library with Finanzas movements before schema
+/// `version` rewrites them, next to the database file. In-memory databases
+/// and libraries without movements are not copied.
+fn copy_before_finance_rework(connection: &Connection, version: i64) -> Result<(), rusqlite::Error> {
     let has_transactions = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='finance_transactions')",
@@ -318,12 +278,171 @@ fn copy_before_finance_rework(connection: &Connection) -> Result<(), rusqlite::E
     let Some(path) = connection.path().filter(|path| !path.is_empty() && *path != ":memory:") else {
         return Ok(());
     };
-    let copy = format!("{path}.pre-v26.sqlite");
+    let copy = format!("{path}.pre-v{version}.sqlite");
     if has_transactions && !Path::new(&copy).exists() {
         connection.execute("VACUUM INTO ?1", [copy])?;
     }
     Ok(())
 }
+
+/// Schema 36: Finanzas starts again with a simple model (see `finance.rs`).
+/// The person agreed to lose what was loaded; a copy of the database stays
+/// next to it (`.pre-v36.sqlite`). Every old table goes, with its entries in
+/// the change log of the copies, and the new ones start with their default
+/// categories and reserves.
+fn rework_finance(connection: &Connection) -> Result<(), rusqlite::Error> {
+    copy_before_finance_rework(connection, 36)?;
+    connection.execute_batch("PRAGMA foreign_keys = OFF")?;
+    let result = (|| {
+        let transaction = connection.unchecked_transaction()?;
+        let old_tables = {
+            let mut statement = transaction.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'finance\\_%' ESCAPE '\\'",
+            )?;
+            let names = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            names
+        };
+        for table in &old_tables {
+            transaction.execute_batch(&format!("DROP TABLE IF EXISTS \"{table}\""))?;
+        }
+        let has_change_log: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='notia_row_changes')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_change_log {
+            transaction.execute("DELETE FROM notia_row_changes WHERE table_name LIKE 'finance\\_%' ESCAPE '\\'", [])?;
+        }
+        transaction.execute_batch(FINANCE_SCHEMA)?;
+        crate::finance::seed_defaults(&transaction)?;
+        transaction.execute("INSERT INTO notia_schema_migrations (version) VALUES (36)", [])?;
+        transaction.commit()
+    })();
+    connection.execute_batch("PRAGMA foreign_keys = ON")?;
+    result
+}
+
+/// The tables of Finanzas since schema 36.
+const FINANCE_SCHEMA: &str = "
+    CREATE TABLE finance_categories (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('expense', 'income')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE finance_accounts (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE finance_cards (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE finance_services (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+        amount TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE finance_loans (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+        amount TEXT NOT NULL,
+        installment_count INTEGER NOT NULL CHECK (installment_count BETWEEN 1 AND 600),
+        first_month TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE finance_card_purchases (
+        id TEXT PRIMARY KEY,
+        card_id TEXT NOT NULL REFERENCES finance_cards(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        category_id TEXT REFERENCES finance_categories(id) ON DELETE SET NULL,
+        currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+        total TEXT NOT NULL,
+        installment_count INTEGER NOT NULL CHECK (installment_count BETWEEN 1 AND 72),
+        first_month TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_finance_card_purchases_card ON finance_card_purchases(card_id);
+    CREATE TABLE finance_movements (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('expense', 'income')),
+        name TEXT NOT NULL,
+        category_id TEXT REFERENCES finance_categories(id) ON DELETE SET NULL,
+        account_id TEXT REFERENCES finance_accounts(id) ON DELETE SET NULL,
+        amount TEXT NOT NULL,
+        currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+        date TEXT NOT NULL,
+        service_id TEXT REFERENCES finance_services(id) ON DELETE SET NULL,
+        service_month TEXT,
+        card_purchase_id TEXT REFERENCES finance_card_purchases(id) ON DELETE SET NULL,
+        loan_id TEXT REFERENCES finance_loans(id) ON DELETE SET NULL,
+        installment_number INTEGER,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_finance_movements_date ON finance_movements(date);
+    CREATE UNIQUE INDEX idx_finance_movements_service_month
+        ON finance_movements(service_id, service_month) WHERE service_id IS NOT NULL;
+    CREATE UNIQUE INDEX idx_finance_movements_card_installment
+        ON finance_movements(card_purchase_id, installment_number) WHERE card_purchase_id IS NOT NULL;
+    CREATE UNIQUE INDEX idx_finance_movements_loan_installment
+        ON finance_movements(loan_id, installment_number) WHERE loan_id IS NOT NULL;
+    CREATE TABLE finance_reserves (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+        goal TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE finance_savings_movements (
+        id TEXT PRIMARY KEY,
+        reserve_id TEXT NOT NULL REFERENCES finance_reserves(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('deposit', 'withdrawal')),
+        amount TEXT NOT NULL,
+        pesos TEXT,
+        date TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_finance_savings_movements_date ON finance_savings_movements(date);
+    CREATE TABLE finance_budgets (
+        id TEXT PRIMARY KEY,
+        category_id TEXT NOT NULL REFERENCES finance_categories(id) ON DELETE CASCADE,
+        currency TEXT NOT NULL CHECK (currency IN ('ARS', 'USD')),
+        amount TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (category_id, currency)
+    );
+    CREATE TABLE finance_budget_alerts (
+        id TEXT PRIMARY KEY,
+        budget_id TEXT NOT NULL REFERENCES finance_budgets(id) ON DELETE CASCADE,
+        month TEXT NOT NULL,
+        level INTEGER NOT NULL,
+        sent_at TEXT NOT NULL
+    );
+    CREATE TABLE finance_applied_requests (
+        request_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+    );
+";
 
 pub fn migrate(connection: &Connection) -> Result<i64, rusqlite::Error> {
     migrate_to(connection, CURRENT_SCHEMA_VERSION)
@@ -1048,7 +1167,7 @@ fn migrate_to(connection: &Connection, target: i64) -> Result<i64, rusqlite::Err
         transaction.commit()?;
     }
     if current_version < 26 && target >= 26 {
-        copy_before_finance_rework(connection)?;
+        copy_before_finance_rework(connection, 26)?;
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(
             "ALTER TABLE finance_transactions ADD COLUMN purchase_date TEXT;
@@ -1093,12 +1212,8 @@ fn migrate_to(connection: &Connection, target: i64) -> Result<i64, rusqlite::Err
              DROP TABLE IF EXISTS finance_valuations;
              DROP TABLE IF EXISTS finance_investments;",
         )?;
-        crate::finance_migration::migrate_existing_finance_data(&transaction).map_err(|message| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ABORT),
-                Some(format!("Finanzas v26: {message}")),
-            )
-        })?;
+        // Version 26 also rewrote the movements of the old model; schema 36
+        // starts Finanzas again, so that data is not converted any more.
         transaction.execute("INSERT INTO notia_schema_migrations (version) VALUES (26)", [])?;
         transaction.commit()?;
     }
@@ -1394,13 +1509,15 @@ fn migrate_to(connection: &Connection, target: i64) -> Result<i64, rusqlite::Err
         )?;
         transaction.commit()?;
     }
+    if current_version < 36 && target >= 36 {
+        rework_finance(connection)?;
+    }
     // Some development builds recorded schema version 18/19 before the
     // association columns were present. Repair the invariant independently
     // of the version marker so existing libraries can load their dashboard.
     if target < CURRENT_SCHEMA_VERSION {
         return Ok(current_version.max(target));
     }
-    ensure_finance_service_link_columns(connection)?;
     // Which rows changed and when, for the copies of a host (`row_sync`).
     crate::row_sync::ensure_tracking(connection)?;
     Ok(current_version.max(CURRENT_SCHEMA_VERSION))
@@ -1743,27 +1860,11 @@ mod tests {
             })
             .expect("migration count");
         assert_eq!(count, CURRENT_SCHEMA_VERSION - 1);
-        let purchase_items: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'finance_purchase_items'", [], |row| row.get(0))
-            .expect("purchase items table");
-        assert_eq!(purchase_items, 1);
-        let receipts: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'finance_receipts'", [], |row| row.get(0))
-            .expect("receipts table");
-        assert_eq!(receipts, 1);
-        for table in [
-            "finance_services",
-            "finance_service_occurrences",
-            "finance_service_occurrence_versions",
-            "finance_service_invoices",
-            "finance_review_items",
-            "finance_merchant_aliases",
-            "finance_product_aliases",
-            "finance_link_log",
+        for table in crate::finance::FINANCE_TABLES.iter().copied().chain([
             "library_inventory",
             "library_inventory_staging",
             "library_inventory_state",
-        ] {
+        ]) {
             let exists: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -1774,12 +1875,13 @@ mod tests {
             assert_eq!(exists, 1, "missing {table}");
         }
         for table in [
+            "finance_transactions",
+            "finance_purchases",
+            "finance_salary_receipts",
+            "finance_credit_card_statements",
+            "finance_merchants",
             "finance_audit_runs",
-            "finance_audit_proposals",
-            "finance_audit_decisions",
-            "finance_relation_repairs",
             "finance_investments",
-            "finance_valuations",
         ] {
             let exists: i64 = connection
                 .query_row(
@@ -1790,22 +1892,6 @@ mod tests {
                 .expect("removed finance table");
             assert_eq!(exists, 0, "{table} should be removed");
         }
-        let transaction_service_column: i64 = connection
-            .query_row("SELECT COUNT(*) FROM pragma_table_info('finance_transactions') WHERE name='service_id'", [], |row| row.get(0))
-            .expect("transaction service column");
-        assert_eq!(transaction_service_column, 1);
-        let purchase_service_column: i64 = connection
-            .query_row("SELECT COUNT(*) FROM pragma_table_info('finance_purchases') WHERE name='service_id'", [], |row| row.get(0))
-            .expect("purchase service column");
-        assert_eq!(purchase_service_column, 1);
-        let ledger_column: i64 = connection
-            .query_row("SELECT COUNT(*) FROM pragma_table_info('finance_savings_reserves') WHERE name = 'ledger_account_id'", [], |row| row.get(0))
-            .expect("ledger account column");
-        assert_eq!(ledger_column, 1);
-        let signed_salary_column: i64 = connection
-            .query_row("SELECT COUNT(*) FROM pragma_table_info('finance_salary_receipts') WHERE name = 'signed_document'", [], |row| row.get(0))
-            .expect("signed salary column");
-        assert_eq!(signed_salary_column, 1);
         let expense_categories = connection
             .prepare("SELECT name FROM finance_categories WHERE kind='expense' ORDER BY name")
             .expect("expense category query")
@@ -1816,16 +1902,18 @@ mod tests {
         assert_eq!(
             expense_categories,
             vec![
-                "Alimentación",
+                "Comida y delivery",
                 "Educación",
-                "Entretenimiento",
-                "Impuestos y comisiones",
-                "Indumentaria",
+                "Hogar",
+                "Impuestos",
                 "Otros",
+                "Préstamos",
+                "Ropa",
+                "Salidas y ocio",
                 "Salud",
                 "Servicios",
+                "Supermercado",
                 "Transporte",
-                "Vivienda",
             ]
         );
     }
@@ -1867,8 +1955,8 @@ mod tests {
         ).expect("version 10 fixture");
 
         assert_eq!(
-            migrate(&connection).expect("migration"),
-            CURRENT_SCHEMA_VERSION
+            migrate_to(&connection, 35).expect("migration"),
+            35
         );
 
         let category_count: i64 = connection
@@ -1902,8 +1990,8 @@ mod tests {
             .expect("cleared version 11 fixture");
 
         assert_eq!(
-            migrate(&connection).expect("migration"),
-            CURRENT_SCHEMA_VERSION
+            migrate_to(&connection, 35).expect("migration"),
+            35
         );
 
         let category_count: i64 = connection
@@ -1940,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_service_columns_when_current_version_was_recorded_early() {
+    fn an_incomplete_finance_schema_recorded_early_still_reaches_the_new_finanzas() {
         let connection = Connection::open_in_memory().expect("in-memory SQLite");
         connection
             .execute_batch(
@@ -1957,105 +2045,38 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
 
-        for table in ["finance_transactions", "finance_purchases"] {
-            let column_count: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name='service_id'",
-                    [table],
-                    |row| row.get(0),
-                )
-                .expect("service link column");
-            assert_eq!(column_count, 1, "missing service_id in {table}");
-        }
+        let column_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('finance_movements') WHERE name='service_id'", [], |row| row.get(0))
+            .expect("service link column");
+        assert_eq!(column_count, 1, "the new Finanzas replaces the incomplete one");
     }
 
     #[test]
-    fn version_26_moves_existing_finance_data_to_the_card_payment_model() {
+    fn version_36_starts_finanzas_again_and_keeps_the_rest() {
         let connection = Connection::open_in_memory().expect("in-memory SQLite");
-        assert_eq!(migrate_to(&connection, 25).expect("version 25"), 25);
+        assert_eq!(migrate_to(&connection, 35).expect("version 35"), 35);
         connection
             .execute_batch(
-                "INSERT INTO finance_accounts(id,name,account_type,currency,opening_balance,active,created_at,updated_at) VALUES
-                    ('card','Visa','credit_card','ARS','0',1,'now','now'),
-                    ('bank','Banco','bank','ARS','0',1,'now','now'),
-                    ('savings:usd','Ahorros','savings_reserve','USD','0',1,'now','now');
-                 INSERT INTO finance_categories(id,name,kind,active,created_at,updated_at)
-                    VALUES('category-credit-card','Tarjeta de crédito','expense',1,'now','now');
-                 INSERT INTO finance_savings_reserves(id,name,currency,opening_balance,active,ledger_account_id,created_at,updated_at)
-                    VALUES('usd','Ahorros','USD','19626.00',1,'savings:usd','now','now');
-                 INSERT INTO finance_transactions(id,transaction_type,amount,currency,effective_date,account_id,category_id,description,source,status,created_at,updated_at) VALUES
-                    ('exchange','expense','1450000.00','ARS','2026-09-02','bank',NULL,'Compra de USD para ahorro','savings_exchange','confirmed','now','now'),
-                    ('line-tx','expense','1500.00','ARS','2026-08-12','card','category-credit-card','COTO CICSA 123','credit_card_statement','confirmed','now','now'),
-                    ('duplicate','expense','1500.00','ARS','2026-08-12','card',NULL,'Compra en Coto','telegram','confirmed','now','now'),
-                    ('after-closing','expense','800.00','ARS','2026-09-02','card',NULL,'Farmacia','telegram','confirmed','now','now'),
-                    ('old-card','expense','300.00','ARS','2026-06-01','card',NULL,'Kiosco','telegram','confirmed','now','now'),
-                    ('future-installment','expense','500.00','ARS','2099-01-10','card',NULL,'Heladera · cuota 3/3','installment','confirmed','now','now');
-                 INSERT INTO finance_savings_movements(id,reserve_id,movement_type,amount,currency,effective_date,description,source,status,linked_transaction_id,created_at,updated_at)
-                    VALUES('savings-exchange:exchange','usd','contribution','1000.00','USD','2026-09-02','Compra de USD para ahorro','savings_exchange','confirmed','exchange','now','now');
-                 INSERT INTO finance_source_artifacts(id,source_type,reference,created_at)
-                    VALUES('statement-artifact','credit_card_statement','resumen.pdf','now');
-                 INSERT INTO finance_credit_card_statements(id,account_id,issuer,period,closing_date,due_date,currency,total_due,source_artifact_id,validation_status,created_at,updated_at)
-                    VALUES('statement','card','Banco','2026-08','2026-08-28','2026-09-05','ARS','1500.00','statement-artifact','confirmed','now','now');
-                 INSERT INTO finance_credit_card_statement_items(id,statement_id,transaction_id,purchase_date,description,amount,currency,item_type,created_at)
-                    VALUES('line','statement','line-tx','2026-08-12','COTO CICSA 123','1500.00','ARS','purchase','now');
-                 INSERT INTO finance_installment_plans(id,account_id,description,purchase_date,currency,total_amount,installment_count,created_at,updated_at)
-                    VALUES('plan','card','Heladera','2098-11-10','ARS','1500.00',3,'now','now');
-                 INSERT INTO finance_installments(id,plan_id,installment_number,due_date,amount,status,transaction_id,created_at,updated_at)
-                    VALUES('plan:3','plan',3,'2099-01-10','500.00','confirmed','future-installment','now','now');
-                 INSERT INTO finance_audit_runs(id,period,trigger_fingerprint,status,source,created_at)
-                    VALUES('run','2026-08','fingerprint','completed','app','now');",
+                "INSERT INTO finance_accounts(id,name,account_type,currency,opening_balance,active,created_at,updated_at)
+                    VALUES('bank','Banco','bank','ARS','0',1,'now','now');
+                 INSERT INTO finance_transactions(id,transaction_type,amount,currency,effective_date,account_id,description,source,status,created_at,updated_at)
+                    VALUES('old','expense','1500.00','ARS','2026-09-02','bank','Coto','app','confirmed','now','now');
+                 CREATE TABLE IF NOT EXISTS notia_row_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_key TEXT NOT NULL, changed_ms INTEGER NOT NULL, pending INTEGER NOT NULL DEFAULT 1, UNIQUE (table_name, row_key));
+                 INSERT INTO notia_row_changes(table_name,row_key,changed_ms) VALUES ('finance_transactions','old',1),('library_users','user-owner',1);",
             )
-            .expect("version 25 finance data");
+            .expect("version 35 finance data");
 
         assert_eq!(migrate(&connection).expect("migration"), CURRENT_SCHEMA_VERSION);
 
-        let transaction = |id: &str| -> (String, String, String, Option<String>, Option<String>, Option<String>) {
-            connection
-                .query_row(
-                    "SELECT transaction_type,status,effective_date,purchase_date,destination_account_id,deleted_at
-                     FROM finance_transactions WHERE id=?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-                )
-                .expect("migrated transaction")
-        };
-        let exchange = transaction("exchange");
-        assert_eq!((exchange.0.as_str(), exchange.4.as_deref()), ("exchange", Some("savings:usd")));
-        let line = transaction("line-tx");
-        assert_eq!((line.2.as_str(), line.3.as_deref(), line.5.as_deref()), ("2026-09-05", Some("2026-08-12"), None));
-        let line_description: String = connection
-            .query_row("SELECT description FROM finance_transactions WHERE id='line-tx'", [], |row| row.get(0))
-            .expect("line description");
-        assert_eq!(line_description, "Compra en Coto");
-        assert!(transaction("duplicate").5.is_some(), "the duplicate joins its line");
-        let after_closing = transaction("after-closing");
-        assert_eq!((after_closing.1.as_str(), after_closing.3.as_deref()), ("card_unpaid", Some("2026-09-02")));
-        let old = transaction("old-card");
-        assert_eq!((old.1.as_str(), old.3.as_deref()), ("confirmed", None));
-        assert!(transaction("future-installment").5.is_some());
-        let installment: (String, Option<String>) = connection
-            .query_row("SELECT status,transaction_id FROM finance_installments WHERE id='plan:3'", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .expect("installment");
-        assert_eq!(installment, ("pending".into(), None));
-        let savings: (String, i64) = connection
-            .query_row(
-                "SELECT r.opening_balance,(SELECT COUNT(*) FROM finance_savings_movements WHERE reserve_id=r.id)
-                 FROM finance_savings_reserves r WHERE r.id='usd'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("reserve");
-        assert_eq!(savings, ("19626.00".into(), 1));
-        let charges: String = connection
-            .query_row("SELECT name FROM finance_categories WHERE id='category-credit-card'", [], |row| row.get(0))
-            .expect("card category");
-        assert_eq!(charges, "Cargos de tarjeta");
-        let audit_tables: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'finance_audit%'", [], |row| row.get(0))
-            .expect("audit tables");
-        assert_eq!(audit_tables, 0);
+        let count = |sql: &str| connection.query_row(sql, [], |row| row.get::<_, i64>(0)).expect(sql);
+        assert_eq!(count("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='finance_transactions'"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM finance_movements"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM finance_categories"), 14, "the default categories");
+        assert_eq!(count("SELECT COUNT(*) FROM finance_reserves"), 2, "the default reserves");
+        assert_eq!(count("SELECT COUNT(*) FROM notia_row_changes WHERE table_name LIKE 'finance%'"), 0, "the copies forget the old rows");
+        assert_eq!(count("SELECT COUNT(*) FROM notia_row_changes WHERE table_name='library_users'"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM library_users WHERE id='user-owner'"), 1);
+        assert_eq!(count("PRAGMA foreign_keys"), 1, "foreign keys are back on");
     }
 
     #[test]

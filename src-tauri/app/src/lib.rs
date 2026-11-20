@@ -16,18 +16,16 @@ pub mod backend_tauri;
 mod backup;
 mod database;
 mod finance;
-mod finance_agent_inputs;
 mod finance_budgets;
-mod finance_edits;
 mod finance_entry;
 mod finance_export;
 mod finance_forms;
-mod finance_loans;
-mod finance_matching;
-mod finance_migration;
-mod finance_reconciliation;
-mod finance_records;
+mod finance_model;
+mod finance_ops;
 mod finance_screen;
+#[cfg(test)]
+mod finance_tests;
+mod finance_tools;
 mod agenda;
 mod agenda_view;
 mod agenda_sync;
@@ -131,7 +129,6 @@ mod services {
     pub mod bluetooth_service;
     #[cfg(all(feature = "bluetooth", not(any(target_os = "android", target_os = "ios"))))]
     pub mod coldpass_secure_link;
-    pub mod finance_extraction;
     pub mod finance_external;
     pub mod local_agreement;
     pub mod media_decoder;

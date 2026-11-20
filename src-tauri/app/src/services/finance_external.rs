@@ -11,7 +11,7 @@ const INFLATION_ANNUAL_URL: &str =
 const DOLLAR_HISTORY_URL: &str =
     "https://api.argentinadatos.com/v1/cotizaciones/dolares/oficial";
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DollarQuote {
     pub kind: String,
@@ -184,6 +184,3 @@ pub async fn finance_dollar_quotes() -> Result<Vec<DollarQuote>, String> {
     dollar_quotes().await
 }
 
-pub async fn finance_inflation_indices() -> Result<InflationIndices, String> {
-    inflation_indices().await
-}
