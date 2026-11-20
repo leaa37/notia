@@ -43,6 +43,12 @@ export function MoneyText({ list, empty = '—', decimals = 0 }: { list: Money[]
   return <>{list.length === 0 ? empty : formatMoneyList(list, decimals)}</>
 }
 
+/** What is still to pay: the exact amounts, and what has none yet («2 servicios»). */
+export function PendingText({ pending, note }: { pending: Money[]; note: string | null }) {
+  if (pending.length === 0 && !note) return <>Nada</>
+  return <>{[pending.length > 0 ? formatMoneyList(pending, 0) : null, note].filter(Boolean).join(' + ')}</>
+}
+
 /** What a movement is, without repeating its name. */
 function movementMeta(row: MovementRow): string {
   if (row.detail) return row.detail

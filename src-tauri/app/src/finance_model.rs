@@ -44,13 +44,12 @@ pub struct Named {
     pub name: String,
 }
 
+/// A service is only its name: what it costs is what each month's payment says.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Service {
     pub id: String,
     pub name: String,
-    pub currency: String,
-    pub amount: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -154,9 +153,7 @@ pub(crate) fn list_cards(connection: &Connection) -> ReadResult<Vec<Named>> {
 }
 
 pub(crate) fn list_services(connection: &Connection) -> ReadResult<Vec<Service>> {
-    rows(connection, "SELECT id,name,currency,amount FROM finance_services ORDER BY name COLLATE NOCASE", [], |row| {
-        Ok(Service { id: row.get(0)?, name: row.get(1)?, currency: row.get(2)?, amount: row.get(3)? })
-    })
+    rows(connection, "SELECT id,name FROM finance_services ORDER BY name COLLATE NOCASE", [], |row| Ok(Service { id: row.get(0)?, name: row.get(1)? }))
 }
 
 fn loan_from(row: &Row<'_>) -> rusqlite::Result<Loan> {
@@ -522,10 +519,9 @@ pub(crate) fn loan_state_of(connection: &Connection, id: &str) -> ReadResult<Opt
 pub struct ServiceMonth {
     #[serde(flatten)]
     pub service: Service,
-    /// The payment of the month, if there is one.
+    /// The payment of the month, if there is one: its amount is the only one shown.
     pub paid: Option<Payment>,
-    /// What it should cost: the last payment, or the amount of the service.
-    pub estimate: String,
+    pub currency: Option<String>,
 }
 
 /// Each service in `month`: from the month it was created on (or paid).
@@ -541,29 +537,27 @@ pub(crate) fn services_of_month(connection: &Connection, month: &str) -> ReadRes
     .collect::<HashMap<_, _>>();
     Ok(list_services(connection)?
         .into_iter()
-        .filter(|service| {
+        .filter_map(|service| {
+            let paid = all.iter().find(|movement| movement.service_id.as_deref() == Some(service.id.as_str()) && movement.service_month.as_deref() == Some(month));
             let created = since.get(&service.id).cloned().flatten().unwrap_or_default();
-            created.as_str() <= month || all.iter().any(|movement| movement.service_id.as_deref() == Some(service.id.as_str()) && movement.service_month.as_deref() == Some(month))
-        })
-        .map(|service| {
-            let of_service = all.iter().filter(|movement| movement.service_id.as_deref() == Some(service.id.as_str())).collect::<Vec<_>>();
-            let paid = of_service.iter().find(|movement| movement.service_month.as_deref() == Some(month)).map(|movement| Payment::of(movement));
-            let estimate = of_service.last().map(|movement| movement.amount.clone()).unwrap_or_else(|| service.amount.clone());
-            ServiceMonth { service, paid, estimate }
+            (created.as_str() <= month || paid.is_some()).then(|| ServiceMonth {
+                currency: paid.map(|movement| movement.currency.clone()),
+                paid: paid.map(Payment::of),
+                service,
+            })
         })
         .collect())
 }
 
-/// What a service should cost now: its last payment, or its amount.
-pub(crate) fn service_estimate(connection: &Connection, service: &Service) -> ReadResult<String> {
-    let last: Option<String> = connection
+/// The last payment of a service, to remind what it was (never as what it will be).
+pub(crate) fn last_service_payment(connection: &Connection, service_id: &str) -> ReadResult<Option<(String, String)>> {
+    connection
         .query_row(
-            "SELECT amount FROM finance_movements WHERE service_id=?1 ORDER BY date DESC, created_at DESC LIMIT 1",
-            [&service.id],
-            |row| row.get(0),
+            "SELECT amount,currency FROM finance_movements WHERE service_id=?1 ORDER BY service_month DESC, date DESC, created_at DESC LIMIT 1",
+            [service_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?;
-    Ok(last.unwrap_or_else(|| service.amount.clone()))
+        .optional()
 }
 
 // ---------------------------------------------------------------------------

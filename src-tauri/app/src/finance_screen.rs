@@ -217,7 +217,10 @@ pub struct Commitment {
 pub struct Commitments {
     pub items: Vec<Commitment>,
     pub paid: Vec<Money>,
+    /// What is still to pay and is known exactly (card installments).
     pub pending: Vec<Money>,
+    /// What is still to pay without an amount yet: «y 2 servicios».
+    pub pending_note: Option<String>,
     pub paid_count: usize,
     pub pending_count: usize,
 }
@@ -483,11 +486,20 @@ fn saved_in_reserves(connection: &Connection, from: &str, to: &str, currency: &s
 fn commitments(connection: &Connection, month: &str, purchases: &[PurchaseState], loans: &[model::LoanState]) -> FinanceCommandResult<Commitments> {
     let mut items = Vec::new();
     for service in model::services_of_month(connection, month)? {
+        // A service costs what its payment says: before paying it, nothing.
         let (amount, status, subtitle) = match &service.paid {
-            Some(paid) => (paid.amount.clone(), "paid", format!("Pagado el {}", day_label(&paid.date))),
-            None => (service.estimate.clone(), "pending", "Servicio".to_string()),
+            Some(paid) => (Some(paid.amount.clone()), "paid", format!("Pagado el {}", day_label(&paid.date))),
+            None => (None, "pending", "Sin pagar".to_string()),
         };
-        items.push(Commitment { kind: "service", id: service.service.id.clone(), title: service.service.name.clone(), subtitle, amount: Some(amount), currency: service.service.currency.clone(), status });
+        items.push(Commitment {
+            kind: "service",
+            id: service.service.id.clone(),
+            title: service.service.name.clone(),
+            subtitle,
+            amount,
+            currency: service.currency.clone().unwrap_or_else(|| "ARS".into()),
+            status,
+        });
     }
     for card in model::list_cards(connection)? {
         let due = model::card_installments(purchases, &card.id, month);
@@ -519,9 +531,10 @@ fn commitments(connection: &Connection, month: &str, purchases: &[PurchaseState]
     for state in loans {
         let Some(installment) = state.installment_of(month) else { continue };
         let late = state.unpaid_before(month) > 0;
+        // Each installment costs something else: before paying it, no amount.
         let (amount, status) = match &installment.paid {
             Some(paid) => (Some(paid.amount.clone()), "paid"),
-            None => (state.last_paid.clone(), if late { "late" } else { "pending" }),
+            None => (None, if late { "late" } else { "pending" }),
         };
         items.push(Commitment {
             kind: "loan",
@@ -540,13 +553,25 @@ fn commitments(connection: &Connection, month: &str, purchases: &[PurchaseState]
         *target.entry(item.currency.clone()).or_insert(0) += item.amount.as_deref().map(cents).unwrap_or(0);
     }
     items.sort_by_key(|item| (item.status == "paid", item.status != "late"));
+    let unknown = |kind: &str| items.iter().filter(|item| item.kind == kind && item.status != "paid" && item.amount.is_none()).count();
     Ok(Commitments {
         paid_count: items.iter().filter(|item| item.status == "paid").count(),
         pending_count: items.iter().filter(|item| item.status != "paid").count(),
+        pending_note: unknown_note(unknown("service"), unknown("loan")),
         paid: money_list(&paid),
         pending: money_list(&pending),
         items,
     })
+}
+
+/// What is still to pay without an amount: «2 servicios», «1 cuota de préstamo».
+pub(crate) fn unknown_note(services: usize, loans: usize) -> Option<String> {
+    let parts = [
+        (services > 0).then(|| if services == 1 { "1 servicio".to_string() } else { format!("{services} servicios") }),
+        (loans > 0).then(|| if loans == 1 { "1 cuota de préstamo".to_string() } else { format!("{loans} cuotas de préstamo") }),
+    ];
+    let parts = parts.into_iter().flatten().collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" y "))
 }
 
 fn debts(connection: &Connection, month: &str, purchases: &[PurchaseState], loans: &[model::LoanState]) -> FinanceCommandResult<Debts> {
@@ -607,10 +632,9 @@ fn debts(connection: &Connection, month: &str, purchases: &[PurchaseState], loan
 pub struct ServicePayment {
     pub id: String,
     pub name: String,
-    pub currency: String,
-    /// What was paid, or what it should cost.
-    pub amount: String,
+    /// The month's payment: its amount is the only one shown.
     pub paid: Option<model::Payment>,
+    pub currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -670,7 +694,6 @@ pub struct LoanMonth {
     pub number: Option<u32>,
     pub paid: Option<model::Payment>,
     pub next_number: Option<u32>,
-    pub last_paid: Option<String>,
     pub paid_count: u32,
     pub total_paid: String,
     pub late_count: usize,
@@ -686,7 +709,10 @@ pub struct Payments {
     pub cards: Vec<CardMonth>,
     pub loans: Vec<LoanMonth>,
     pub paid: Vec<Money>,
+    /// What is still to pay and is known exactly (card installments).
     pub pending: Vec<Money>,
+    /// What is still to pay without an amount yet.
+    pub pending_note: Option<String>,
 }
 
 pub fn finance_payments(app: crate::host::AppHandle, payload: MonthPayload) -> FinanceCommandResult<Payments> {
@@ -703,12 +729,12 @@ pub(crate) fn payments(connection: &Connection, month: &str) -> FinanceCommandRe
     let services = model::services_of_month(connection, month)?
         .into_iter()
         .map(|service| {
-            let amount = service.paid.as_ref().map(|payment| payment.amount.clone()).unwrap_or(service.estimate.clone());
-            let target = if service.paid.is_some() { &mut paid } else { &mut pending };
-            *target.entry(service.service.currency.clone()).or_insert(0) += cents(&amount);
-            ServicePayment { id: service.service.id, name: service.service.name, currency: service.service.currency, amount, paid: service.paid }
+            if let (Some(payment), Some(currency)) = (&service.paid, &service.currency) {
+                *paid.entry(currency.clone()).or_insert(0) += cents(&payment.amount);
+            }
+            ServicePayment { id: service.service.id, name: service.service.name, paid: service.paid, currency: service.currency }
         })
-        .collect();
+        .collect::<Vec<_>>();
     let cards = model::list_cards(connection)?
         .into_iter()
         .map(|card| {
@@ -772,16 +798,13 @@ pub(crate) fn payments(connection: &Connection, month: &str) -> FinanceCommandRe
             }
         })
         .collect();
-    let loans = loans
+    let loans: Vec<LoanMonth> = loans
         .iter()
         .filter(|state| !state.finished || state.installments.iter().any(|installment| installment.paid.as_ref().is_some_and(|paid| paid.date.starts_with(month))))
         .map(|state| {
             let installment = state.installment_of(month);
-            if let Some(installment) = installment {
-                match &installment.paid {
-                    Some(payment) => *paid.entry(state.loan.currency.clone()).or_insert(0) += cents(&payment.amount),
-                    None => *pending.entry(state.loan.currency.clone()).or_insert(0) += state.last_paid.as_deref().map(cents).unwrap_or(0),
-                }
+            if let Some(payment) = installment.and_then(|installment| installment.paid.as_ref()) {
+                *paid.entry(state.loan.currency.clone()).or_insert(0) += cents(&payment.amount);
             }
             LoanMonth {
                 id: state.loan.id.clone(),
@@ -792,7 +815,6 @@ pub(crate) fn payments(connection: &Connection, month: &str) -> FinanceCommandRe
                 number: installment.map(|installment| installment.number),
                 paid: installment.and_then(|installment| installment.paid.clone()),
                 next_number: state.next_number,
-                last_paid: state.last_paid.clone(),
                 paid_count: state.paid_count,
                 total_paid: state.total_paid.clone(),
                 late_count: state.unpaid_before(month),
@@ -800,7 +822,17 @@ pub(crate) fn payments(connection: &Connection, month: &str) -> FinanceCommandRe
             }
         })
         .collect();
-    Ok(Payments { nav: nav(month), services, cards, loans, paid: money_list(&paid), pending: money_list(&pending) })
+    let services_left = services.iter().filter(|service| service.paid.is_none()).count();
+    let loans_left = loans.iter().filter(|loan| loan.number.is_some() && loan.paid.is_none() && !loan.finished).count();
+    Ok(Payments {
+        nav: nav(month),
+        pending_note: unknown_note(services_left, loans_left),
+        services,
+        cards,
+        loans,
+        paid: money_list(&paid),
+        pending: money_list(&pending),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,8 +1159,10 @@ pub struct FinanceHomeSummary {
     income: Vec<Money>,
     /// What is left of the month: income minus expenses minus savings.
     left: Vec<Money>,
-    /// What is still to pay this month (services, cards, loans).
+    /// What is still to pay this month and is known exactly (card installments).
     pending: Vec<Money>,
+    /// What is still to pay without an amount yet: «2 servicios».
+    pending_note: Option<String>,
     pending_count: usize,
     saved: Vec<Money>,
 }
@@ -1150,6 +1184,7 @@ pub(crate) fn home_summary(app: &crate::host::AppHandle, context: &FinanceContex
             income: pick(|balance| &balance.income),
             left: pick(|balance| &balance.left),
             pending: overview.commitments.pending.clone(),
+            pending_note: overview.commitments.pending_note.clone(),
             pending_count: overview.commitments.pending_count,
             saved: pick(|balance| &balance.saved),
         })

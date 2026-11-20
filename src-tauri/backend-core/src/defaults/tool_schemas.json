@@ -5397,7 +5397,7 @@
     }
   },
   "get_finance_setup": {
-    "description": "Lectura: lo configurado en Finanzas, con ids y nombres: categorías de gastos e ingresos, cuentas, tarjetas con sus compras en cuotas en curso, servicios (importe, último pago, si se pagó este mes), préstamos (cuotas pagadas, último importe, próxima cuota), presupuestos del mes y reservas de ahorro con su saldo. Leela antes de cargar algo si no conocés los nombres.",
+    "description": "Lectura: lo configurado en Finanzas, con ids y nombres: categorías de gastos e ingresos, cuentas, tarjetas con sus compras en cuotas en curso, servicios (si se pagó este mes y con cuánto, y el último pago), préstamos (cuotas pagadas, último importe, próxima cuota), presupuestos del mes y reservas de ahorro con su saldo. Leela antes de cargar algo si no conocés los nombres.",
     "parameters": {
       "type": "object",
       "properties": {}
@@ -5628,7 +5628,7 @@
     }
   },
   "pay_finance_loan_installment": {
-    "description": "Mutación: paga una cuota de un préstamo con el importe pagado (cambia cada mes). Sin number paga la próxima cuota sin pagar. Queda como gasto de la categoría «Préstamos». Muestra una vista previa y espera la confirmación; afirmá que quedó guardado solo después de ok:true.",
+    "description": "Mutación: paga una cuota de un préstamo con el importe pagado (cambia cada mes; si la persona no lo dijo, preguntale). Sin number paga la próxima cuota sin pagar. Queda como gasto de la categoría «Préstamos». Muestra una vista previa y espera la confirmación; afirmá que quedó guardado solo después de ok:true.",
     "parameters": {
       "type": "object",
       "required": [
@@ -5661,11 +5661,12 @@
     }
   },
   "pay_finance_service": {
-    "description": "Mutación: registra el pago de un servicio en un mes (uno por mes). Sin amount usa el último importe pagado. Queda como gasto de la categoría «Servicios». Muestra una vista previa y espera la confirmación; afirmá que quedó guardado solo después de ok:true.",
+    "description": "Mutación: registra el pago de un servicio en un mes (uno por mes) con lo que costó ESE mes. El importe es obligatorio y nunca se deduce de otros meses: si la persona no lo dijo, preguntale. Queda como gasto de la categoría «Servicios». Muestra una vista previa y espera la confirmación; afirmá que quedó guardado solo después de ok:true.",
     "parameters": {
       "type": "object",
       "required": [
-        "service"
+        "service",
+        "amount"
       ],
       "properties": {
         "service": {
@@ -5678,7 +5679,15 @@
         },
         "amount": {
           "type": "string",
-          "description": "Lo que se pagó. Texto decimal, por ejemplo \"45000\" o \"1500.50\"; sin símbolo."
+          "description": "Lo que se pagó este mes. Texto decimal, por ejemplo \"45000\"; sin símbolo."
+        },
+        "currency": {
+          "type": "string",
+          "enum": [
+            "ARS",
+            "USD"
+          ],
+          "description": "Moneda del pago; por defecto la del último pago del servicio, o ARS."
         },
         "date": {
           "type": "string",
@@ -5686,7 +5695,7 @@
         },
         "account": {
           "type": "string",
-          "description": "Cuenta (opcional), por nombre. Las cuentas son opcionales: no la pidas si la persona no la menciona."
+          "description": "Cuenta (opcional), por nombre."
         }
       }
     }
@@ -5774,7 +5783,7 @@
     }
   },
   "save_finance_setup": {
-    "description": "Mutación: crea o corrige lo que se configura. kind card: name. service: name, amount, currency (se paga cada mes y va a «Servicios»). loan: name, amount (lo prestado), installments, firstMonth. budget: category, amount, currency (un tope por mes; uno por categoría y moneda). category: name, categoryKind. reserve: name, currency, goal opcional. account: name. Muestra una vista previa y espera la confirmación; afirmá que quedó guardado solo después de ok:true.",
+    "description": "Mutación: crea o corrige lo que se configura. kind card: name. service: name (solo el nombre: cada mes se paga con lo que costó y va a «Servicios»). loan: name, amount (lo prestado), installments, firstMonth. budget: category, amount, currency (un tope por mes; uno por categoría y moneda). category: name, categoryKind. reserve: name, currency, goal opcional. account: name. Muestra una vista previa y espera la confirmación; afirmá que quedó guardado solo después de ok:true.",
     "parameters": {
       "type": "object",
       "required": [

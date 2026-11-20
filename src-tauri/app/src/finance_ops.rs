@@ -648,23 +648,23 @@ fn pay_service(connection: &Connection, source: &str, values: &Values) -> OpResu
     if let Some(paid) = paid {
         return Err(reject("month", format!("{} de {} ya está pagado (el {}).", service.name, month_label(&month), day_label(&paid))));
     }
-    let amount = match optional_amount(values, "amount")? {
-        Some(amount) => amount,
-        None => cents(&model::service_estimate(connection, &service)?),
-    };
+    // What this month cost: nothing is guessed from other months.
+    let amount = amount(values, "amount")?;
+    let last_currency = model::last_service_payment(connection, &service_id)?.map(|(_, currency)| currency).unwrap_or_else(|| "ARS".into());
+    let currency = currency(values, "currency", &last_currency)?;
     let input = MovementInput {
         kind: "expense",
         name: service.name.clone(),
         category_id: Some(ensure_category(connection, CATEGORY_SERVICES, "expense")?),
         account_id: account(connection, values)?,
         amount,
-        currency: service.currency.clone(),
+        currency: currency.clone(),
         date: date(values, "date")?,
     };
     let id = insert_movement(connection, source, &input, PaysFor { service: Some((&service_id, &month)), ..PaysFor::default() })?;
     Ok(Applied {
         undo: undo_delete("movement", &id),
-        ..applied(format!("{} de {} pagado: {}.", service.name, month_label(&month), money_text(amount, &service.currency)), Some(id))
+        ..applied(format!("{} de {} pagado: {}.", service.name, month_label(&month), money_text(amount, &currency)), Some(id))
     })
 }
 
@@ -826,29 +826,12 @@ fn delete_category(connection: &Connection, id: &str) -> OpResult<Applied> {
     delete_row(connection, "finance_categories", id, &message)
 }
 
+/// A service is a name; each month's payment says what it cost.
 fn save_service(connection: &Connection, id: Option<&str>, values: &Values) -> OpResult<Applied> {
     let name = name(values, "name", "el nombre del servicio")?;
-    let amount = amount(values, "amount")?;
-    let currency = currency(values, "currency", "ARS")?;
     unique_name(connection, "finance_services", id, &name, "")?;
-    let stamp = now();
-    let saved = match id {
-        Some(id) => {
-            if connection.execute("UPDATE finance_services SET name=?2,currency=?3,amount=?4,updated_at=?5 WHERE id=?1", params![id, name, currency, format_cents(amount), stamp])? == 0 {
-                return Err(refuse("El servicio ya no existe."));
-            }
-            id.to_string()
-        }
-        None => {
-            let id = new_id();
-            connection.execute(
-                "INSERT INTO finance_services (id,name,currency,amount,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?5)",
-                params![id, name, currency, format_cents(amount), stamp],
-            )?;
-            id
-        }
-    };
-    Ok(applied(format!("Servicio guardado: {name} · {} por mes.", money_text(amount, &currency)), Some(saved)))
+    let saved = upsert_named(connection, "finance_services", id, &name)?;
+    Ok(applied(format!("Servicio guardado: {name}. Cada mes, al pagarlo, cargás lo que costó."), Some(saved)))
 }
 
 fn save_loan(connection: &Connection, id: Option<&str>, values: &Values) -> OpResult<Applied> {

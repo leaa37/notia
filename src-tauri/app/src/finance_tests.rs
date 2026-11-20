@@ -163,7 +163,10 @@ fn a_loan_is_paid_with_what_each_installment_cost() {
     let catalog = forms::catalog(&connection).unwrap();
     let form = forms::build(&connection, &catalog, "loan-payment", None, &Values::new()).unwrap().unwrap();
     let amount = form.fields.iter().find(|field| field.key == "amount").unwrap();
-    assert_eq!(amount.value, json!("64500"), "it starts from the last payment");
+    assert_eq!(amount.value, json!(""), "each installment is typed");
+    assert_eq!(amount.help.as_deref(), Some("La anterior fue de $ 64.500."));
+    let view = screen::overview(&connection, &month).unwrap();
+    assert_eq!(view.commitments.items.iter().find(|item| item.kind == "loan").and_then(|item| item.amount.clone()), Some("62000.00".into()), "this month's was paid");
     let last = apply(&connection, "loan-payment", None, json!({ "loanId": loan, "amount": "65000" }));
     assert!(last.message.ends_with("Con esta terminaste el préstamo."), "{}", last.message);
     let category: Option<String> = connection.query_row("SELECT category_id FROM finance_movements WHERE loan_id=?1 LIMIT 1", [&loan], |row| row.get(0)).unwrap();
@@ -171,37 +174,69 @@ fn a_loan_is_paid_with_what_each_installment_cost() {
 }
 
 #[test]
-fn a_service_is_a_name_and_an_amount_and_goes_to_servicios() {
+fn a_service_is_a_name_and_each_payment_says_what_it_cost() {
     let connection = database();
     let month = current_month();
     let catalog = forms::catalog(&connection).unwrap();
     let form = forms::build(&connection, &catalog, "service", None, &Values::new()).unwrap().unwrap();
-    assert_eq!(form.fields.iter().map(|field| field.key.as_str()).collect::<Vec<_>>(), ["name", "amount"]);
-    assert_eq!(form.fields[1].currency.as_ref().map(|pick| pick.key.as_str()), Some("currency"));
+    assert_eq!(form.fields.iter().map(|field| field.key.as_str()).collect::<Vec<_>>(), ["name"], "no amount to guess");
 
     // Even after its category was deleted.
     delete(&connection, "category", "category-services");
-    let internet = id(apply(&connection, "service", None, json!({ "name": "Internet", "amount": "25000" })));
-    let paid = apply(&connection, "service-payment", None, json!({ "serviceId": "internet" }));
-    assert_eq!(paid.message, format!("Internet de {} pagado: $ 25.000.", crate::finance::month_label(&month)));
-    assert_eq!(count(&connection, "SELECT COUNT(*) FROM finance_categories WHERE id='category-services' AND name='Servicios'"), 1);
-    assert_eq!(rejected(&connection, "service-payment", json!({ "serviceId": internet })), ["month"], "one payment per month");
+    let internet = id(apply(&connection, "service", None, json!({ "name": "Internet" })));
 
-    // The next month starts from what was paid.
+    // Before paying, it shows no amount: what is missing is not invented.
+    let view = screen::overview(&connection, &month).unwrap();
+    let pending = view.commitments.items.iter().find(|item| item.kind == "service").unwrap();
+    assert_eq!((pending.status, pending.amount.as_deref()), ("pending", None));
+    assert!(view.commitments.pending.is_empty());
+    assert_eq!(view.commitments.pending_note.as_deref(), Some("1 servicio"));
+    let payments = screen::payments(&connection, &month).unwrap();
+    assert_eq!(payments.pending_note.as_deref(), Some("1 servicio"));
+
+    // Paying asks what it cost this month.
+    let catalog = forms::catalog(&connection).unwrap();
+    let pay = forms::build(&connection, &catalog, "service-payment", None, &Values::new()).unwrap().unwrap();
+    let amount = pay.fields.iter().find(|field| field.key == "amount").unwrap();
+    assert_eq!((amount.value.clone(), amount.help.is_none()), (json!(""), true), "nothing typed for it");
+    assert_eq!(rejected(&connection, "service-payment", json!({ "serviceId": "internet" })), ["amount"]);
+    let paid = apply(&connection, "service-payment", None, json!({ "serviceId": "internet", "amount": "45.000" }));
+    assert_eq!(paid.message, format!("Internet de {} pagado: $ 45.000.", crate::finance::month_label(&month)));
+    assert_eq!(count(&connection, "SELECT COUNT(*) FROM finance_categories WHERE id='category-services' AND name='Servicios'"), 1);
+    assert_eq!(rejected(&connection, "service-payment", json!({ "serviceId": internet, "amount": "1" })), ["month"], "one payment per month");
+
+    // That amount is the one shown everywhere.
+    let view = screen::overview(&connection, &month).unwrap();
+    let done = view.commitments.items.iter().find(|item| item.kind == "service").unwrap();
+    assert_eq!((done.status, done.amount.as_deref()), ("paid", Some("45000.00")));
+    assert_eq!(view.commitments.pending_note, None);
+    let payments = screen::payments(&connection, &month).unwrap();
+    assert_eq!(payments.services[0].paid.as_ref().map(|paid| paid.amount.as_str()), Some("45000.00"));
+    assert_eq!(payments.paid[0].amount, "45000.00");
+
+    // The next month asks again; the last payment is only a reminder, with its currency.
     let next = add_months(&month, 1);
-    apply(&connection, "movement", paid.saved_id.as_deref(), json!({ "amount": "26100" }));
-    let services = model::services_of_month(&connection, &next).unwrap();
-    assert_eq!((services[0].paid.is_none(), services[0].estimate.as_str()), (true, "26100.00"));
+    apply(&connection, "movement", paid.saved_id.as_deref(), json!({ "amount": "46100" }));
     let catalog = forms::catalog(&connection).unwrap();
     let form = forms::build(&connection, &catalog, "service-payment", None, &values(json!({ "month": next }))).unwrap().unwrap();
-    assert_eq!(form.fields.iter().find(|field| field.key == "amount").unwrap().value, json!("26100"));
+    let amount = form.fields.iter().find(|field| field.key == "amount").unwrap();
+    assert_eq!(amount.value, json!(""));
+    assert_eq!(amount.help.as_deref(), Some("La vez anterior pagaste $ 46.100."));
+    apply(&connection, "service-payment", None, json!({ "serviceId": internet, "month": next, "amount": "12", "currency": "USD" }));
+    let catalog = forms::catalog(&connection).unwrap();
+    let form = forms::build(&connection, &catalog, "service-payment", None, &Values::new()).unwrap().unwrap();
+    assert_eq!(form.fields.iter().find(|field| field.key == "amount").and_then(|field| field.currency.as_ref()).map(|pick| pick.value.as_str()), Some("USD"));
+
+    // A reload for another service forgets what was typed for this one.
+    let reloaded = forms::build(&connection, &catalog, "service-payment", None, &values(json!({ "serviceId": internet, "amount": "999", "_changed": "serviceId" }))).unwrap().unwrap();
+    assert_eq!(reloaded.fields.iter().find(|field| field.key == "amount").unwrap().value, json!(""));
 
     // It does not show before it existed.
     assert!(model::services_of_month(&connection, &add_months(&month, -1)).unwrap().is_empty());
 
     // Deleting the service keeps its payments.
     delete(&connection, "service", &internet);
-    assert_eq!(count(&connection, "SELECT COUNT(*) FROM finance_movements WHERE category_id='category-services'"), 1);
+    assert_eq!(count(&connection, "SELECT COUNT(*) FROM finance_movements WHERE category_id='category-services'"), 2);
 }
 
 #[test]

@@ -319,9 +319,16 @@ pub(crate) fn build(connection: &Connection, catalog: &Catalog, kind: &str, id: 
         None => (kind, Map::new()),
     };
     let changed = text(prefill, "_changed");
+    // What depends on the field that changed belongs to the previous choice.
+    let stale: &[&str] = match changed.as_deref() {
+        Some("serviceId") => &["amount", "currency"],
+        Some("loanId") => &["amount", "number"],
+        Some("cardId") | Some("month") if kind == "card-payment" => &["installments"],
+        _ => &[],
+    };
     let mut values = stored_values;
     for (key, value) in prefill {
-        if key != "_changed" {
+        if key != "_changed" && !stale.contains(&key.as_str()) {
             values.insert(key.clone(), value.clone());
         }
     }
@@ -332,9 +339,9 @@ pub(crate) fn build(connection: &Connection, catalog: &Catalog, kind: &str, id: 
         "salary" => Some(salary_form(connection, catalog, editing)?),
         "payment" => Some(payment_form(connection, catalog, &values)?),
         "card-purchase" => Some(purchase_form(catalog, &values, editing)),
-        "card-payment" => Some(card_payment_form(catalog, &values, changed.as_deref())),
-        "loan-payment" => Some(loan_payment_form(catalog, &values, changed.as_deref())),
-        "service-payment" => Some(service_payment_form(connection, catalog, &values, changed.as_deref())?),
+        "card-payment" => Some(card_payment_form(catalog, &values)),
+        "loan-payment" => Some(loan_payment_form(catalog, &values)),
+        "service-payment" => Some(service_payment_form(connection, catalog, &values)?),
         "savings" => Some(savings_form(catalog, &values)),
         "exchange" => Some(exchange_form(catalog, &values)),
         "category" => Some(category_form(editing)),
@@ -463,9 +470,7 @@ fn stored_values(connection: &Connection, catalog: &Catalog, kind: &str, id: &st
         }),
         "account" => catalog.accounts.iter().find(|account| account.id == id).map(|account| ("account".into(), object(json!({ "name": account.name })))),
         "card" => catalog.cards.iter().find(|card| card.id == id).map(|card| ("card".into(), object(json!({ "name": card.name })))),
-        "service" => catalog.services.iter().find(|service| service.id == id).map(|service| {
-            ("service".into(), object(json!({ "name": service.name, "amount": service.amount, "currency": service.currency })))
-        }),
+        "service" => catalog.services.iter().find(|service| service.id == id).map(|service| ("service".into(), object(json!({ "name": service.name })))),
         "loan" => catalog.loans.iter().find(|state| state.loan.id == id).map(|state| {
             let loan = &state.loan;
             ("loan".into(), object(json!({
@@ -617,7 +622,7 @@ fn purchase_form(catalog: &Catalog, values: &Values, editing: bool) -> EntryForm
     form
 }
 
-fn card_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) -> EntryForm {
+fn card_payment_form(catalog: &Catalog, values: &Values) -> EntryForm {
     let card_id = text(values, "cardId").or_else(|| catalog.cards.first().map(|card| card.id.clone())).unwrap_or_default();
     let month = text(values, "month").filter(|month| crate::finance::valid_month(month)).unwrap_or_else(current_month);
     let due = model::card_installments(&catalog.purchases, &card_id, &month).into_iter().filter(|installment| installment.paid.is_none()).collect::<Vec<_>>();
@@ -645,13 +650,7 @@ fn card_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) 
             *totals.entry(installment.currency.clone()).or_default() += cents(&installment.amount);
         }
         let total = totals.iter().map(|(currency, amount)| money_text(*amount, currency)).collect::<Vec<_>>().join(" + ");
-        let mut checks = Field::checks("installments", "Cuotas a pagar", options).required().help(format!("Todas: {total}."));
-        if changed.is_none() {
-            if let Some(chosen) = values.get("installments").filter(|value| value.is_array()) {
-                checks.value = chosen.clone();
-            }
-        }
-        fields.push(checks);
+        fields.push(Field::checks("installments", "Cuotas a pagar", options).required().help(format!("Todas: {total}.")));
     }
     fields.push(date_field());
     push_account(&mut fields, catalog);
@@ -662,7 +661,7 @@ fn card_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) 
     form
 }
 
-fn loan_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) -> EntryForm {
+fn loan_payment_form(catalog: &Catalog, values: &Values) -> EntryForm {
     let open = catalog.loans.iter().filter(|state| !state.finished).collect::<Vec<_>>();
     let loan_id = text(values, "loanId").or_else(|| open.first().map(|state| state.loan.id.clone())).unwrap_or_default();
     let state = catalog.loans.iter().find(|state| state.loan.id == loan_id);
@@ -677,13 +676,11 @@ fn loan_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) 
             .filter(|installment| installment.paid.is_none())
             .map(|installment| choice(installment.number.to_string(), format!("Cuota {} de {} · {}", installment.number, state.loan.installment_count, month_short(&installment.month))))
             .collect::<Vec<_>>();
-        let mut number = Field::select("number", "Cuota", unpaid).required().default(state.next_number.map(|number| number.to_string()).unwrap_or_default());
+        let number = Field::select("number", "Cuota", unpaid).required().default(state.next_number.map(|number| number.to_string()).unwrap_or_default());
+        // Each installment costs something else: typed every time, the last one only as a reminder.
         let mut amount = Field::locked_money("amount", "Lo que pagaste", &state.loan.currency).required();
         if let Some(last) = &state.last_paid {
-            amount = amount.default(last.clone()).help(format!("La anterior fue de {}.", money_text(cents(last), &state.loan.currency)));
-        }
-        if changed == Some("loanId") {
-            number.value = Value::String(state.next_number.map(|number| number.to_string()).unwrap_or_default());
+            amount = amount.help(format!("La anterior fue de {}.", money_text(cents(last), &state.loan.currency)));
         }
         fields.push(number);
         fields.push(amount);
@@ -697,7 +694,7 @@ fn loan_payment_form(catalog: &Catalog, values: &Values, changed: Option<&str>) 
     form
 }
 
-fn service_payment_form(connection: &Connection, catalog: &Catalog, values: &Values, changed: Option<&str>) -> rusqlite::Result<EntryForm> {
+fn service_payment_form(connection: &Connection, catalog: &Catalog, values: &Values) -> rusqlite::Result<EntryForm> {
     let service_id = text(values, "serviceId").or_else(|| catalog.services.first().map(|service| service.id.clone())).unwrap_or_default();
     let mut fields = vec![
         Field::select("serviceId", "Servicio", catalog.services.iter().map(|service| choice(&service.id, &service.name)).collect())
@@ -706,26 +703,17 @@ fn service_payment_form(connection: &Connection, catalog: &Catalog, values: &Val
             .reload(),
         Field::month("month", "Mes").default(current_month()),
     ];
-    if let Some(service) = catalog.services.iter().find(|service| service.id == service_id) {
-        let estimate = model::service_estimate(connection, service)?;
-        let mut amount = Field::locked_money("amount", "Lo que pagaste", &service.currency).required().default(estimate.clone());
-        if estimate != service.amount {
-            amount = amount.help(format!("El mes pasado: {}.", money_text(cents(&estimate), &service.currency)));
-        }
-        fields.push(amount);
+    // What this month cost, typed every time: the last one is only a reminder.
+    let last = model::last_service_payment(connection, &service_id)?;
+    let currency = last.as_ref().map(|(_, currency)| currency.as_str()).unwrap_or("ARS");
+    let mut amount = Field::money("amount", "Lo que pagaste este mes", currency).required();
+    if let Some((paid, currency)) = &last {
+        amount = amount.help(format!("La vez anterior pagaste {}.", money_text(cents(paid), currency)));
     }
+    fields.push(amount);
     fields.push(date_field());
     push_account(&mut fields, catalog);
-    let mut form = form("service-payment", "Pagar un servicio", "Pagar", fields);
-    if changed == Some("serviceId") {
-        // The amount of the newly chosen service, not the one typed before.
-        if let Some(service) = catalog.services.iter().find(|service| service.id == service_id) {
-            let estimate = model::service_estimate(connection, service)?;
-            if let Some(field) = form.fields.iter_mut().find(|field| field.key == "amount") {
-                field.value = Value::String(estimate);
-            }
-        }
-    }
+    let form = form("service-payment", "Pagar un servicio", "Pagar", fields);
     if catalog.services.is_empty() {
         return Ok(with_intro(form, "Todavía no tenés servicios. Creá uno desde Cargar → Servicio."));
     }
@@ -790,9 +778,8 @@ fn service_form(editing: bool) -> EntryForm {
     let mut form = with_intro(
         form("service", if editing { "Servicio" } else { "Nuevo servicio" }, "Guardar", vec![
             Field::text("name", "Nombre").required().placeholder("Luz, internet, alquiler…"),
-            Field::money("amount", "Importe por mes", "ARS").required().help("Más o menos: cada mes cargás lo que pagaste."),
         ]),
-        "Se paga cada mes y va a la categoría Servicios.",
+        "Cada mes, al pagarlo, cargás lo que costó ese mes. Va a la categoría Servicios.",
     );
     form.delete = delete("Borrar servicio", "¿Borrar el servicio? Sus pagos quedan en Movimientos.");
     form

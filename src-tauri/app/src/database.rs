@@ -12,7 +12,7 @@ use crate::host::{
 
 const NOTIA_DIRECTORY: &str = ".notia";
 const DATABASE_FILE_NAME: &str = "notia.db";
-pub const CURRENT_SCHEMA_VERSION: i64 = 36;
+pub const CURRENT_SCHEMA_VERSION: i64 = 37;
 /// A client's copy that never got its host's database.
 pub(crate) const COPY_WITHOUT_DATABASE: &str =
     "La copia de este equipo no tiene la base de datos de la biblioteca: conectate al host para completarla.";
@@ -1512,6 +1512,16 @@ fn migrate_to(connection: &Connection, target: i64) -> Result<i64, rusqlite::Err
     if current_version < 36 && target >= 36 {
         rework_finance(connection)?;
     }
+    if current_version < 37 && target >= 37 {
+        // Un servicio es solo su nombre: lo que cuesta es lo de cada pago.
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE finance_services DROP COLUMN amount;
+             ALTER TABLE finance_services DROP COLUMN currency;
+             INSERT INTO notia_schema_migrations (version) VALUES (37);",
+        )?;
+        transaction.commit()?;
+    }
     // Some development builds recorded schema version 18/19 before the
     // association columns were present. Repair the invariant independently
     // of the version marker so existing libraries can load their dashboard.
@@ -2049,6 +2059,22 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pragma_table_info('finance_movements') WHERE name='service_id'", [], |row| row.get(0))
             .expect("service link column");
         assert_eq!(column_count, 1, "the new Finanzas replaces the incomplete one");
+    }
+
+    #[test]
+    fn version_37_keeps_the_services_without_their_amount() {
+        let connection = Connection::open_in_memory().expect("in-memory SQLite");
+        assert_eq!(migrate_to(&connection, 36).expect("version 36"), 36);
+        connection
+            .execute("INSERT INTO finance_services (id,name,currency,amount,created_at,updated_at) VALUES ('s','Luz','ARS','18000.00','1','1')", [])
+            .expect("a service of version 36");
+        assert_eq!(migrate(&connection).expect("migration"), CURRENT_SCHEMA_VERSION);
+        let name: String = connection.query_row("SELECT name FROM finance_services WHERE id='s'", [], |row| row.get(0)).expect("service");
+        assert_eq!(name, "Luz");
+        let columns: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('finance_services') WHERE name IN ('amount','currency')", [], |row| row.get(0))
+            .expect("columns");
+        assert_eq!(columns, 0);
     }
 
     #[test]

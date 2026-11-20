@@ -3,10 +3,10 @@ import { ArrowRight, TrendingDown, TrendingUp } from 'lucide-react'
 import type { NotiaLibrary } from '../../../types/notia'
 import { getFinanceOverview } from '../services/financeService'
 import { useFinanceResource } from '../hooks/useFinanceResource'
-import { formatAmount, formatMoneyList, formatPercent, formatSignedPercent, plural } from '../engines/financeFormat'
+import { formatAmount, formatExact, formatMoneyList, formatPercent, formatSignedPercent, plural } from '../engines/financeFormat'
 import type { Balance, CategoryRow, Commitment, FinanceOverview, HistoryPoint } from '../types/financeScreen'
 import { useFinanceEntry, type FinanceEntryApi } from './entry/financeEntryContext'
-import { FinanceBar, FinanceCard, FinancePill, FinanceStatus, MoneyText, MovementList } from './FinanceParts'
+import { FinanceBar, FinanceCard, FinancePill, FinanceStatus, MoneyText, MovementList, PendingText } from './FinanceParts'
 import type { FinanceTab } from './FinanceScreen'
 
 interface Props {
@@ -150,7 +150,7 @@ function CommitmentsCard({ view, entry, onTab }: { view: FinanceOverview; entry:
       <FinanceBar percent={(commitments.paidCount * 100) / total} label={`Pagaste ${commitments.paidCount} de ${total}`} />
       <div className="finance-split">
         <div><span className="finance-mono-label">Pagado</span><strong><MoneyText list={commitments.paid} empty="$ 0" /></strong></div>
-        <div><span className="finance-mono-label">Falta pagar</span><strong className={commitments.pendingCount > 0 ? 'finance-warn-text' : ''}><MoneyText list={commitments.pending} empty="Nada" /></strong></div>
+        <div><span className="finance-mono-label">Falta pagar</span><strong className={commitments.pendingCount > 0 ? 'finance-warn-text' : ''}><PendingText pending={commitments.pending} note={commitments.pendingNote} /></strong></div>
       </div>
       <ul className="finance-commitments" role="list">
         {commitments.items.map((item) => <li key={`${item.kind}:${item.id}:${item.currency}`} className="finance-commitment">
@@ -158,7 +158,7 @@ function CommitmentsCard({ view, entry, onTab }: { view: FinanceOverview; entry:
             <span className="finance-commitment__title">{item.title}</span>
             <span className="finance-commitment__sub">{item.kind === 'service' ? 'Servicio' : item.kind === 'card' ? 'Tarjeta' : 'Préstamo'} · {item.subtitle}</span>
           </span>
-          <span className="finance-commitment__amount">{item.amount ? formatAmount(item.amount, item.currency, 0) : '—'}</span>
+          <span className="finance-commitment__amount">{item.amount ? formatExact(item.amount, item.currency) : ''}</span>
           {item.status === 'paid'
             ? <FinancePill tone="paid">{STATUS_TEXT.paid}</FinancePill>
             : <button type="button" className={`finance-button finance-button--small ${item.status === 'late' ? 'finance-button--warn' : 'finance-button--outline'}`} onClick={() => pay(item)}>

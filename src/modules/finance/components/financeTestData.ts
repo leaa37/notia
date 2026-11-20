@@ -11,12 +11,13 @@ export const overview: FinanceOverview = {
   pace: { daysElapsed: 20, daysInMonth: 30, dailyAverage: '20000.00', projected: '600000.00', expenseCount: 12, biggest: null },
   commitments: {
     items: [
-      { kind: 'service', id: 's1', title: 'Internet', subtitle: 'Servicio', amount: '25000.00', currency: 'ARS', status: 'pending' },
+      { kind: 'service', id: 's1', title: 'Internet', subtitle: 'Sin pagar', amount: null, currency: 'ARS', status: 'pending' },
       { kind: 'card', id: 'c1', title: 'Visa', subtitle: '2 cuotas', amount: '90000.00', currency: 'ARS', status: 'late' },
       { kind: 'loan', id: 'l1', title: 'Préstamo', subtitle: 'Cuota 2 de 12', amount: '62000.00', currency: 'ARS', status: 'paid' },
     ],
     paid: [pesos('62000.00')],
-    pending: [pesos('115000.00')],
+    pending: [pesos('90000.00')],
+    pendingNote: '1 servicio',
     paidCount: 1,
     pendingCount: 2,
   },
@@ -31,7 +32,7 @@ export const overview: FinanceOverview = {
 
 export const payments: FinancePayments = {
   ...nav,
-  services: [{ id: 's1', name: 'Internet', currency: 'ARS', amount: '25000.00', paid: null }],
+  services: [{ id: 's1', name: 'Internet', paid: null, currency: null }],
   cards: [{
     id: 'c1',
     name: 'Visa',
@@ -45,9 +46,10 @@ export const payments: FinancePayments = {
     debt: [pesos('600000.00')],
     purchases: [{ id: 'p1', name: 'Heladera', category: 'Hogar', total: '720000.00', currency: 'ARS', count: 12, paidCount: 2, remaining: '600000.00', firstMonth: '2026-09', lastMonth: '2027-08', finished: false }],
   }],
-  loans: [{ id: 'l1', name: 'Préstamo', currency: 'ARS', amount: '600000.00', count: 12, number: 2, paid: null, nextNumber: 2, lastPaid: '62000.00', paidCount: 1, totalPaid: '62000.00', lateCount: 0, finished: false }],
+  loans: [{ id: 'l1', name: 'Préstamo', currency: 'ARS', amount: '600000.00', count: 12, number: 2, paid: null, nextNumber: 2, paidCount: 1, totalPaid: '62000.00', lateCount: 0, finished: false }],
   paid: [],
-  pending: [pesos('177000.00')],
+  pending: [pesos('90000.00')],
+  pendingNote: '1 servicio y 1 cuota de préstamo',
 }
 
 export const movements: FinanceMovements = {

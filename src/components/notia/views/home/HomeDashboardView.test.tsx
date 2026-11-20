@@ -52,7 +52,7 @@ mocks.dashboard = {
   summary: '1 evento en los próximos 7 días',
   agenda: { data: { days: [{ date: '2026-09-26', weekday: 'Sáb', day: 26, label: 'sábado 26', isToday: true, hasEvents: false }], events: [] } },
   tasks: { data: { completed: 17, sprint: 5, review: 2, blocked: 1, urgentCount: 0, urgent: [], focus: { filePath: 't/a.md', title: 'Performance', selected: false } } },
-  finance: { data: { month: '2026-09', monthLabel: 'septiembre', expenses: [], expenseCount: 0, income: [], left: [], pending: [], pendingCount: 0, saved: [] } },
+  finance: { data: { month: '2026-09', monthLabel: 'septiembre', expenses: [], expenseCount: 0, income: [], left: [], pending: [], pendingNote: null, pendingCount: 0, saved: [] } },
   routine: { data: { today: '2026-09-26', monthLabel: 'septiembre', monthPct: 75, weekPct: 76, bestStreak: 13, pendingToday: 0, week: [], routines: [] } },
   notes: { data: { items: [], pending: 0 } },
   recent: { items: [], folders: [{ name: 'Facultad', path: 'C:/gaia/Facultad' }] },

@@ -353,14 +353,15 @@ fn setup(connection: &Connection) -> ToolResult<Value> {
         .collect::<Vec<_>>();
     let services = model::services_of_month(connection, &month)?
         .into_iter()
-        .map(|service| json!({
-            "id": service.service.id,
-            "name": service.service.name,
-            "currency": service.service.currency,
-            "amount": service.service.amount,
-            "lastAmount": service.estimate,
-            "paidThisMonth": service.paid.is_some(),
-        }))
+        .map(|service| {
+            let last = model::last_service_payment(connection, &service.service.id).ok().flatten();
+            json!({
+                "id": service.service.id,
+                "name": service.service.name,
+                "paidThisMonth": service.paid.as_ref().map(|paid| json!({ "amount": paid.amount, "currency": service.currency, "date": paid.date })),
+                "lastPayment": last.map(|(amount, currency)| json!({ "amount": amount, "currency": currency })),
+            })
+        })
         .collect::<Vec<_>>();
     let loans = model::loan_states(connection)?
         .into_iter()
@@ -414,7 +415,7 @@ mod tests {
         assert!(preview("save_finance_salary", json!({ "amount": "1.500.000" })).expect("salary").contains("1.500.000"));
         let purchase = preview("save_finance_card_purchase", json!({ "card": "visa", "name": "Heladera", "total": "720000", "installments": 12 })).expect("purchase");
         assert!(purchase.contains("12 cuotas de $ 60.000"), "{purchase}");
-        assert!(preview("save_finance_setup", json!({ "kind": "service", "name": "Luz", "amount": "18000" })).expect("service").contains("Luz"));
+        assert!(preview("save_finance_setup", json!({ "kind": "service", "name": "Luz" })).expect("service").contains("Luz"));
         assert!(matches!(preview("delete_finance_record", json!({ "kind": "movement" })), Err(ToolFailure::Invalid(_))));
     }
 }

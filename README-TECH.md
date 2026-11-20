@@ -13815,7 +13815,7 @@ Tablas nuevas: `finance_applied_requests`, `finance_budgets`, `finance_budget_al
 
 Pedido del usuario, después de usar la carga manual: el modelo del asistente era inusable a mano.
 - El sueldo pedía bruto, descuentos, conceptos y empleador: ahora es solo el importe.
-- Los servicios pedían categoría, proveedor, vencimiento y fijo/variable: ahora son nombre, moneda e importe, y van solos a «Servicios».
+- Los servicios pedían categoría, proveedor, vencimiento y fijo/variable: ahora son solo su nombre, y van solos a «Servicios». Desde el esquema 37 no tienen importe: cada pago lleva lo que costó ese mes (ver «Finanzas: servicios sin importe estimado»).
 - Los préstamos ahora son nombre, monto y cuotas, y cada cuota se paga con su importe.
 - Las tarjetas son compras con total y cuotas que se pagan cuota por cuota, sin cargar resúmenes.
 - No hay tickets, productos ni comercios.
@@ -13835,7 +13835,7 @@ Decisiones del usuario:
 - Con `foreign_keys` apagado, borra **todas** las tablas `finance_*` y sus entradas en `notia_row_changes` (la copia de un host no pide filas de tablas que ya no existen). Después crea `FINANCE_SCHEMA` y siembra las categorías y reservas iniciales (`finance::seed_defaults`).
 - La conversión de datos de la v26 (`finance_migration`) ya no corre: la v36 los descarta igual.
 - Tablas:
-  - `finance_categories` (`kind` es `expense` o `income`), `finance_accounts`, `finance_cards` y `finance_services` (moneda e importe);
+  - `finance_categories` (`kind` es `expense` o `income`), `finance_accounts`, `finance_cards` y `finance_services` (con moneda e importe hasta el esquema 37, que los borra);
   - `finance_loans` (moneda, monto, `installment_count` de 1 a 600 y `first_month`);
   - `finance_card_purchases` (tarjeta en cascada, categoría `SET NULL`, moneda, total, de 1 a 72 cuotas y `first_month`);
   - `finance_movements`;
@@ -13860,7 +13860,7 @@ Decisiones del usuario:
   - lo pendiente se calcula siempre (`finance_model::purchase_states`, `card_installments`).
 - El **resumen de una tarjeta** en un mes son sus cuotas de ese mes más las anteriores sin pagar (`late`).
 - Un **préstamo** tiene una cuota por mes desde `first_month`, sin importe esperado. Cada pago guarda lo que se pagó, en la categoría «Préstamos», y `last_paid` sirve para precargar el próximo.
-- Un **servicio** tiene un pago por mes. El importe esperado es el último pagado o, si nunca se pagó, el del servicio (`service_estimate`).
+- Un **servicio** tiene un pago por mes. No hay importe esperado: el del mes es el de su pago, y antes de pagarlo no hay ninguno.
 - Borrar una tarjeta, compra, servicio o préstamo deja sus pagos como gastos sueltos (`SET NULL`): lo pagado es historia. Una reserva se borra con sus movimientos.
 
 ### Escrituras (`finance_ops.rs`)
@@ -13871,7 +13871,7 @@ Decisiones del usuario:
 - Tipos:
   - movimientos: `expense`, `income`, `salary` y `movement` (editar o borrar uno guardado); `movements` con `delete` y `ids` deshace un pago de varias cuotas;
   - tarjetas: `card-purchase`, `card-payment` (con `installments` `purchaseId:n`, o todas las sin pagar hasta `month`);
-  - pagos: `loan-payment` (`number` por defecto la próxima) y `service-payment` (`amount` por defecto el estimado);
+  - pagos: `loan-payment` (`number` por defecto la próxima) y `service-payment` (`amount` obligatorio, sin valor por defecto);
   - ahorro: `savings` y `exchange`;
   - configuración: `category`, `account`, `card`, `service`, `loan`, `budget` (guardar uno existente le cambia el tope) y `reserve`.
 - Referencias por id **o por nombre**, sin acentos ni mayúsculas (`fold`). Si no existe, el mensaje nombra las que hay. Una compra sin tarjetas acepta `newCard` y la crea.
@@ -13883,12 +13883,12 @@ Decisiones del usuario:
 
 - Tipos de campo: `text`, `money`, `integer`, `date`, `month`, `select`, `checks` e `info`.
   - `money` lleva `currency: { key, value, locked }`. Una moneda elegible viaja con su clave (`currency`) y una bloqueada (la del servicio o del préstamo) solo se muestra.
-  - `reload: true`: al cambiar, el cliente vuelve a pedir el formulario con los valores y `_changed`. Así el pago de un servicio trae su importe, el de una tarjeta sus cuotas (`checks`, todas marcadas) y el de un préstamo la próxima cuota y el último importe.
+  - `reload: true`: al cambiar, el cliente vuelve a pedir el formulario con los valores y `_changed`. Así el pago de un servicio trae su moneda y lo que costó la vez anterior (como ayuda, no como valor), el de una tarjeta sus cuotas (`checks`, todas marcadas) y el de un préstamo la próxima cuota y, como ayuda, el último importe.
 - Lo que piden:
   - gasto: nombre (con sugerencias de nombres recientes), importe, categoría y fecha;
   - sueldo: importe, precargado con el último, y fecha;
   - compra con tarjeta: tarjeta, qué, total, cuotas, categoría («Otros») y primera cuota (el mes que viene);
-  - servicio: nombre e importe;
+  - servicio: solo el nombre;
   - préstamo: nombre, monto, cuotas y primera cuota.
 - La cuenta solo aparece si hay cuentas.
 - Un pago guardado se edita con su propio formulario (`payment`, que se aplica como `movement`): dice qué paga, con la moneda bloqueada, y su borrado es «Deshacer el pago».
@@ -13900,8 +13900,8 @@ Decisiones del usuario:
   - `finance_apply`, idempotente por `requestId`: guarda el resultado en `finance_applied_requests` en la misma transacción, y un rechazo no lo guarda;
   - `finance_manage`, con las secciones `cards`, `purchases`, `services`, `loans`, `budgets`, `expense-categories`, `income-categories`, `reserves` y `accounts`.
 - `finance_screen.rs`:
-  - `finance_overview` devuelve `balance` por moneda (ingresos, sueldo, gastos, ahorro, queda, % gastado y ahorrado, variación contra el mes anterior), `pace` (promedio diario, proyección del mes actual y el gasto más grande), `commitments` (cada servicio, tarjeta por moneda y préstamo del mes, `paid`/`pending`/`late`), `categories` con su `budget`, `history` (seis meses en pesos), `debts` (por tarjeta, total, cuotas de los próximos tres meses y préstamos), `savings`, `topExpenses`, `recent` y `empty`;
-  - `finance_payments` devuelve los servicios, cada tarjeta (cuotas del mes y atrasadas, total, pendiente, deuda y compras) y cada préstamo, con lo pagado y lo pendiente del mes;
+  - `finance_overview` devuelve `balance` por moneda (ingresos, sueldo, gastos, ahorro, queda, % gastado y ahorrado, variación contra el mes anterior), `pace` (promedio diario, proyección del mes actual y el gasto más grande), `commitments` (cada servicio, tarjeta por moneda y préstamo del mes, `paid`/`pending`/`late`; `pending` suma solo cuotas de tarjeta y `pendingNote` nombra lo que no tiene importe), `categories` con su `budget`, `history` (seis meses en pesos), `debts` (por tarjeta, total, cuotas de los próximos tres meses y préstamos), `savings`, `topExpenses`, `recent` y `empty`;
+  - `finance_payments` devuelve los servicios, cada tarjeta (cuotas del mes y atrasadas, total, pendiente, deuda y compras) y cada préstamo, con lo pagado y lo pendiente del mes (`pending` exacto más `pendingNote`);
   - `finance_movements` y `finance_search` reciben `filter { kind, categoryId, accountId, search }`. La búsqueda también encuentra por importe; el historial va de a 200;
   - `finance_savings` es asíncrono: suma las cotizaciones de DolarApi y el valor en pesos de los dólares al blue (o al oficial).
 - `finance_export` escribe las columnas Fecha, Tipo, Nombre, Categoría, Cuenta, Detalle, Importe y Moneda.
@@ -13942,7 +13942,7 @@ Decisiones del usuario:
 
 - Usa los mismos comandos y tiene las mismas pestañas.
 - `Forms.kt`:
-  - `FullScreen` es un `Dialog` de pantalla completa con `dismissOnClickOutside = false`;
+  - `FullScreen` es un `Dialog` de pantalla completa con `dismissOnClickOutside = false` y `decorFitsSystemWindows = false`, acolchado con `WindowInsets.safeDrawing`; Guardar va debajo de los campos (ver «Finanzas: servicios sin importe estimado»);
   - Atrás llama a `requestCloseForm`, que pregunta si hay cambios. No hay `ModalBottomSheet` en los formularios; solo queda en el menú «Cargar», que no tiene nada que perder;
   - Ajustes también abre a pantalla completa.
 - `BackHandler` en `HomeScreen`: fuera de Resumen, Atrás va a Resumen; en Resumen, sale.
@@ -13964,3 +13964,59 @@ Decisiones del usuario:
   - en 390 px: Resumen y Pagos.
 - App: compila en GitHub Actions.
 - Pendiente: probarla en el teléfono (sobre todo Atrás, los formularios a pantalla completa con el teclado y la cola sin conexión) y el bot con el modelo real.
+
+## Finanzas: servicios sin importe estimado y Guardar visible en la app (2026-11-20)
+
+Un servicio tenía un «importe por mes» obligatorio y Notia lo usaba como lo que faltaba pagar. Era un número inventado: el servicio cuesta distinto cada mes. Ahora un servicio es solo su nombre, y el importe que se ve en todos lados es el de su pago de ese mes.
+
+### Esquema 37 (`database.rs`)
+
+- `ALTER TABLE finance_services DROP COLUMN amount` y `DROP COLUMN currency`, en una transacción. Los servicios y sus pagos quedan; no hace falta borrar datos.
+- Los triggers de `row_sync` solo nombran columnas clave, así que `DROP COLUMN` no choca con ellos.
+- Prueba: `version_37_keeps_the_services_without_their_amount` migra a 36, crea un servicio con importe, migra a 37 y comprueba que el nombre sigue y que las columnas ya no existen.
+
+### Modelo y escrituras
+
+- `finance_model::Service` es `{ id, name }`. `ServiceMonth` agrega `paid` y `currency`, la del pago del mes o, si no hay, la del último pago (`last_service_payment`, ordenado por `service_month`, fecha y alta).
+- `save_service` (`kind: "service"`) guarda solo `name` (único).
+- `pay_service` (`service-payment`) exige `amount`; sin él rechaza en el campo. La moneda por defecto es la del último pago, o ARS.
+- `loan-payment` tampoco trae el importe precargado: la ayuda dice «La anterior fue de X».
+- `build()` de los formularios descarta las claves que dependen de lo que cambió (`serviceId` → `amount`, `currency`; `loanId` → `amount`, `number`; tarjeta o mes del pago → `installments`), para que una recarga no deje el valor del servicio anterior.
+
+### Lo que se muestra
+
+- Un servicio o una cuota de préstamo sin pagar no tiene importe (`amount: null`) en `commitments`, `finance_payments` y `Administrar` («Sin pagar este mes» o «Pagado en {mes}: $X»).
+- «Falta pagar» suma solo lo exacto (cuotas de tarjeta) en `pending` y nombra el resto en `pendingNote` («1 servicio», «2 servicios y 1 cuota de préstamo»; `unknown_note`). La web y la app lo muestran como «$ 90.000 + 1 servicio»; sin nada, «Nada». El inicio (`FinanceHomeSummary`) también trae `pendingNote`.
+- `finance_payments` ya no devuelve `lastPaid` en cada préstamo: ninguna pantalla lo usaba. El recordatorio vive en la ayuda del formulario.
+
+### Asistente
+
+- `pay_finance_service` pide `service` y `amount` (y `currency` opcional). `get_finance_setup` devuelve cada servicio con `paidThisMonth` y `lastPayment`.
+- La guía de Finanzas dice que un servicio es solo su nombre, que el pago lleva lo que costó ese mes (si falta, lo pregunta) y que no hay que dar importes pendientes de servicios o préstamos sin pagar.
+
+### App de Android
+
+- `ServicePayment` es `{ id, name, paid, currency }`; `Commitments` y `Payments` traen `pendingNote`. Un servicio o préstamo sin pagar no muestra importe.
+- Guardar se veía recortado al fondo de los formularios. La web no lo reproduce: el botón queda debajo de los campos. En la app, `FullScreen` fijaba los botones al borde inferior del `Dialog` y dependía de `navigationBarsPadding()`. Con `decorFitsSystemWindows = true` (el valor por defecto) el diálogo no recibe los insets de forma confiable, y esa barra podía quedar debajo de la barra de navegación. Ahora:
+  - `DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false, …)` y `windowInsetsPadding(WindowInsets.safeDrawing)`: barras, recorte y teclado;
+  - Guardar (y Borrar o Descartar) van dentro del scroll, debajo del último campo, como en la web; arriba a la derecha sigue el Guardar del encabezado;
+  - los íconos de las barras siguen el tema (oscuros en el claro) con `WindowCompat.getInsetsController` sobre la ventana del diálogo.
+
+### Validaciones
+
+- `cargo test -p notia-app`: 429 aprobados, 2 fallidos (los mismos de antes: `meeting::…a_meeting_whose_session_is_gone_finishes_with_its_lines` y `telegram_service::…endpoint_accepts_standard_bot_token_shape`), 6 ignorados. Las de Finanzas pasan, incluida `a_service_is_a_name_and_each_payment_says_what_it_cost`. Cubre:
+  - solo el campo nombre;
+  - un pendiente sin importe con «1 servicio»;
+  - el importe obligatorio y el pago visto en todos lados;
+  - la ayuda con el anterior y la moneda recordada en US$;
+  - la recarga que descarta el importe, el mes de alta y borrar sin perder los pagos.
+- `cargo test -p notia-backend-core`: 837 aprobados, falla 1 (`image_generation::…only_sexual_content_with_minors_is_refused`, ya fallaba antes y no tiene relación).
+- `cargo clippy -p notia-app`: sin avisos en Finanzas ni en la migración 37.
+- Web: `vitest run` (151 archivos, 772 pruebas), `tsc` y `eslint` limpios.
+- En el navegador, contra el servidor headless con datos nuevos, a 1400×900 y 390×844:
+  - el servicio se crea solo con el nombre;
+  - sin pagar, no muestra importe y «Falta pagar» dice «$ 90.000 + 1 servicio y 1 cuota de préstamo»;
+  - el pago pide «Lo que pagaste este mes», y después Pagos y el Resumen muestran $ 25.800 y «Falta pagar» ya no nombra el servicio;
+  - sin errores de página.
+- App: compila en GitHub Actions.
+- Pendiente: ver en un teléfono real que Guardar queda visible con y sin teclado, con navegación por gestos y con tres botones. No hay dispositivo ni emulador en este entorno.

@@ -252,11 +252,11 @@ pub(crate) fn manage_sections(connection: &Connection) -> rusqlite::Result<Vec<M
     let services = model::services_of_month(connection, &month)?
         .into_iter()
         .map(|service| {
-            let status = match &service.paid {
-                Some(_) => format!("pagado en {}", month_label(&month).split(' ').next().unwrap_or_default()),
-                None => "sin pagar este mes".to_string(),
+            let subtitle = match (&service.paid, &service.currency) {
+                (Some(paid), Some(currency)) => format!("Pagado en {}: {}", month_label(&month).split(' ').next().unwrap_or_default(), money_text(cents(&paid.amount), currency)),
+                _ => "Sin pagar este mes".to_string(),
             };
-            manage_row(&service.service.id, "service", service.service.name.clone(), format!("{} por mes · {status}", money_text(cents(&service.service.amount), &service.service.currency)), false)
+            manage_row(&service.service.id, "service", service.service.name.clone(), subtitle, false)
         })
         .collect();
     let loan_rows = loans

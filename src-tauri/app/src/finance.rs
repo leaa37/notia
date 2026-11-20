@@ -7,6 +7,8 @@
 //!   categoría «Sueldo».
 //! - **Pagos**: pagar un servicio, una cuota de tarjeta o una cuota de un
 //!   préstamo crea el gasto del mes en que se paga; lo pendiente se calcula.
+//!   Un servicio es solo su nombre y una cuota de préstamo no tiene importe
+//!   hasta que se paga: nada pendiente se muestra con un importe inventado.
 //! - **Tarjetas**: cada compra lleva su total y sus cuotas; el resumen de
 //!   cada mes se arma solo con las cuotas que vencen.
 //! - **Ahorro**: reservas con depósitos y retiros, y compra o venta de
@@ -636,9 +638,9 @@ pub(crate) fn seed_demo_data(connection: &Connection) -> rusqlite::Result<()> {
             ('dev-account-cash','Efectivo demo','{stamp}','{stamp}');
          INSERT OR IGNORE INTO finance_cards (id,name,created_at,updated_at) VALUES
             ('dev-card-visa','Visa demo','{stamp}','{stamp}');
-         INSERT OR IGNORE INTO finance_services (id,name,currency,amount,created_at,updated_at) VALUES
-            ('dev-service-internet','Internet demo','ARS','25000.00','{stamp}','{stamp}'),
-            ('dev-service-power','Luz demo','ARS','18000.00','{stamp}','{stamp}');
+         INSERT OR IGNORE INTO finance_services (id,name,created_at,updated_at) VALUES
+            ('dev-service-internet','Internet demo','{stamp}','{stamp}'),
+            ('dev-service-power','Luz demo','{stamp}','{stamp}');
          INSERT OR IGNORE INTO finance_loans (id,name,currency,amount,installment_count,first_month,created_at,updated_at) VALUES
             ('dev-loan-bank','Préstamo demo','ARS','600000.00',12,'{previous}','{stamp}','{stamp}');
          INSERT OR IGNORE INTO finance_card_purchases (id,card_id,name,category_id,currency,total,installment_count,first_month,created_at,updated_at) VALUES

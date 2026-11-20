@@ -92,8 +92,10 @@ export interface HomeFinance {
   income: Money[]
   /** What is left of the month: income minus expenses minus savings. */
   left: Money[]
-  /** What is still to pay this month (services, cards, loans). */
+  /** What is still to pay this month and is known exactly (card installments). */
   pending: Money[]
+  /** What is still to pay without an amount yet: «2 servicios». */
+  pendingNote: string | null
   pendingCount: number
   saved: Money[]
 }

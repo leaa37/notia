@@ -67,7 +67,10 @@ export interface Commitment {
 export interface Commitments {
   items: Commitment[]
   paid: Money[]
+  /** What is still to pay and is known exactly (card installments). */
   pending: Money[]
+  /** What is still to pay without an amount yet: «2 servicios». */
+  pendingNote: string | null
   paidCount: number
   pendingCount: number
 }
@@ -152,12 +155,12 @@ export interface Payment {
   amount: string
 }
 
+/** A service is only its name: the amount is the one of the month's payment. */
 export interface ServicePayment {
   id: string
   name: string
-  currency: string
-  amount: string
   paid: Payment | null
+  currency: string | null
 }
 
 export interface InstallmentRow {
@@ -206,7 +209,6 @@ export interface LoanMonth {
   number: number | null
   paid: Payment | null
   nextNumber: number | null
-  lastPaid: string | null
   paidCount: number
   totalPaid: string
   lateCount: number
@@ -218,7 +220,10 @@ export interface FinancePayments extends MonthNav {
   cards: CardMonth[]
   loans: LoanMonth[]
   paid: Money[]
+  /** What is still to pay and is known exactly (card installments). */
   pending: Money[]
+  /** What is still to pay without an amount yet. */
+  pendingNote: string | null
 }
 
 export interface MovementFilter {

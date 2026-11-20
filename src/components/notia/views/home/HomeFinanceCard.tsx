@@ -66,7 +66,7 @@ export function HomeFinanceCard({ card, onOpenFinance, onOpenChat }: HomeFinance
             <div className="home-finance__figure">
               <span className="home-card__sub">Falta pagar</span>
               <span className="home-finance__value">
-                {finance.pendingCount > 0 ? finance.pending.map((money) => formatMoney(money, 0)).join(' · ') : 'Nada'}
+                {finance.pendingCount === 0 ? 'Nada' : [finance.pending.map((money) => formatMoney(money, 0)).join(' · '), finance.pendingNote].filter(Boolean).join(' + ')}
               </span>
             </div>
           </div>

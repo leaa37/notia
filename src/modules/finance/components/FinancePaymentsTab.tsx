@@ -6,7 +6,7 @@ import { useFinanceResource } from '../hooks/useFinanceResource'
 import { formatAmount, formatExact, formatMoneyList, formatShortDate, formatShortMonthYear, plural } from '../engines/financeFormat'
 import type { CardMonth, FinancePayments, LoanMonth, ServicePayment } from '../types/financeScreen'
 import { useFinanceEntry, type FinanceEntryApi } from './entry/financeEntryContext'
-import { FinanceBar, FinanceCard, FinancePill, FinanceStatus, MoneyText } from './FinanceParts'
+import { FinanceBar, FinanceCard, FinancePill, FinanceStatus, MoneyText, PendingText } from './FinanceParts'
 
 /**
  * «Pagos»: what is paid each month. A card installment is paid with one
@@ -21,7 +21,7 @@ export function FinancePaymentsTab({ library, month }: { library: NotiaLibrary; 
     {error && <FinanceStatus isLoading={false} error={error} onRetry={reload} />}
     <div className="finance-split finance-card finance-payments__summary">
       <div><span className="finance-mono-label">Pagado</span><strong className="finance-figure"><MoneyText list={data.paid} empty="$ 0" /></strong></div>
-      <div><span className="finance-mono-label">Falta pagar</span><strong className={`finance-figure${data.pending.length > 0 ? ' finance-warn-text' : ''}`}><MoneyText list={data.pending} empty="Nada" /></strong></div>
+      <div><span className="finance-mono-label">Falta pagar</span><strong className={`finance-figure${data.pending.length > 0 || data.pendingNote ? ' finance-warn-text' : ''}`}><PendingText pending={data.pending} note={data.pendingNote} /></strong></div>
     </div>
     <Services data={data} entry={entry} />
     <Cards data={data} entry={entry} />
@@ -42,7 +42,7 @@ function Services({ data, entry }: { data: FinancePayments; entry: FinanceEntryA
           <span className="finance-pay-row__name">{service.name}</span>
           <span className="finance-pay-row__sub">{service.paid ? `Pagado el ${formatShortDate(service.paid.date)}` : 'Sin pagar'}</span>
         </span>
-        <span className="finance-pay-row__amount">{formatExact(service.amount, service.currency)}</span>
+        <span className="finance-pay-row__amount">{service.paid ? formatExact(service.paid.amount, service.currency ?? 'ARS') : ''}</span>
         {service.paid
           ? <button type="button" className="finance-pill-button" onClick={() => entry?.openEntry({ kind: 'movement', id: service.paid?.movementId })}><FinancePill tone="paid">Pagado</FinancePill></button>
           : <button type="button" className="finance-button finance-button--outline finance-button--small" onClick={() => pay(service)}>Pagar</button>}
@@ -134,7 +134,8 @@ function LoanRow({ loan, entry }: { loan: LoanMonth; entry: FinanceEntryApi | nu
     : loan.number === null
       ? `Próxima: cuota ${loan.nextNumber} de ${loan.count}`
       : `Cuota ${loan.number} de ${loan.count}${loan.paid ? ` · pagada el ${formatShortDate(loan.paid.date)}` : ''}${loan.lateCount > 0 ? ` · ${plural(loan.lateCount, 'atrasada', 'atrasadas')}` : ''}`
-  const amount = loan.paid?.amount ?? loan.lastPaid
+  // Only what was paid: the next installment costs what it costs.
+  const amount = loan.paid?.amount
   return <li className="finance-pay-row finance-pay-row--loan">
     <span className="finance-pay-row__main">
       <span className="finance-pay-row__name">{loan.name}</span>
@@ -142,7 +143,7 @@ function LoanRow({ loan, entry }: { loan: LoanMonth; entry: FinanceEntryApi | nu
       <FinanceBar percent={(loan.paidCount * 100) / loan.count} label={`${loan.paidCount} de ${loan.count} cuotas`} />
       <span className="finance-pay-row__sub">{loan.paidCount}/{loan.count} pagadas · {formatAmount(loan.totalPaid, loan.currency, 0)} de {formatAmount(loan.amount, loan.currency, 0)} prestados</span>
     </span>
-    <span className="finance-pay-row__amount">{amount ? formatAmount(amount, loan.currency, 0) : '—'}</span>
+    <span className="finance-pay-row__amount">{amount ? formatExact(amount, loan.currency) : ''}</span>
     {loan.paid || loan.finished
       ? <FinancePill tone="paid">{loan.finished ? 'Terminado' : 'Pagada'}</FinancePill>
       : <button type="button" className="finance-button finance-button--outline finance-button--small" onClick={() => entry?.openEntry({ kind: 'loan-payment', prefill: { loanId: loan.id } })}>Pagar cuota</button>}

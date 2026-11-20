@@ -79,6 +79,8 @@ describe('Finanzas', () => {
     expect(screen.getByText('Te queda')).toBeTruthy()
     expect(screen.getByText('$ 1.000.000')).toBeTruthy()
     expect(screen.getByText('Pagaste 1 de 3')).toBeTruthy()
+    // A service not paid yet has no amount: what is missing is the cards' and a note.
+    expect(screen.getByText('$ 90.000 + 1 servicio')).toBeTruthy()
     expect(screen.getByText(/Te pasaste \$ 30\.000 del presupuesto/)).toBeTruthy()
     expect(screen.getByText(/que el mes pasado/)).toBeTruthy()
     // Paying a service from the overview opens its form with the service.
@@ -106,6 +108,7 @@ describe('Finanzas', () => {
     expect(entry.applyEntry).toHaveBeenLastCalledWith(library, { kind: 'movements', id: null, action: 'delete', values: { ids: ['m9'] }, requestId: 'pedido-1' })
     expect(screen.getByText('Listo, lo deshice.')).toBeTruthy()
     expect(screen.getByText(/atrasada/)).toBeTruthy()
+    expect(screen.getByText('$ 90.000 + 1 servicio y 1 cuota de préstamo')).toBeTruthy()
     expect(screen.getByRole('button', { name: /Pagar las 2 cuotas/ })).toBeTruthy()
   })
 
