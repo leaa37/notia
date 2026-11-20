@@ -528,11 +528,23 @@ pub struct ServiceMonth {
     pub estimate: String,
 }
 
-/// Each service in `month`.
+/// Each service in `month`: from the month it was created on (or paid).
 pub(crate) fn services_of_month(connection: &Connection, month: &str) -> ReadResult<Vec<ServiceMonth>> {
     let all = payments(connection, "service_id")?;
+    let since = rows(
+        connection,
+        "SELECT id, strftime('%Y-%m', CAST(created_at AS INTEGER), 'unixepoch', 'localtime') FROM finance_services",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?
+    .into_iter()
+    .collect::<HashMap<_, _>>();
     Ok(list_services(connection)?
         .into_iter()
+        .filter(|service| {
+            let created = since.get(&service.id).cloned().flatten().unwrap_or_default();
+            created.as_str() <= month || all.iter().any(|movement| movement.service_id.as_deref() == Some(service.id.as_str()) && movement.service_month.as_deref() == Some(month))
+        })
         .map(|service| {
             let of_service = all.iter().filter(|movement| movement.service_id.as_deref() == Some(service.id.as_str())).collect::<Vec<_>>();
             let paid = of_service.iter().find(|movement| movement.service_month.as_deref() == Some(month)).map(|movement| Payment::of(movement));

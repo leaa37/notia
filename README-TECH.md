@@ -8161,6 +8161,9 @@ Graph View sigue el canvas https://claude.ai/artifact/Xprcvq7qWmvfMf2u5HJiaT. Re
 
 ## Finanzas: seguimiento informal cargado por el asistente
 
+> **Reemplazada (2026-11-20):** desde el esquema 36 rige «Finanzas v2: el modelo simple» (al final del documento). Lo que sigue describe el modelo anterior, que ya no existe en el código.
+
+
 Estado vigente desde el esquema SQLite 26. Reemplaza lo que las secciones anteriores de Finanzas describen sobre formularios, auditorías, propuestas, relaciones, reparación de vínculos, inversiones, patrimonio y el pago de la tarjeta como transferencia.
 
 ### Decisiones
@@ -11503,6 +11506,9 @@ El canvas «ColdPass — Gestor de contraseñas» (https://claude.ai/artifact/Lg
 
 ## Finanzas: guardar la ocurrencia de un servicio (2026-10-04)
 
+> **Reemplazada (2026-11-20):** desde el esquema 36 rige «Finanzas v2: el modelo simple» (al final del documento). Lo que sigue describe el modelo anterior, que ya no existe en el código.
+
+
 **Problema.** `finance_save_service_occurrence` (`app/src/finance.rs`) fallaba siempre con «16 values for 15 columns». El `INSERT` de `finance_service_occurrences` nombra 15 columnas, pero los valores eran `?1…?14`, `COALESCE(…, ?15)` y `?15`. La llamada pasa 14 parámetros (el decimotercero es `source` y el decimocuarto, la marca de tiempo), así que sobraba `?14` y `?15` no existía. Así, ni la app ni el agente podían guardar la marca mensual de un servicio: el servicio seguía «sin pagar» en ese mes aunque el pago estuviera vinculado en el resumen. La reconciliación de resúmenes (`finance_records.rs`) usa otro `INSERT`, que estaba bien.
 
 **Arreglo.** Los valores son `?1…?13, COALESCE((SELECT created_at …), ?14), ?14`: al reemplazar una ocurrencia se conserva su `created_at`. La sentencia pasó a la constante `UPSERT_SERVICE_OCCURRENCE_SQL`.
@@ -13671,6 +13677,9 @@ No hay registros del caso real, así que no hay una causa probada. Se revisó `t
 
 ## Finanzas: carga manual, préstamos, presupuestos, historial y app de Android (2026-11-19)
 
+> **Reemplazada (2026-11-20):** desde el esquema 36 rige «Finanzas v2: el modelo simple» (al final del documento). Lo que sigue describe el modelo anterior, que ya no existe en el código.
+
+
 Pedido del usuario: poder cargar todo Finanzas a mano en la página, una app de Android aparte con lo mismo (ver, cargar…), y mejoras al módulo. Eligió todo en una sola entrega, una app nativa con cola sin conexión y, como mejoras:
 - una sección de pago de préstamos al lado de la de tarjetas;
 - ingresos y saldo del mes;
@@ -13801,3 +13810,157 @@ Tablas nuevas: `finance_applied_requests`, `finance_budgets`, `finance_budget_al
   - en 390 px: un gasto y un ticket con productos. Un ticket repetido se rechaza («El ticket ya fue registrado anteriormente»).
 - App: compila y firma en GitHub Actions (ver su README).
 - Pendiente: probar la app en un teléfono real, sobre todo la cola sin conexión fuera de casa, y un aviso de presupuesto con el bot de Telegram real.
+
+## Finanzas v2: el modelo simple (2026-11-20)
+
+Pedido del usuario, después de usar la carga manual: el modelo del asistente era inusable a mano.
+- El sueldo pedía bruto, descuentos, conceptos y empleador: ahora es solo el importe.
+- Los servicios pedían categoría, proveedor, vencimiento y fijo/variable: ahora son nombre, moneda e importe, y van solos a «Servicios».
+- Los préstamos ahora son nombre, monto y cuotas, y cada cuota se paga con su importe.
+- Las tarjetas son compras con total y cuotas que se pagan cuota por cuota, sin cargar resúmenes.
+- No hay tickets, productos ni comercios.
+- Ahorro sin sueldo, y borrar en vez de desactivar.
+- Un Resumen más completo.
+- En la app, los formularios no se cierran deslizando y Atrás vuelve a Resumen.
+
+Decisiones del usuario:
+- las cuentas siguen, pero opcionales;
+- una cuota de tarjeta cuenta como gasto el mes en que se paga;
+- el asistente se adapta al modelo nuevo (no lee más tickets, resúmenes ni recibos);
+- aceptó perder los datos cargados.
+
+### Esquema 36 (`database.rs`, `rework_finance`)
+
+- Antes de cambiar, si había movimientos, copia la base a `.notia/notia.db.pre-v36.sqlite` (`VACUUM INTO`, como en el esquema 26).
+- Con `foreign_keys` apagado, borra **todas** las tablas `finance_*` y sus entradas en `notia_row_changes` (la copia de un host no pide filas de tablas que ya no existen). Después crea `FINANCE_SCHEMA` y siembra las categorías y reservas iniciales (`finance::seed_defaults`).
+- La conversión de datos de la v26 (`finance_migration`) ya no corre: la v36 los descarta igual.
+- Tablas:
+  - `finance_categories` (`kind` es `expense` o `income`), `finance_accounts`, `finance_cards` y `finance_services` (moneda e importe);
+  - `finance_loans` (moneda, monto, `installment_count` de 1 a 600 y `first_month`);
+  - `finance_card_purchases` (tarjeta en cascada, categoría `SET NULL`, moneda, total, de 1 a 72 cuotas y `first_month`);
+  - `finance_movements`;
+  - `finance_reserves` (con `goal`), `finance_savings_movements` (`deposit` o `withdrawal`, con `pesos` si fue compra o venta de dólares);
+  - `finance_budgets` (único por categoría y moneda), `finance_budget_alerts` y `finance_applied_requests`.
+- `finance_movements` lleva `kind`, `name`, categoría y cuenta opcionales (`SET NULL` al borrarlas), importe, moneda y fecha. Si es un pago, también:
+  - `service_id` y `service_month`, para un servicio;
+  - `card_purchase_id` e `installment_number`, para una cuota de tarjeta;
+  - `loan_id` e `installment_number`, para una cuota de préstamo.
+- Hay índices únicos parciales: un pago por servicio y mes, y uno por cuota.
+- Categorías iniciales:
+  - de gastos: Supermercado, Comida y delivery, Transporte, Hogar, Salud, Salidas y ocio, Ropa, Educación, Impuestos, Servicios (`category-services`), Préstamos (`category-loans`) y Otros;
+  - de ingresos: Sueldo (`category-salary`) y Otros ingresos.
+- Reservas iniciales: «Ahorro en pesos» y «Ahorro en dólares». Las categorías que Notia usa sola se vuelven a crear con su id si se borraron (`finance::ensure_category`).
+
+### Lo que no se guarda
+
+- Las **cuotas** no tienen tabla. Una compra de N cuotas tiene la cuota k en `first_month + k − 1`, con el importe `installment_amounts(total, N)`: todas iguales, y los centavos que no dividen van a la primera.
+- Una cuota está pagada si hay un movimiento con su `card_purchase_id` e `installment_number`. Así:
+  - pagar es insertar ese gasto, con la categoría de la compra y la fecha del pago;
+  - deshacerlo es borrarlo;
+  - lo pendiente se calcula siempre (`finance_model::purchase_states`, `card_installments`).
+- El **resumen de una tarjeta** en un mes son sus cuotas de ese mes más las anteriores sin pagar (`late`).
+- Un **préstamo** tiene una cuota por mes desde `first_month`, sin importe esperado. Cada pago guarda lo que se pagó, en la categoría «Préstamos», y `last_paid` sirve para precargar el próximo.
+- Un **servicio** tiene un pago por mes. El importe esperado es el último pagado o, si nunca se pagó, el del servicio (`service_estimate`).
+- Borrar una tarjeta, compra, servicio o préstamo deja sus pagos como gastos sueltos (`SET NULL`): lo pagado es historia. Una reserva se borra con sus movimientos.
+
+### Escrituras (`finance_ops.rs`)
+
+- `apply(connection, source, kind, id, action, values)` es la única puerta de escritura. Corre dentro de la transacción de quien llama:
+  - `finance_apply` hace commit;
+  - la vista previa del asistente hace rollback.
+- Tipos:
+  - movimientos: `expense`, `income`, `salary` y `movement` (editar o borrar uno guardado); `movements` con `delete` y `ids` deshace un pago de varias cuotas;
+  - tarjetas: `card-purchase`, `card-payment` (con `installments` `purchaseId:n`, o todas las sin pagar hasta `month`);
+  - pagos: `loan-payment` (`number` por defecto la próxima) y `service-payment` (`amount` por defecto el estimado);
+  - ahorro: `savings` y `exchange`;
+  - configuración: `category`, `account`, `card`, `service`, `loan`, `budget` (guardar uno existente le cambia el tope) y `reserve`.
+- Referencias por id **o por nombre**, sin acentos ni mayúsculas (`fold`). Si no existe, el mensaje nombra las que hay. Una compra sin tarjetas acepta `newCard` y la crea.
+- Importes como se tipean (`typed_cents`: `1.500`, `1.500,50`, `1500,5`, `US$ 12,99` o un número JSON); se guardan como `1500.50`.
+- Los rechazos son `OpError::Rejected { message, errors }` por campo; `Storage` es lo demás.
+- `Applied { message, saved_id, undo }`. `undo` es otra llamada a `finance_apply` que lo deshace: borrar el movimiento o los movimientos creados.
+
+### Formularios (`finance_forms.rs`)
+
+- Tipos de campo: `text`, `money`, `integer`, `date`, `month`, `select`, `checks` e `info`.
+  - `money` lleva `currency: { key, value, locked }`. Una moneda elegible viaja con su clave (`currency`) y una bloqueada (la del servicio o del préstamo) solo se muestra.
+  - `reload: true`: al cambiar, el cliente vuelve a pedir el formulario con los valores y `_changed`. Así el pago de un servicio trae su importe, el de una tarjeta sus cuotas (`checks`, todas marcadas) y el de un préstamo la próxima cuota y el último importe.
+- Lo que piden:
+  - gasto: nombre (con sugerencias de nombres recientes), importe, categoría y fecha;
+  - sueldo: importe, precargado con el último, y fecha;
+  - compra con tarjeta: tarjeta, qué, total, cuotas, categoría («Otros») y primera cuota (el mes que viene);
+  - servicio: nombre e importe;
+  - préstamo: nombre, monto, cuotas y primera cuota.
+- La cuenta solo aparece si hay cuentas.
+- Un pago guardado se edita con su propio formulario (`payment`, que se aplica como `movement`): dice qué paga, con la moneda bloqueada, y su borrado es «Deshacer el pago».
+
+### Comandos
+
+- `finance_entry.rs`:
+  - `finance_session`, `finance_entry_menu` y `finance_form`;
+  - `finance_apply`, idempotente por `requestId`: guarda el resultado en `finance_applied_requests` en la misma transacción, y un rechazo no lo guarda;
+  - `finance_manage`, con las secciones `cards`, `purchases`, `services`, `loans`, `budgets`, `expense-categories`, `income-categories`, `reserves` y `accounts`.
+- `finance_screen.rs`:
+  - `finance_overview` devuelve `balance` por moneda (ingresos, sueldo, gastos, ahorro, queda, % gastado y ahorrado, variación contra el mes anterior), `pace` (promedio diario, proyección del mes actual y el gasto más grande), `commitments` (cada servicio, tarjeta por moneda y préstamo del mes, `paid`/`pending`/`late`), `categories` con su `budget`, `history` (seis meses en pesos), `debts` (por tarjeta, total, cuotas de los próximos tres meses y préstamos), `savings`, `topExpenses`, `recent` y `empty`;
+  - `finance_payments` devuelve los servicios, cada tarjeta (cuotas del mes y atrasadas, total, pendiente, deuda y compras) y cada préstamo, con lo pagado y lo pendiente del mes;
+  - `finance_movements` y `finance_search` reciben `filter { kind, categoryId, accountId, search }`. La búsqueda también encuentra por importe; el historial va de a 200;
+  - `finance_savings` es asíncrono: suma las cotizaciones de DolarApi y el valor en pesos de los dólares al blue (o al oficial).
+- `finance_export` escribe las columnas Fecha, Tipo, Nombre, Categoría, Cuenta, Detalle, Importe y Moneda.
+- Se van `finance_products`, `finance_salary_savings` y `finance_resolve_review`.
+- `finance_budgets.rs` mantiene los avisos por Telegram (80 % y 100 %). Lo gastado son los gastos del mes por categoría y moneda.
+- `finance.rs` mantiene:
+  - el contexto, la autorización (`#Confidencial`) y `sync_context`;
+  - `write`/`read`, importes y meses, la consola Dev (`FINANCE_TABLES`), vaciar y la semilla de demo;
+  - `FinanceCommandError::from(String)` ahora es siempre `storage`: los rechazos van por `OpError`.
+- Módulos borrados: `finance_agent_inputs`, `finance_edits`, `finance_loans`, `finance_matching`, `finance_migration`, `finance_reconciliation`, `finance_records` y `services/finance_extraction`. También se borra `finance_insights` de backend-core.
+
+### Asistente (`finance_tools.rs`)
+
+- Lectura: `get_finance_month`, `get_finance_payments`, `list_finance_movements`, `get_finance_setup` y las tres externas (cotizaciones, IPC, historial del dólar).
+- Escritura: `save_finance_expense`, `save_finance_income`, `save_finance_salary`, `save_finance_card_purchase`, `pay_finance_card`, `pay_finance_loan_installment`, `pay_finance_service`, `save_finance_savings_movement`, `save_finance_dollar_exchange`, `save_finance_setup` (`kind`) y `delete_finance_record` (`kind`, `id`).
+- Antes había unas 60. `clear_finance_data` ya no es una herramienta.
+- Cada escritura arma `kind` y `values` y llama a `ops::apply`, igual que los formularios:
+  - la vista previa la aplica en una transacción y la deshace, y su mensaje es el resumen de la confirmación;
+  - un rechazo vuelve al modelo como `invalid_input`;
+  - `execute` hace commit con `finance::write` y devuelve `{ ok, changed, message, savedId }`.
+- `catalog.rs`: la política `FinanceWrite` es `save_finance_*`, `pay_finance_*` o `delete_finance_*`. Los esquemas están en `tool_schemas.json`.
+- `prompt_guidance.rs` explica el modelo y qué herramienta corresponde a «pagué la Visa», «pagué la luz» o «pagué la cuota».
+- `finance_answer.rs` ya no exige persistir documentos de Telegram (tickets, recibos, resúmenes). `telegram_bot::is_finance_request` suma tarjeta, cuota, préstamo, presupuesto, Visa y Mastercard.
+
+### Web (`src/modules/finance`)
+
+- Pestañas: `FinanceOverviewTab`, `FinancePaymentsTab`, `FinanceMovementsTab` (con `FinanceHistory` y `FinanceExportDialog`), `FinanceSavingsTab`, `FinanceManageTab` y `FinanceDeveloperView`. Las piezas comunes están en `FinanceParts`.
+- `FinanceEntryProvider`:
+  - un formulario con cambios (`dirty`, contra los valores con que abrió) no se cierra por clic afuera, Escape, la cruz ni «Cancelar» sin preguntar «¿Descartar lo que cargaste?»;
+  - recarga el formulario cuando cambia un campo con `reload`;
+  - `quickApply` aplica sin formulario (pagar una cuota);
+  - el aviso trae **Deshacer** cuando hay `undo`.
+- `FinanceFormFields` dibuja `money` con su moneda al lado, `checks` como filas tildables, `select` corto y sin etiqueta como botones, e `info`. Los valores iniciales salen de `entryValues.ts`.
+- `formatExact` muestra centavos solo si los hay. `formatMoney` escribe `US$`.
+- Inicio (`HomeFinanceCard`, `FinanceHomeSummary`): gastos, lo que queda, lo que falta pagar y cuántos pagos faltan.
+
+### App de Android (`leaa37/notia-finance-android`)
+
+- Usa los mismos comandos y tiene las mismas pestañas.
+- `Forms.kt`:
+  - `FullScreen` es un `Dialog` de pantalla completa con `dismissOnClickOutside = false`;
+  - Atrás llama a `requestCloseForm`, que pregunta si hay cambios. No hay `ModalBottomSheet` en los formularios; solo queda en el menú «Cargar», que no tiene nada que perder;
+  - Ajustes también abre a pantalla completa.
+- `BackHandler` en `HomeScreen`: fuera de Resumen, Atrás va a Resumen; en Resumen, sale.
+- El aviso es un `Snackbar` con «Deshacer» (`Undo` del resultado).
+- Las cuotas se pagan con un toque (`quickApply`, que también entra a la cola sin conexión).
+
+### Validaciones
+
+- Rust:
+  - `cargo test -p notia-app --lib`: 436 pruebas. Fallan 2, las mismas de antes (`meeting::…a_meeting_whose_session_is_gone_finishes_with_its_lines` y `telegram_service::…endpoint_accepts_standard_bot_token_shape`);
+  - las 25 de Finanzas pasan (`finance_tests`, `finance_tools`, `finance`, `finance_budgets` y `finance_export`). Cubren la migración 36 (copias, defaults, `foreign_keys`), las cuotas y su resumen, deshacer, préstamos, servicios con la categoría recreada, categorías borradas, presupuestos, ahorro y dólares, Resumen, formularios y la idempotencia de `finance_apply`;
+  - `cargo test -p notia-backend-core`: falla 1, `image_generation::…only_sexual_content_with_minors_is_refused`, sin relación con Finanzas;
+  - `cargo clippy` sin avisos en Finanzas.
+- Web: `vitest run` (151 archivos, 772 pruebas), `tsc -b` y `eslint` limpios.
+- En el navegador, contra el servidor headless con una biblioteca nueva:
+  - en escritorio: sueldo, gasto con su error de campo, Escape que pregunta, compras en cuotas (creando la tarjeta), servicio, préstamo y presupuesto;
+  - en Pagos: una cuota con un toque, Deshacer y todas juntas; el servicio y la cuota del préstamo con su importe;
+  - ahorro y dólares, el Resumen con las cuentas correctas, buscar, abrir un pago, todo el historial, exportar `.xlsx` y borrar una categoría;
+  - en 390 px: Resumen y Pagos.
+- App: compila en GitHub Actions.
+- Pendiente: probarla en el teléfono (sobre todo Atrás, los formularios a pantalla completa con el teclado y la cola sin conexión) y el bot con el modelo real.

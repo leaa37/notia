@@ -196,6 +196,9 @@ fn a_service_is_a_name_and_an_amount_and_goes_to_servicios() {
     let form = forms::build(&connection, &catalog, "service-payment", None, &values(json!({ "month": next }))).unwrap().unwrap();
     assert_eq!(form.fields.iter().find(|field| field.key == "amount").unwrap().value, json!("26100"));
 
+    // It does not show before it existed.
+    assert!(model::services_of_month(&connection, &add_months(&month, -1)).unwrap().is_empty());
+
     // Deleting the service keeps its payments.
     delete(&connection, "service", &internet);
     assert_eq!(count(&connection, "SELECT COUNT(*) FROM finance_movements WHERE category_id='category-services'"), 1);
