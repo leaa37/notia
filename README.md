@@ -453,7 +453,7 @@ El asistente puede **generar** una imagen nueva a partir de lo que le pidas («d
 - **Tiempo**: una imagen de 1024 × 1024 tarda alrededor de un minuto y una edición, cerca de dos. Mientras se genera, el progreso muestra «generando la imagen» y podés cancelar.
 - **Celular**: en Android no se generan imágenes en el teléfono. Conectado como cliente a tu PC, el asistente las genera en ella.
 - **Comando `/image`** (también `/imagen`): escribí `/image` y lo que querés ver, por ejemplo `/image un faro al atardecer`, en el chat de la app o por Telegram. Tu texto va tal cual al modelo de imágenes, sin pasar por el modelo de chat, que es el que a veces se niega o cambia el pedido; además es más rápido. Podés empezar con una proporción (`/image 16:9 un bosque`; también 1:1, 9:16, 4:3, 3:4, 3:2 y 2:3) y, si adjuntás una imagen, la edita según tu texto. Se cancela como cualquier pedido. El resultado se guarda y se envía igual que el resto de las imágenes del asistente.
-- Notia no filtra el contenido de las imágenes, salvo uno: rechaza los pedidos sexuales o de desnudos con menores, por cualquier camino.
+- Notia no filtra el contenido de las imágenes, salvo uno: rechaza los pedidos sexuales o de desnudos con menores, por cualquier camino. Lo detecta por las palabras y las edades que tiene el pedido y, ante la duda, rechaza: por ejemplo, «Nina desnuda» se rechaza porque «nina» se lee como «niña».
 - Si la placa de video se queda sin memoria, el asistente te avisa; cerrá lo que la esté usando (por ejemplo Meeting) o pedí una imagen más chica. Si el modelo del chat corre en tu PC con Ollama, Notia lo saca de la placa mientras dibuja y Ollama lo vuelve a cargar para la respuesta siguiente.
 
 ### Terminal de la PC host

@@ -14,7 +14,7 @@
 - **La forma "oficial" (ventana en Windows):** pide bajar unos 2 GB de modelos de voz y compilar dos runtimes nativos en C++ con el Vulkan SDK. Sin eso, el build de Rust falla a propósito.
 - **Lo que encontré roto** (detalle en [§9](#9-problemas-e-inconsistencias-que-encontré)):
   - `npm run lint` falla con 4 errores.
-  - Falla 1 test de Rust: el filtro que debería bloquear imágenes sexuales de menores **no existe**, y el modelo de imágenes es una versión "uncensored". Es serio.
+  - Fallaba 1 test de Rust: el filtro que bloquea imágenes sexuales de menores no existía, y el modelo de imágenes es una versión "uncensored" (ya corregido el filtro; el modelo sigue siendo el mismo).
   - El servidor headless no podía abrir una biblioteca nueva (ya corregido).
   - La documentación tiene datos desactualizados: URL de IA por defecto, versión, cantidad de comandos y pasos de Android que faltan.
 
@@ -434,7 +434,7 @@ resources/speech/models/whisper-large-v3/**/*
 
 Ordenados por gravedad.
 
-1. **🔴 La generación de imágenes no tiene ningún filtro contra contenido sexual con menores.** El test `image_generation::tests::only_sexual_content_with_minors_is_refused` (`src-tauri/backend-core/src/image_generation.rs`) espera que prompts como "niña desnuda" se rechacen con `Forbidden`, pero `generate_job` y `edit_job` **no validan nada**: el test falla con el primer caso. La función `fold` que seguramente iba a usarse para normalizar el texto quedó sin uso (el compilador avisa `fn fold is never used`). Y el modelo que se descarga es `Qwen-Image-2.1-Turbo-Abliterated-Uncensored`. En criollo: el único freno que el propio autor quiso poner **no está implementado**, y el test que lo dice está en rojo. Esto hay que arreglarlo antes de cualquier otra cosa.
+1. **✅ Corregido el 2026-11-20: la generación de imágenes no tenía ningún filtro contra contenido sexual con menores.** Ahora `prompt` llama a `sexualizes_minors` y el test pasa; queda un control por palabras, con los límites que explica «Imágenes: el rechazo de contenido sexual con menores» en `README-TECH.md`. Lo que se encontró: el test `image_generation::tests::only_sexual_content_with_minors_is_refused` (`src-tauri/backend-core/src/image_generation.rs`) espera que prompts como "niña desnuda" se rechacen con `Forbidden`, pero `generate_job` y `edit_job` **no validan nada**: el test falla con el primer caso. La función `fold` que seguramente iba a usarse para normalizar el texto quedó sin uso (el compilador avisa `fn fold is never used`). Y el modelo que se descarga es `Qwen-Image-2.1-Turbo-Abliterated-Uncensored`. En criollo: el único freno que el propio autor quiso poner **no está implementado**, y el test que lo dice está en rojo. Esto hay que arreglarlo antes de cualquier otra cosa.
 2. **✅ Corregido el 2026-11-11: el servidor headless no inicializaba una biblioteca nueva.** `--add-library` registraba la carpeta pero no creaba `.notia/`, y el login llama a `open_library_connection`, que no crea la carpeta padre. Resultado: *"No se pudo abrir SQLite: unable to open database file"*. Ahora registrar una biblioteca deja su base lista (ver «Servidor con carpeta única de datos» en `README-TECH.md`).
 3. **🟠 `npm run lint` falla** con 4 errores, aunque `README-TECH.md` registra validaciones en verde:
    - `react-refresh/only-export-components` en `MeetingCompletedPanel.tsx:427` y `MermaidCodePane.tsx:46`;

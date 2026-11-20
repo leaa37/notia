@@ -11821,7 +11821,7 @@ El modelo de chat decide si llama a `generate_image` y escribe su descripción, 
 - **Ejecución** (`app::image_generation::run_command`): arma el trabajo con semilla al azar, libera la GPU de un Ollama local, genera y deja la imagen para la respuesta del pedido. `cancel_when` cancela el `RequestControl` cuando el turno se cancela.
 - **Chat de la app** (`ai_chat.rs::send` → `image_command_reply`): solo en `TurnMode::Chat`, sin agentes ni modelo de chat. La respuesta es un mensaje de Notia con el texto (o el error) y la imagen adjunta, y se guarda en el archivo del chat como cualquier turno. Edita la primera imagen que adjuntó la persona. Cancelar el turno corta el proceso.
 - **Telegram** (`telegram_worker.rs::run_job` → `run_image_command`): solo el Owner. Descarga los adjuntos (la primera imagen se edita) y muestra «Generando la imagen…» o «Editando la imagen…», que se borra al terminar. Corre como el pedido actual del chat (`begin_run`), así que `/cancelar` lo detiene. La foto sale con `send_generated_images`, seguida del texto, y el turno queda en el historial efímero con la imagen.
-- **Único contenido rechazado** (`sexualizes_minors`, dentro de `prompt`, así que vale para `/image` y para las herramientas): un pedido que une una palabra de menor (niño/niña, nene/nena, menor, infantil, adolescente, colegiala, bebé, child, kid, teen, underage, loli, shota…) o una edad menor de 18 («15 años», «12 yo») con desnudez o sexo (desnud-, sexual, sexo, porn-, erot-, nsfw, hentai, nude, naked, topless, lencer-, genital…) devuelve `Forbidden`. El contenido adulto y cualquier otro tema no se filtran.
+- **Único contenido rechazado** (`sexualizes_minors`, dentro de `prompt`, así que vale para `/image` y para las herramientas): un pedido que une una palabra de menor (niño/niña, nene/nena, menor, infantil, adolescente, colegiala, bebé, child, kid, teen, underage, loli, shota…) o una edad menor de 18 («15 años», «12 yo») con desnudez o sexo (desnud-, sexual, sexo, porn-, erot-, nsfw, hentai, nude, naked, topless, lencer-, genital…) devuelve `Forbidden`. El contenido adulto y cualquier otro tema no se filtran. **Corrección (2026-11-20):** este control no llegó al código en esta iteración; existe desde «Imágenes: el rechazo de contenido sexual con menores (2026-11-20)», que tiene la implementación real.
 
 ### Validaciones
 
@@ -13965,6 +13965,60 @@ Decisiones del usuario:
 - App: compila en GitHub Actions.
 - Pendiente: probarla en el teléfono (sobre todo Atrás, los formularios a pantalla completa con el teclado y la cola sin conexión) y el bot con el modelo real.
 
+## Imágenes: el rechazo de contenido sexual con menores (2026-11-20)
+
+**Causa.** El rechazo que describe «Comando `/image` (2026-10-13)» nunca llegó al repositorio. El commit `ec2d4e2` subió la prueba `only_sexual_content_with_minors_is_refused`, la función `fold` y la documentación, pero no `sexualizes_minors` ni su llamada en `prompt`. Desde entonces:
+
+- `generate_job` y `edit_job` armaban el trabajo con cualquier texto;
+- la prueba fallaba con «niña desnuda»;
+- el compilador avisaba que `fold` no se usaba.
+
+Las validaciones de esa sección dan la prueba por aprobada, pero no corresponden al código que se subió. No fue una regresión: el control nunca estuvo.
+
+**Implementación** (`backend-core::image_generation`):
+
+- **Dónde se llama.** `prompt` llama a `sexualizes_minors` después de controlar el largo. `prompt` lee el `prompt` de `generate_job` y el `instruction` de `edit_job`, así que cubre `/image` (chat de la app y Telegram) y las herramientas `generate_image`/`edit_image`. Ningún otro código arma un `ImageJob`.
+- **Error.** `BackendError` con código `Forbidden`, no reintentable, y el mensaje `MINORS_REFUSAL`: «No se generan imágenes sexuales ni de desnudos con menores de edad.». El chat y Telegram muestran ese texto. El agente lo recibe como resultado de la herramienta.
+- **`fold`.** Pasa a minúsculas, quita las tildes (también las escritas como marca combinante, U+0300–U+036F), cambia `ñ` por `n` y borra los caracteres invisibles (guion blando, U+200B–U+200D, U+2060, U+FEFF). `NIÑA`, `niña`, `nina` y `nin` + tilde combinante + `a` se leen igual.
+- **`folded_words`.** Deja palabras de letras y números separadas por un espacio. Un número pegado a letras queda aparte: `15años` → `15 anos`.
+- **Regla.** Se rechaza cuando el mismo pedido tiene las dos cosas:
+  - una palabra de `MINOR_TERMS` o una edad menor de 18;
+  - una palabra de `SEXUAL_TERMS`.
+- **Términos.** Un término con `*` al final acepta cualquier terminación (`desnud*`). Los demás tienen que ser la palabra entera, para no tomar `sexto`, `sexteto` o `nudo`. También hay frases de dos palabras: `sin ropa` y `ropa interior`.
+- **Edad** (`names_a_minor_age`). Un número menor de 18, en cifras o en letras (`dos`…`diecisiete`, `two`…`seventeen`), seguido de alguna de estas unidades:
+  - `años`, `año`, `añitos`;
+  - `years`, `year`, `yrs`, `yr`;
+  - `yo` o `y/o`.
+
+  `un` y `one` no cuentan, porque «hace un año» dice cuándo, no qué edad.
+
+**Decisiones y falsos positivos conocidos.** Ante la duda se rechaza. El modelo que se descarga es una versión sin censura (`Abliterated-Uncensored`) y este control es el único freno. Por eso:
+
+- `nina` sin `ñ` cuenta como niña: «Nina desnuda» se rechaza;
+- `bebe` cuenta como bebé: «mujer desnuda que bebe vino» se rechaza;
+- `menor`, `nena`, `colegiala`, `teen` y `schoolgirl` cuentan aunque se usen para adultos;
+- una duración de menos de 18 años junto a un desnudo («pareja desnuda, casados hace 10 años») se rechaza;
+- la palabra de menor y la sexual pueden estar en cualquier parte del pedido, no hace falta que estén juntas.
+
+**Límites.** Es un control por palabras, no un clasificador:
+
+- no mira la imagen de una edición: «dejala desnuda» sobre la foto de un menor pasa si el texto no nombra un menor ni una edad;
+- un pedido escrito para esquivarlo puede pasar (leetspeak, faltas de ortografía, otros idiomas, eufemismos);
+- `chica`, `chico`, `girl`, `boy` y `baby` no cuentan solos, porque también se usan para adultos; con una edad menor de 18 al lado, sí.
+
+**Plataformas.** Es código de `backend-core`, sin nada propio de la plataforma. Corre igual en Windows y en el servidor headless. En Android no se generan imágenes: el teléfono, conectado como cliente, las pide a la PC, que aplica este mismo control.
+
+### Validaciones
+
+- `cargo test -p notia-backend-core`: 839 pasan, 0 fallan, 7 ignoradas.
+  - `only_sexual_content_with_minors_is_refused` pasa sin cambios.
+  - Prueba nueva, `the_refusal_reads_case_accents_and_how_ages_are_written`. Rechaza mayúsculas, `ñ` sin tilde, tilde combinante, espacio de ancho cero, `sin ropa`, `15años`, `14-year-old`, `y/o`, «doce años» y `bebé`. Deja pasar `sexto`, `nudo`, `sexteto`, 18 y 30 años, y «con 2 gatos».
+- `cargo build -p notia-backend-core` termina sin avisos: ya no aparece `fold is never used`.
+- `cargo clippy -p notia-backend-core` no da avisos en `image_generation.rs`.
+- Sigue un aviso ajeno, solo en el build de pruebas: `test_picture` sin uso en `export_render/diagrams.rs`.
+- No se compiló `notia-app`. El cambio no toca firmas que use; solo agrega la constante `MINORS_REFUSAL`, y ningún módulo importa este con `*`.
+- Pendiente: probar `/image` y `generate_image` con el modelo real en Windows, y ver el mensaje en el chat de la app y en Telegram.
+
 ## Finanzas: servicios sin importe estimado y Guardar visible en la app (2026-11-20)
 
 Un servicio tenía un «importe por mes» obligatorio y Notia lo usaba como lo que faltaba pagar. Era un número inventado: el servicio cuesta distinto cada mes. Ahora un servicio es solo su nombre, y el importe que se ve en todos lados es el de su pago de ese mes.
@@ -14010,7 +14064,7 @@ Un servicio tenía un «importe por mes» obligatorio y Notia lo usaba como lo q
   - el importe obligatorio y el pago visto en todos lados;
   - la ayuda con el anterior y la moneda recordada en US$;
   - la recarga que descarta el importe, el mes de alta y borrar sin perder los pagos.
-- `cargo test -p notia-backend-core`: 837 aprobados, falla 1 (`image_generation::…only_sexual_content_with_minors_is_refused`, ya fallaba antes y no tiene relación).
+- `cargo test -p notia-backend-core`: 839 aprobados y ninguno fallido, ya con el rechazo de imágenes con menores integrado desde `main`.
 - `cargo clippy -p notia-app`: sin avisos en Finanzas ni en la migración 37.
 - Web: `vitest run` (151 archivos, 772 pruebas), `tsc` y `eslint` limpios.
 - En el navegador, contra el servidor headless con datos nuevos, a 1400×900 y 390×844:
