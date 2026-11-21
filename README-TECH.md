@@ -14074,3 +14074,67 @@ Un servicio tenía un «importe por mes» obligatorio y Notia lo usaba como lo q
   - sin errores de página.
 - App: compila en GitHub Actions.
 - Pendiente: ver en un teléfono real que Guardar queda visible con y sin teclado, con navegación por gestos y con tres botones. No hay dispositivo ni emulador en este entorno.
+
+## App de Android: un solo diseño, alineado y simétrico (2026-11-20)
+
+En el teléfono, la tarjeta de Servicios ponía «Pagar» en un renglón propio debajo de cada servicio y «+ Servicio» suelto abajo a la izquierda. Cada pantalla armaba sus filas a mano, así que nada quedaba alineado. Ahora todas usan las mismas piezas (`ui/Components.kt`, en `leaa37/notia-finance-android`). Solo cambia la presentación: los datos, los textos y las reglas siguen siendo los de Notia.
+
+### Piezas
+
+- `Measures` define la grilla:
+  - margen de 16 dp, 12 dp entre tarjetas y radio de 20 dp;
+  - acción de fila de 96 × 36 dp;
+  - filas de al menos 56 dp.
+- `SectionCard`: el título y el resumen a la izquierda y la acción en la misma línea, a la derecha (`AddButton` «+ Servicio», `LinkButton` «Ver Pagos»).
+- `ItemRow`: el texto a la izquierda, después el importe en su columna y la acción en otra de ancho mínimo fijo. Por eso las filas con y sin botón quedan encolumnadas. `Rows` pone una línea entre fila y fila.
+- `RowButton` («Pagar») y `StatusPill` («✓ Pagado») tienen el mismo tamaño.
+- `Stats`: totales en columnas iguales con un divisor. «Falta pagar» muestra lo exacto como cifra y lo que no tiene importe debajo («+ 2 servicios»).
+- `Segmented`:
+  - filtros de Movimientos;
+  - formato de exportación;
+  - selects de hasta tres opciones sin etiqueta;
+  - moneda al lado del importe, con la misma altura que el campo (8 dp abajo por la etiqueta flotante).
+- `TonalButton` arma las grillas de acciones: Ahorro en 2 × 2 y Movimientos en 1 × 2.
+- `FitText` achica la letra hasta que el nombre de la pestaña entra (mide con `TextMeasurer` dentro de `BoxWithConstraints`), en vez de cortarlo.
+- Los montos llevan un espacio duro entre el signo y el número (`money`), así «$» nunca queda solo al final del renglón.
+
+### Pantallas
+
+- La barra superior mide lo mismo con y sin mes. Las flechas son botones redondos simétricos.
+- `BottomNav` propia: cinco partes iguales, el indicador detrás del ícono, `selectable` con `Role.Tab`.
+- «Cargar» se muestra extendido arriba de todo y se achica al bajar (`ExtendedFloatingActionButton(expanded)`, con `derivedStateOf` sobre el scroll de la pestaña).
+- Los movimientos llevan el día como una hoja de calendario («20 / nov»).
+- Ahorro:
+  - las cotizaciones van en columnas Compra y Venta;
+  - una cotización sin precio muestra «—» en vez de «$ 0».
+- Formularios:
+  - los campos son contornos sobre la página (`fieldColors`), sin relleno; el relleno dejaba un recuadro oscuro detrás de la etiqueta flotante;
+  - las casillas van en una caja con divisores y el importe a la derecha;
+  - los avisos van en una franja de color.
+- Menú «Cargar»: una tarjeta por grupo, con una fila y un chevron por cada carga.
+
+### Contrato con el view model
+
+- `ui/Actions.kt` define `FinanceActions` (pestañas, mes, formularios, pagos con un toque, filtros, cola y contraseñas) y `FormActions`. `AppViewModel` implementa las dos.
+- `HomeScreen(vm)` junta el estado, los efectos y lo que se abre encima.
+- `HomeLayout(state, actions)`, las pestañas, `FormContent` y `MenuContent` solo dibujan lo que reciben. `FullScreen` (el `Dialog`) envuelve a `FullScreenLayout`.
+
+### Validaciones
+
+- Capturas con Paparazzi 1.3.5 sobre una copia de la app fuera del repositorio; el repositorio no suma dependencias ni pruebas de capturas. Datos de prueba realistas, Pixel 6:
+  - Resumen y Pagos, en páginas;
+  - Movimientos, Ahorro, Administrar y Resumen vacío;
+  - formularios: pago de servicio, servicio, pago de tarjeta con casillas, error de campo e importe bloqueado;
+  - menú «Cargar» y Ajustes;
+  - en oscuro y en claro, y Pagos y la barra de abajo con letra al 130 %.
+- Se revisaron una por una. Ajustes que salieron de esa revisión:
+  - «Falta pagar» en dos niveles;
+  - campos sin relleno;
+  - meses en minúscula dentro de las frases;
+  - espacio duro en los montos;
+  - «—» en cotizaciones sin precio;
+  - el equivalente en pesos de los dólares en su propio renglón.
+- `compileDebugKotlin`: sin avisos.
+- CI de la app: compila.
+- Pendiente: verlo en el teléfono, sobre todo los diálogos (`AlertDialog`, `ModalBottomSheet` y `DatePickerDialog`). Paparazzi no dibuja ventanas aparte.
+
